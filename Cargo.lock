@@ -101,7 +101,6 @@ name = "fpsmaxxing-control-plane"
 version = "0.1.0"
 dependencies = [
  "fpsmaxxing-contracts",
- "fpsmaxxing-mock-provider",
  "fpsmaxxing-provider-sdk",
  "rusqlite",
  "serde",
@@ -119,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "fpsmaxxing-contracts",
  "fpsmaxxing-control-plane",
+ "fpsmaxxing-mock-provider",
  "rusqlite",
  "serde",
  "serde_json",

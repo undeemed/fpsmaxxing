@@ -20,9 +20,13 @@ fn doctor() {
         |_| PathBuf::from("fpsmaxxing-journal.sqlite"),
         PathBuf::from,
     );
-    let journal_status = rusqlite::Connection::open(&journal)
-        .and_then(|connection| connection.execute_batch("PRAGMA journal_mode = WAL;"))
-        .map_or("unavailable", |()| "ready");
+    let journal_status = if journal.exists() {
+        rusqlite::Connection::open_with_flags(&journal, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|connection| connection.query_row("PRAGMA schema_version", [], |_row| Ok(())))
+            .map_or("unavailable", |()| "ready")
+    } else {
+        "missing (no experiments journaled yet)"
+    };
     println!("FPSMaxxing diagnostics");
     println!("  contracts: ready");
     println!("  provider SDK: ready");

@@ -9,7 +9,6 @@ publish = false
 
 [dependencies]
 fpsmaxxing-contracts.workspace = true
-fpsmaxxing-mock-provider = { path = "../../sidecars/mock-provider" }
 fpsmaxxing-provider-sdk.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

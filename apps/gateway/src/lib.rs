@@ -23,26 +23,37 @@ pub enum GatewayError {
 
 /// Serves line-delimited JSON-RPC MCP requests until the client closes stdin.
 ///
+/// Malformed JSON receives a parse-error response and the session continues;
+/// notifications (messages without an `id`) never receive a response.
+///
 /// # Errors
 ///
-/// Returns an error for malformed transport input or a failed journal write.
+/// Returns an error for a failed transport reader or writer.
 pub fn serve(
     input: impl BufRead,
     mut output: impl Write,
     mut plane: ControlPlane,
 ) -> Result<(), GatewayError> {
     for line in input.lines() {
-        let request: Value = serde_json::from_str(&line?)?;
-        let response = dispatch(&mut plane, &request);
-        serde_json::to_writer(&mut output, &response)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
+        let response = match serde_json::from_str::<Value>(&line?) {
+            Ok(request) => dispatch(&mut plane, &request),
+            Err(error) => Some(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": { "code": -32700, "message": format!("parse error: {error}") }
+            })),
+        };
+        if let Some(response) = response {
+            serde_json::to_writer(&mut output, &response)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+        }
     }
     Ok(())
 }
 
-fn dispatch(plane: &mut ControlPlane, request: &Value) -> Value {
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
+fn dispatch(plane: &mut ControlPlane, request: &Value) -> Option<Value> {
+    let id = request.get("id")?.clone();
     let result = match request.get("method").and_then(Value::as_str) {
         Some("initialize") => Ok(json!({
             "protocolVersion": "2025-03-26",
@@ -57,42 +68,46 @@ fn dispatch(plane: &mut ControlPlane, request: &Value) -> Value {
             }}
         ]})),
         Some("tools/call") => call_tool(plane, request.get("params").unwrap_or(&Value::Null)),
-        Some(method) => Err(format!("unsupported MCP method: {method}")),
-        None => Err("missing MCP method".to_owned()),
+        Some(method) => Err((-32601, format!("method not found: {method}"))),
+        None => Err((-32600, "missing MCP method".to_owned())),
     };
-    match result {
+    Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(message) => {
-            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": message } })
+        Err((code, message)) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
         }
-    }
+    })
 }
 
-fn call_tool(plane: &mut ControlPlane, params: &Value) -> Result<Value, String> {
+fn call_tool(plane: &mut ControlPlane, params: &Value) -> Result<Value, (i64, String)> {
     match params.get("name").and_then(Value::as_str) {
-        Some("fpsmaxxing.capabilities") => {
-            content(plane.capabilities()).map_err(|error| error.to_string())
-        }
+        Some("fpsmaxxing.capabilities") => Ok(success(plane.capabilities())),
         Some("fpsmaxxing.run_mock_lifecycle") => {
             let arguments = params
                 .get("arguments")
-                .ok_or_else(|| "missing tool arguments".to_owned())?;
+                .ok_or_else(|| (-32602, "missing tool arguments".to_owned()))?;
             let request = serde_json::from_value::<ChangeRequest>(json!({
                 "capability_id": "mock.value", "parameters": { "value": arguments.get("value").cloned().unwrap_or(Value::Null) },
                 "lease_seconds": arguments.get("lease_seconds").cloned().unwrap_or(Value::Null)
-            })).map_err(|error| format!("invalid lifecycle arguments: {error}"))?;
-            content(
-                plane
-                    .run_lifecycle(&request)
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())
+            }))
+            .map_err(|error| (-32602, format!("invalid lifecycle arguments: {error}")))?;
+            Ok(match plane.run_lifecycle(&request) {
+                Ok(result) => success(result),
+                Err(error) => failure(&error.to_string()),
+            })
         }
-        Some(name) => Err(format!("unknown tool: {name}")),
-        None => Err("missing tool name".to_owned()),
+        Some(name) => Err((-32602, format!("unknown tool: {name}"))),
+        None => Err((-32602, "missing tool name".to_owned())),
     }
 }
 
-fn content(value: impl serde::Serialize) -> Result<Value, serde_json::Error> {
-    Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value)? }] }))
+fn success(value: impl serde::Serialize) -> Value {
+    match serde_json::to_string(&value) {
+        Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+        Err(error) => failure(&format!("serialization failed: {error}")),
+    }
+}
+
+fn failure(message: &str) -> Value {
+    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
