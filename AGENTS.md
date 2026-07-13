@@ -28,4 +28,8 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo deny check
 ```
+
+`cargo deny check` requires [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) and enforces the advisory, ban, license, and source policies in `deny.toml`.
+CI runs the same checks, plus JSON schema validation, on every push and pull request.
