@@ -14,7 +14,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 
 ## Repository rules
 
-- Keep shared wire types in `crates/contracts`.
+- Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
 - Put provider-specific code in one `sidecars/<provider>` package; sidecars may not import each other.
 - Put non-Rust compatibility processes under `bridges/` and isolate them behind the sidecar protocol.
@@ -32,4 +32,4 @@ cargo deny check
 ```
 
 `cargo deny check` requires [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) and enforces the advisory, ban, license, and source policies in `deny.toml`.
-CI runs the same checks, plus JSON schema validation, on every push and pull request.
+CI runs the same checks, plus JSON schema validation, on every pull request and push to `main`.
