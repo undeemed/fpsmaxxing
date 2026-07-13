@@ -1,5 +1,7 @@
 //! Reference sidecar used to validate the provider lifecycle without hardware.
 
+use std::num::NonZeroU32;
+
 use fpsmaxxing_contracts::{
     CapabilityDescriptor, ChangeRequest, Persistence, ProviderManifest, RiskClass, StateSnapshot,
 };
@@ -14,7 +16,7 @@ impl Provider for MockProvider {
     fn manifest(&self) -> ProviderManifest {
         ProviderManifest {
             id: "mock".to_owned(),
-            protocol_version: 1,
+            protocol_version: NonZeroU32::MIN,
             targets: vec![std::env::consts::OS.to_owned()],
             capabilities: vec![CapabilityDescriptor {
                 id: "mock.value".to_owned(),

@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: rustup toolchain install
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -30,6 +30,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
+
+  cargo-deny:
+    name: Cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check advisories, bans, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
 
   schemas:
     name: JSON schemas
