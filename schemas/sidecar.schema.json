@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/sidecar.schema.json",
+  "title": "FPSMaxxing sidecar manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "protocol_version", "targets", "capabilities"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$" },
+    "protocol_version": { "type": "integer", "minimum": 1 },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "capability.schema.json" }
+    }
+  }
+}

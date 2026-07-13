@@ -1,0 +1,10 @@
+# Only one provider may own a conflict group at a time.
+
+[groups.process-policy]
+providers = ["process-lasso", "windows-native-process-policy"]
+
+[groups.gpu-fan]
+providers = ["fan-control", "nvidia", "amd"]
+
+[groups.power-plan]
+providers = ["process-lasso", "windows-power"]

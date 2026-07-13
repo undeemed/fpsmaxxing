@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/capability.schema.json",
+  "title": "FPSMaxxing capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "description", "risk", "persistence", "input_schema"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$" },
+    "description": { "type": "string", "minLength": 1 },
+    "risk": {
+      "enum": ["read-only", "reversible", "approval-required", "denied"]
+    },
+    "persistence": {
+      "enum": ["none", "leased", "persistent", "reboot-required"]
+    },
+    "input_schema": { "type": "object" }
+  }
+}

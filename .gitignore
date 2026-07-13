@@ -1,0 +1,21 @@
+/target/
+/dist/
+/.idea/
+/.vscode/
+*.user
+*.suo
+*.swp
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Local machine state must never enter source control.
+/.fpsmaxxing/
+/.env
+/.env.*
+!.env.example
+
+# .NET bridge output.
+**/bin/
+**/obj/

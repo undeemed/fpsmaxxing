@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en" data-theme="business">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Performance Gateway — Implementation Plan</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :where(.grid, .flex) > * { min-width: 0; }
+    :where(p, h1, h2, h3, h4, li, td, th, .badge, .label) { overflow-wrap: anywhere; }
+    :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+    html { scroll-behavior: smooth; }
+    body { background: radial-gradient(circle at 12% 0%, color-mix(in oklab, var(--color-primary) 13%, transparent), transparent 28rem), var(--color-base-300); }
+    .shell { width: min(1180px, calc(100% - 2rem)); margin-inline: auto; }
+    .eyebrow { letter-spacing: .15em; text-transform: uppercase; font-size: .72rem; font-weight: 800; color: var(--color-primary); }
+    .section-anchor { scroll-margin-top: 1rem; }
+    .phase-card { border-left: 3px solid color-mix(in oklab, var(--color-primary) 75%, transparent); }
+    .code-chip { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .78rem; }
+    .sticky-nav { position: sticky; top: .75rem; z-index: 20; backdrop-filter: blur(16px); }
+    .mermaid { background: var(--color-base-100); border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent); border-radius: 1rem; padding: 1rem; overflow-x: auto; }
+    .decision-form fieldset { width: 100%; max-width: 100%; min-width: 0; min-inline-size: 0; margin-inline: 0; padding-inline: 0; overflow: hidden; }
+    .decision-form select { display: block; width: 100%; max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+    @media print { .sticky-nav, .review-only { display: none !important; } body { background: white; } }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "strict",
+      themeVariables: {
+        primaryColor: "#d7e7ff",
+        primaryTextColor: "#172033",
+        primaryBorderColor: "#3976c8",
+        lineColor: "#6b7b93",
+        secondaryColor: "#dff7e8",
+        tertiaryColor: "#f2e7ff",
+        fontFamily: "ui-sans-serif, system-ui, sans-serif"
+      }
+    });
+  </script>
+</head>
+<body class="text-base-content">
+  <header class="shell pt-8 lg:pt-12">
+    <nav class="sticky-nav navbar rounded-box border border-base-content/10 bg-base-100/85 shadow-lg">
+      <div class="navbar-start min-w-0">
+        <a href="#top" class="btn btn-ghost min-w-0 text-left">
+          <span class="truncate">Performance Gateway</span>
+        </a>
+      </div>
+      <div class="navbar-end gap-2">
+        <a href="#monorepo" class="btn btn-ghost btn-sm hidden md:inline-flex">Repository</a>
+        <a href="#roadmap" class="btn btn-ghost btn-sm hidden sm:inline-flex">Roadmap</a>
+        <a href="#decisions" class="btn btn-primary btn-sm">Decide scope</a>
+      </div>
+    </nav>
+
+    <section id="top" class="hero my-6 rounded-box border border-base-content/10 bg-base-100 shadow-xl">
+      <div class="hero-content w-full items-start py-10 lg:py-14">
+        <div class="w-full">
+          <p class="eyebrow">Implementation plan · Windows-first prototype</p>
+          <div class="mt-3 grid gap-8 lg:grid-cols-[minmax(0,1.45fr)_minmax(0,.75fr)] lg:items-end">
+            <div>
+              <h1 class="pb-1 text-4xl font-black leading-[1.12] tracking-tight sm:text-5xl lg:text-6xl">Build the highways before the research loop.</h1>
+              <p class="mt-5 max-w-3xl text-lg text-base-content/70">A local capability gateway normalizes Process Lasso, Fan Control, PresentMon, LibreHardwareMonitor, GPU APIs, Windows power policy, and curated Registry tweaks. The LLM proposes experiments; deterministic services execute and reverse them.</p>
+            </div>
+            <div class="stats stats-vertical border border-base-content/10 bg-base-200 shadow-sm">
+              <div class="stat"><div class="stat-title">Target</div><div class="stat-value text-2xl">1 workstation</div><div class="stat-desc">Local-only Windows prototype</div></div>
+              <div class="stat"><div class="stat-title">AI implementation target</div><div class="stat-value text-2xl">≈60 minutes</div><div class="stat-desc">Code, tests, and first vertical slice</div></div>
+              <div class="stat"><div class="stat-title">Implementation language</div><div class="stat-value text-2xl">Rust-first</div><div class="stat-desc">One isolated .NET hardware bridge</div></div>
+              <div class="stat"><div class="stat-title">Validation clock</div><div class="stat-value text-2xl">Evidence-based</div><div class="stat-desc">Benchmark, reboot, and thermal time stays real</div></div>
+              <div class="stat"><div class="stat-title">v1 risk ceiling</div><div class="stat-value text-2xl">Reversible</div><div class="stat-desc">No BIOS, voltage, or raw kernel writes</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </header>
+
+  <main class="shell pb-20">
+    <section class="grid gap-4 md:grid-cols-3">
+      <article class="card card-border bg-base-100"><div class="card-body"><span class="badge badge-success badge-soft">In scope</span><h2 class="card-title">Capability gateway</h2><p class="text-sm text-base-content/70">Typed discovery, snapshot, apply, verify, observe, lease, and rollback operations.</p></div></article>
+      <article class="card card-border bg-base-100"><div class="card-body"><span class="badge badge-info badge-soft">In scope</span><h2 class="card-title">Provider adapters</h2><p class="text-sm text-base-content/70">Profile-based integrations first; direct vendor APIs where they are stable and supported.</p></div></article>
+      <article class="card card-border bg-base-100"><div class="card-body"><span class="badge badge-error badge-soft">Deferred</span><h2 class="card-title">Firmware autonomy</h2><p class="text-sm text-base-content/70">BIOS, voltage, arbitrary Registry, raw MSR/PCI/EC access, and firmware flashing.</p></div></article>
+    </section>
+
+    <section id="architecture" class="section-anchor mt-12">
+      <div class="mb-5">
+        <p class="eyebrow">01 · Architecture</p>
+        <h2 class="mt-2 text-3xl font-bold">Where trust and privilege live</h2>
+        <p class="mt-2 max-w-3xl text-base-content/70">The LLM never receives administrator credentials or raw command execution. A local gateway exposes semantic tools; a separately installed Windows service owns privileged provider calls and rollback.</p>
+      </div>
+      <div class="mermaid">
+flowchart TD
+  LLM["LLM / outer research loop"] -->|"typed MCP tools"| GW["Local capability gateway\nnon-admin process"]
+  GW --> REG["Capability registry + policy engine"]
+  REG -->|"validated request over ACL'd named pipe"| BROKER["Privileged broker\nWindows service"]
+  BROKER --> PL["Process Lasso adapter"]
+  BROKER --> FC["Fan Control adapter"]
+  BROKER --> PWR["Windows power + Registry adapters"]
+  BROKER --> GPU["NVML / AMD SMI adapter"]
+  PM["PresentMon"] --> OBS["Telemetry normalizer"]
+  LHM["LibreHardwareMonitor"] --> OBS
+  PL --> OBS
+  FC --> OBS
+  GPU --> OBS
+  OBS --> DB[("SQLite experiment journal")]
+  OBS --> GW
+  WATCH["Independent watchdog service"] -->|"trip / TTL expiry"| BROKER
+  BROKER --> DB
+      </div>
+      <div role="alert" class="alert alert-warning mt-4">
+        <span><strong>Ownership rule:</strong> only one provider may own a knob at a time. The registry records conflicts so Process Lasso, Fan Control, GPU software, and Windows power managers cannot fight each other.</span>
+      </div>
+    </section>
+
+    <section id="contract" class="section-anchor mt-12">
+      <p class="eyebrow">02 · Provider contract</p>
+      <h2 class="mt-2 text-3xl font-bold">Every highway has the same shape</h2>
+      <div class="mt-5 grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+        <div class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Discover</h3><p class="text-sm text-base-content/70">Version, health, available capabilities, valid ranges, persistence, conflicts.</p></div></div>
+        <div class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Transact</h3><p class="text-sm text-base-content/70">Snapshot, preview, apply one bounded change, attach a TTL lease.</p></div></div>
+        <div class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Prove</h3><p class="text-sm text-base-content/70">Read back provider state and verify the actual OS or hardware effect.</p></div></div>
+        <div class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Recover</h3><p class="text-sm text-base-content/70">Restore the exact snapshot without consulting the LLM.</p></div></div>
+      </div>
+      <div class="mockup-code mt-5 bg-neutral text-neutral-content">
+        <pre data-prefix="1"><code>capabilities.list()</code></pre>
+        <pre data-prefix="2"><code>change.preview(capability, parameters)</code></pre>
+        <pre data-prefix="3"><code>change.apply(preview_id, lease_seconds)</code></pre>
+        <pre data-prefix="4"><code>change.verify(change_id)</code></pre>
+        <pre data-prefix="5"><code>change.rollback(change_id)</code></pre>
+        <pre data-prefix="6"><code>telemetry.query(metric_set, window)</code></pre>
+      </div>
+    </section>
+
+    <section id="language" class="section-anchor mt-12">
+      <div class="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p class="eyebrow">03 · Language decision</p>
+          <h2 class="mt-2 text-3xl font-bold">Rust owns every trusted boundary</h2>
+        </div>
+        <span class="badge badge-success badge-lg">Decision locked</span>
+      </div>
+      <p class="mt-3 max-w-3xl text-base-content/70">Use stable Rust with edition 2024 for the gateway, privileged broker, watchdog, experiment runner, CLI, shared crates, and native provider sidecars. Keep a single C# bridge for LibreHardwareMonitor because its supported integration surface is a .NET library; isolate it behind the same sidecar protocol rather than moving .NET into the trusted broker.</p>
+
+      <div class="mt-6 overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+        <table class="table table-zebra">
+          <thead><tr><th>Concern</th><th>Decision</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>Async runtime</td><td class="code-chip">tokio</td><td>Shared runtime for MCP, provider supervision, telemetry streams, timers, and Windows named pipes.</td></tr>
+            <tr><td>LLM interface</td><td class="code-chip">rmcp</td><td>The official Rust MCP SDK already uses Tokio, Serde, and generated JSON Schemas.</td></tr>
+            <tr><td>Windows APIs</td><td class="code-chip">windows-registry, windows-services, windows</td><td>Prefer Microsoft's focused crates; enable only required Win32 namespaces for lower API surface.</td></tr>
+            <tr><td>Local privileged IPC</td><td class="code-chip">tokio named pipes + length-prefixed JSON</td><td>Inspectable v1 protocol with named-pipe ACLs; no localhost TCP listener.</td></tr>
+            <tr><td>Contracts</td><td class="code-chip">serde + schemars</td><td>One Rust type generates wire-format JSON Schema and validates MCP inputs.</td></tr>
+            <tr><td>Journal</td><td class="code-chip">rusqlite</td><td>Small synchronous transaction surface behind one journal actor; bundled SQLite for predictable installs.</td></tr>
+            <tr><td>CLI and diagnostics</td><td class="code-chip">clap + tracing</td><td>Typed commands and structured diagnostics without a separate logging stack.</td></tr>
+            <tr><td>Errors</td><td class="code-chip">thiserror; anyhow at binary edges</td><td>Libraries preserve typed failure semantics; applications add operational context.</td></tr>
+            <tr><td>Build orchestration</td><td class="code-chip">Cargo workspace + xtask</td><td>No Bazel or Turborepo in v1; Cargo builds Rust and xtask coordinates .NET, packaging, schemas, and release assembly.</td></tr>
+            <tr><td>Desktop UI</td><td>Deferred; Tauri-compatible</td><td>Do not add TypeScript until a UI is actually required.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div role="alert" class="alert alert-info mt-4">
+        <span><strong>Purity rule:</strong> polyglot code is allowed only behind a sidecar boundary. It cannot be linked into the broker, watchdog, policy engine, or shared contract crates.</span>
+      </div>
+    </section>
+
+    <section id="monorepo" class="section-anchor mt-12">
+      <p class="eyebrow">04 · Monorepo structure</p>
+      <h2 class="mt-2 text-3xl font-bold">Provider-first source, target-first artifacts</h2>
+      <p class="mt-2 max-w-3xl text-base-content/70">Use top-level folders for deployable roles, shared libraries, and isolated providers. Keep each sidecar together by provider; put OS-specific implementations inside it. Package output by target triple so installers still receive a clean Windows/Linux layout.</p>
+
+      <div class="mt-6 grid gap-4 lg:grid-cols-3">
+        <article class="card card-border bg-base-100">
+          <div class="card-body">
+            <span class="badge badge-ghost">Option A</span>
+            <h3 class="card-title">OS-first source</h3>
+            <p class="code-chip text-base-content/70">sidecars/windows/process-lasso</p>
+            <p class="text-sm text-base-content/70">Simple packaging view, but duplicates shared providers and makes NVIDIA or future cross-platform integrations awkward.</p>
+          </div>
+        </article>
+        <article class="card card-border bg-base-100">
+          <div class="card-body">
+            <span class="badge badge-ghost">Option B</span>
+            <h3 class="card-title">Capability-first only</h3>
+            <p class="code-chip text-base-content/70">providers/process/cpu-affinity</p>
+            <p class="text-sm text-base-content/70">Clean logical model, but hides executable, privilege, packaging, and failure-isolation boundaries.</p>
+          </div>
+        </article>
+        <article class="card card-border border-primary/40 bg-base-100 shadow-lg">
+          <div class="card-body">
+            <span class="badge badge-primary">Recommended</span>
+            <h3 class="card-title">Hybrid</h3>
+            <p class="code-chip text-base-content/70">sidecars/nvidia/platform/windows</p>
+            <p class="text-sm text-base-content/70">Provider ownership stays cohesive while target-specific code and release artifacts remain explicit.</p>
+          </div>
+        </article>
+      </div>
+
+      <div class="mt-6 grid gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,.65fr)]">
+        <article class="card card-border overflow-hidden bg-base-100">
+          <div class="card-body pb-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="card-title">Proposed repository tree</h3>
+                <p class="text-sm text-base-content/60">Cargo workspace with one isolated .NET bridge.</p>
+              </div>
+              <span class="badge badge-outline">proposed-tree.txt</span>
+            </div>
+          </div>
+          <div id="repo-tree-file" class="min-w-0 overflow-hidden"></div>
+        </article>
+
+        <div class="space-y-4">
+          <article class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Source boundary</h3><p class="text-sm text-base-content/70"><span class="code-chip">apps/</span> contains shipped Rust binaries. <span class="code-chip">sidecars/</span> contains provider-specific Rust processes. <span class="code-chip">crates/</span> can never call vendor tools directly.</p></div></article>
+          <article class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Sidecar rule</h3><p class="text-sm text-base-content/70">Every sidecar owns a manifest, source, platform shims, fixtures, and contract tests. No provider-specific types leak into shared contracts.</p></div></article>
+          <article class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Artifact rule</h3><p class="text-sm text-base-content/70">CI emits <span class="code-chip">dist/&lt;target-triple&gt;/sidecars/&lt;provider&gt;</span>, following the target-specific binary model used by Tauri sidecars.</p></div></article>
+          <article class="card card-border bg-base-100"><div class="card-body"><h3 class="card-title text-base">Dependency rule</h3><p class="text-sm text-base-content/70">Dependencies point inward: apps and sidecars may depend on packages; packages never depend on apps or sidecars; sidecars never import one another.</p></div></article>
+        </div>
+      </div>
+
+      <div class="mt-6 overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+        <table class="table table-zebra">
+          <thead><tr><th>Directory</th><th>Owns</th><th>Must not own</th></tr></thead>
+          <tbody>
+            <tr><td class="code-chip">apps/</td><td>Gateway, broker, watchdog, runner, CLI, future desktop UI</td><td>Provider-specific protocol parsing</td></tr>
+            <tr><td class="code-chip">sidecars/</td><td>One external service/vendor integration per process boundary</td><td>Cross-provider policy or experiment decisions</td></tr>
+            <tr><td class="code-chip">crates/</td><td>Contracts, policy, IPC, telemetry, journal, SDK, testkit</td><td>OS calls, admin writes, vendor binaries</td></tr>
+            <tr><td class="code-chip">bridges/</td><td>Non-Rust compatibility processes, beginning with LibreHardwareMonitor</td><td>Policy, privilege escalation, or direct broker linkage</td></tr>
+            <tr><td class="code-chip">schemas/</td><td>Versioned wire and manifest schemas</td><td>Runtime code</td></tr>
+            <tr><td class="code-chip">policies/</td><td>Risk rules, conflicts, curated Registry catalog</td><td>Secrets or machine-local state</td></tr>
+            <tr><td class="code-chip">profiles/</td><td>Reviewed provider profiles and safe baselines</td><td>User-generated runtime snapshots</td></tr>
+            <tr><td class="code-chip">packaging/</td><td>Installers, service definitions, target manifests</td><td>Source-of-truth provider logic</td></tr>
+            <tr><td class="code-chip">third-party/</td><td>Licenses, notices, checksums, acquisition metadata</td><td>Vendor binaries without redistribution rights</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div role="alert" class="alert alert-info mt-4">
+        <span><strong>Why this shape:</strong> Cargo workspaces share a lockfile and build directory across related crates; OpenTelemetry Collector keeps independently supportable components isolated; Tauri packages sidecars by target triple. The hybrid keeps idiomatic Rust source boundaries while producing explicit OS/architecture artifacts.</span>
+      </div>
+    </section>
+
+    <section id="providers" class="section-anchor mt-12">
+      <p class="eyebrow">05 · Integration order</p>
+      <h2 class="mt-2 text-3xl font-bold">Prove read paths before write paths</h2>
+      <p class="mt-2 max-w-3xl text-base-content/70">Third-party applications remain user-installed during the prototype. Adapters discover supported versions and refuse unknown contracts.</p>
+      <div class="mt-5 overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+        <table class="table table-zebra">
+          <thead><tr><th>Order</th><th>Provider</th><th>First integration</th><th>Control boundary</th><th>Exit test</th></tr></thead>
+          <tbody>
+            <tr><td><span class="badge badge-success">1</span></td><td class="font-semibold">LibreHardwareMonitor</td><td>Read-only .NET library</td><td>Temperatures, clocks, fan RPM, loads, power</td><td>Stable normalized samples for a 30-minute workload</td></tr>
+            <tr><td><span class="badge badge-success">1</span></td><td class="font-semibold">PresentMon</td><td>Service/API or console CSV</td><td>Frame time, latency, FPS, GPU telemetry</td><td>Correlate workload metrics with hardware samples</td></tr>
+            <tr><td><span class="badge badge-info">2</span></td><td class="font-semibold">Process Lasso</td><td>List/switch prebuilt profiles; ingest logs</td><td>Affinity, CPU sets, priorities, process power profile</td><td>Apply, verify, and restore baseline profile</td></tr>
+            <tr><td><span class="badge badge-info">2</span></td><td class="font-semibold">Windows power</td><td>Native Power APIs</td><td>Clone and activate controlled power schemes</td><td>Never mutate the user's original scheme</td></tr>
+            <tr><td><span class="badge badge-warning">3</span></td><td class="font-semibold">Registry</td><td>Curated tweak catalog only</td><td>Exact path/value/type/view; no raw path tool</td><td>Lease expiry restores existence, type, and bytes</td></tr>
+            <tr><td><span class="badge badge-warning">3</span></td><td class="font-semibold">NVIDIA / AMD</td><td>NVML first; AMD SMI after contract parity</td><td>Supported clocks and power limits; no voltage</td><td>Provider reset plus watchdog rollback tested</td></tr>
+            <tr><td><span class="badge badge-warning">3</span></td><td class="font-semibold">Fan Control</td><td>Switch complete JSON configs</td><td>Fan Control owns the fast thermal loop</td><td>Fallback config activates if gateway dies</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="roadmap" class="section-anchor mt-12">
+      <p class="eyebrow">06 · Delivery roadmap</p>
+      <h2 class="mt-2 text-3xl font-bold">One-hour AI build sprint with hard promotion gates</h2>
+      <div role="alert" class="alert alert-info mt-4">
+        <span><strong>Estimate basis:</strong> approximately 60 minutes of autonomous implementation with dependencies available, administrator access configured, target hardware connected, and parallel test execution. Hardware soak, benchmark duration, reboot cycles, vendor licensing, signing, and human approvals are elapsed validation time—not coding effort—and remain governed by the exit gates below.</span>
+      </div>
+      <div class="mt-6 space-y-4">
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 0</span><h3 class="mt-2 font-bold">Workspace + contract</h3><p class="text-sm text-base-content/60">5 minutes</p></div><div class="flex-1"><p>Create the Cargo workspace, pin the stable toolchain, add CI formatting/lint/audit gates, and freeze provider traits, capability schemas, risk classes, conflict model, experiment record, and error taxonomy.</p><p class="mt-2 text-sm font-semibold">Gate: a fake Rust sidecar passes discover → snapshot → apply → verify → rollback over the real IPC protocol.</p></div></div></article>
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 1</span><h3 class="mt-2 font-bold">Read-only alpha</h3><p class="text-sm text-base-content/60">10 minutes</p></div><div class="flex-1"><p>Build the Rust MCP gateway with rmcp, hardware inventory, telemetry normalizer, rusqlite journal actor, PresentMon sidecar, and the isolated .NET LibreHardwareMonitor bridge.</p><p class="mt-2 text-sm font-semibold">Gate: reproducible baseline reports with clock, thermal, power, latency, and workload context.</p></div></div></article>
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 2</span><h3 class="mt-2 font-bold">Safe actuators</h3><p class="text-sm text-base-content/60">15 minutes</p></div><div class="flex-1"><p>Add the privileged broker, named-pipe ACLs, Process Lasso profile switching, cloned Windows power schemes, curated Registry transactions, and TTL leases.</p><p class="mt-2 text-sm font-semibold">Gate: killing the gateway always restores every active change.</p></div></div></article>
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 3</span><h3 class="mt-2 font-bold">Hardware adapters</h3><p class="text-sm text-base-content/60">10 minutes</p></div><div class="flex-1"><p>Add NVML or AMD SMI and Fan Control profile switching. Introduce exclusive ownership locks and an independent watchdog.</p><p class="mt-2 text-sm font-semibold">Gate: injected telemetry loss, provider crash, and thermal trip all restore defaults.</p></div></div></article>
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 4</span><h3 class="mt-2 font-bold">Experiment engine</h3><p class="text-sm text-base-content/60">10 minutes</p></div><div class="flex-1"><p>Implement baseline, warmup, repeated candidate trials, cooldown, practical-effect threshold, keep/rollback, and profile promotion. Add LLM hypothesis tools only after deterministic runs work.</p><p class="mt-2 text-sm font-semibold">Gate: the same trial can be replayed from its journal without the original LLM conversation.</p></div></div></article>
+        <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 5</span><h3 class="mt-2 font-bold">Hardening</h3><p class="text-sm text-base-content/60">10 minutes</p></div><div class="flex-1"><p>Fault injection, reboot recovery, binary/version verification, tamper tests, least-privilege review, installer/uninstaller, diagnostics bundle, and single-machine pilot.</p><p class="mt-2 text-sm font-semibold">Gate: uninstall restores baseline and leaves no active rules, services, profiles, or Registry values created by the product.</p></div></div></article>
+      </div>
+    </section>
+
+    <section id="safety" class="section-anchor mt-12 grid gap-6 lg:grid-cols-2">
+      <div>
+        <p class="eyebrow">07 · Safety invariants</p>
+        <h2 class="mt-2 text-3xl font-bold">Rules code cannot override</h2>
+        <ul class="list mt-5 rounded-box border border-base-content/10 bg-base-100">
+          <li class="list-row"><div class="text-success">01</div><div><strong>No generic shell or raw Registry path</strong><div class="text-sm text-base-content/65">Only catalogued semantic capabilities reach the broker.</div></div></li>
+          <li class="list-row"><div class="text-success">02</div><div><strong>Every write has a snapshot and TTL</strong><div class="text-sm text-base-content/65">If rollback cannot be proven before apply, reject the change.</div></div></li>
+          <li class="list-row"><div class="text-success">03</div><div><strong>Unknown versions fail closed</strong><div class="text-sm text-base-content/65">Provider discovery never guesses an integration contract.</div></div></li>
+          <li class="list-row"><div class="text-success">04</div><div><strong>Watchdog is independent</strong><div class="text-sm text-base-content/65">The LLM, gateway, and experiment process cannot disable it.</div></div></li>
+          <li class="list-row"><div class="text-success">05</div><div><strong>One owner per knob</strong><div class="text-sm text-base-content/65">Conflicting tools block promotion until ownership is resolved.</div></div></li>
+        </ul>
+      </div>
+      <div>
+        <p class="eyebrow">08 · Test strategy</p>
+        <h2 class="mt-2 text-3xl font-bold">Verify failure, not only success</h2>
+        <div class="mt-5 space-y-3">
+          <div class="collapse collapse-arrow border border-base-content/10 bg-base-100"><input type="checkbox"><div class="collapse-title font-semibold">Adapter contract tests</div><div class="collapse-content text-sm text-base-content/70">Fake providers and real providers must pass identical lifecycle, idempotency, timeout, snapshot, verification, and rollback tests.</div></div>
+          <div class="collapse collapse-arrow border border-base-content/10 bg-base-100"><input type="checkbox"><div class="collapse-title font-semibold">Fault injection</div><div class="collapse-content text-sm text-base-content/70">Kill gateway, broker client, provider, and workload; corrupt a response; remove telemetry; force a timeout; reboot with an active lease.</div></div>
+          <div class="collapse collapse-arrow border border-base-content/10 bg-base-100"><input type="checkbox"><div class="collapse-title font-semibold">Hardware-in-the-loop</div><div class="collapse-content text-sm text-base-content/70">Fan and GPU tests run only on a sacrificial lab machine with hard temperature limits and physical recovery access.</div></div>
+          <div class="collapse collapse-arrow border border-base-content/10 bg-base-100"><input type="checkbox"><div class="collapse-title font-semibold">Statistical benchmark tests</div><div class="collapse-content text-sm text-base-content/70">Use controlled warmup, repeated baseline/candidate runs, cooldown, correctness checks, and a minimum practical improvement.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="acceptance" class="section-anchor mt-12">
+      <p class="eyebrow">09 · MVP acceptance</p>
+      <h2 class="mt-2 text-3xl font-bold">The prototype is done when...</h2>
+      <div class="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>Installed providers and capabilities are discovered</span></label>
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>A complete baseline snapshot is journaled</span></label>
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>Process Lasso profile apply/restore is proven</span></label>
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>One power, Registry, GPU, and fan transaction works</span></label>
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>Crash, timeout, and reboot rollback are demonstrated</span></label>
+        <label class="label cursor-default rounded-box border border-base-content/10 bg-base-100 p-4"><input type="checkbox" class="checkbox checkbox-success" disabled><span>One measured experiment promotes or rejects safely</span></label>
+      </div>
+    </section>
+
+    <section id="decisions" class="section-anchor review-only mt-12 rounded-box border border-primary/30 bg-base-100 p-6 shadow-xl lg:p-8">
+      <p class="eyebrow">Review decisions</p>
+      <h2 class="mt-2 text-3xl font-bold">Resolve the prototype shape</h2>
+      <p class="mt-2 text-base-content/70">The recommended defaults are selected. Change them if needed, then queue one consolidated decision for the implementation spec.</p>
+      <form class="decision-form mt-6 grid gap-5 lg:grid-cols-2" data-lavish-question="prototype-scope" onsubmit="event.preventDefault(); const f = new FormData(event.currentTarget); const message = `Use these prototype decisions: workload=${f.get('workload')}; GPU=${f.get('gpu')}; third-party delivery=${f.get('delivery')}; medium-risk approvals=${f.get('approval')}. Keep the locked Rust-first language and hybrid repository decisions. Update the implementation plan and produce the detailed provider protocol spec.`; window.lavish.queuePrompt(message, { tag: 'scope', text: 'Prototype scope decisions', element: event.currentTarget, queueKey: 'prototype-scope', data: Object.fromEntries(f.entries()) });">
+        <fieldset class="fieldset"><legend class="fieldset-legend">Primary workload</legend><select class="select select-bordered" name="workload"><option value="gaming latency and frame pacing">Gaming latency and frame pacing</option><option value="AI inference throughput">AI inference throughput</option><option value="mixed workstation responsiveness">Mixed workstation responsiveness</option></select><p class="label">Defines the first immutable evaluator and metrics.</p></fieldset>
+        <fieldset class="fieldset"><legend class="fieldset-legend">First GPU provider</legend><select class="select select-bordered" name="gpu"><option value="NVIDIA NVML">NVIDIA NVML — recommended</option><option value="AMD SMI">AMD SMI</option><option value="no GPU control in first milestone">No GPU control initially</option></select><p class="label">Monitoring can remain cross-vendor even if control begins with one.</p></fieldset>
+        <fieldset class="fieldset"><legend class="fieldset-legend">Third-party delivery</legend><select class="select select-bordered" name="delivery"><option value="user-installed tools detected at runtime">User-installed tools — recommended</option><option value="pursue redistribution agreements before prototype">Pursue redistribution before prototype</option></select><p class="label">Avoids early packaging and licensing commitments.</p></fieldset>
+        <fieldset class="fieldset"><legend class="fieldset-legend">Medium-risk approval</legend><select class="select select-bordered" name="approval"><option value="prompt before every apply">Prompt before every apply — recommended</option><option value="pre-approved signed policies may run unattended">Pre-approved policies may run unattended</option></select><p class="label">Low-risk read-only and temporary profile operations remain autonomous.</p></fieldset>
+        <div class="lg:col-span-2 flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-5">
+          <span class="text-sm text-base-content/60">Selection stays local until you queue it.</span>
+          <button type="submit" class="btn btn-primary">Queue scope decision</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="mt-12">
+      <p class="eyebrow">Primary references</p>
+      <div class="mt-4 flex flex-wrap gap-2">
+        <a class="btn btn-sm btn-outline" href="https://bitsum.com/processlasso-docs/" target="_blank" rel="noreferrer">Process Lasso docs</a>
+        <a class="btn btn-sm btn-outline" href="https://getfancontrol.com/docs/" target="_blank" rel="noreferrer">Fan Control docs</a>
+        <a class="btn btn-sm btn-outline" href="https://github.com/GameTechDev/PresentMon" target="_blank" rel="noreferrer">PresentMon</a>
+        <a class="btn btn-sm btn-outline" href="https://github.com/LibreHardwareMonitor/LibreHardwareMonitor" target="_blank" rel="noreferrer">LibreHardwareMonitor</a>
+        <a class="btn btn-sm btn-outline" href="https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceCommands.html" target="_blank" rel="noreferrer">NVML</a>
+        <a class="btn btn-sm btn-outline" href="https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry" target="_blank" rel="noreferrer">Windows Registry</a>
+        <a class="btn btn-sm btn-outline" href="https://turborepo.dev/docs/crafting-your-repository/structuring-a-repository" target="_blank" rel="noreferrer">Turborepo structure</a>
+        <a class="btn btn-sm btn-outline" href="https://github.com/open-telemetry/opentelemetry-collector-contrib" target="_blank" rel="noreferrer">OpenTelemetry components</a>
+        <a class="btn btn-sm btn-outline" href="https://v2.tauri.app/develop/sidecar/" target="_blank" rel="noreferrer">Tauri sidecars</a>
+        <a class="btn btn-sm btn-outline" href="https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html" target="_blank" rel="noreferrer">Cargo workspaces</a>
+        <a class="btn btn-sm btn-outline" href="https://github.com/microsoft/windows-rs" target="_blank" rel="noreferrer">Microsoft windows-rs</a>
+        <a class="btn btn-sm btn-outline" href="https://github.com/modelcontextprotocol/rust-sdk" target="_blank" rel="noreferrer">Official MCP Rust SDK</a>
+        <a class="btn btn-sm btn-outline" href="https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/index.html" target="_blank" rel="noreferrer">Tokio named pipes</a>
+      </div>
+    </section>
+  </main>
+  <script type="module">
+    import { File } from "https://esm.sh/@pierre/diffs@1.2.10?bundle";
+    const tree = [
+      "performance-gateway/",
+      "├── apps/",
+      "│   ├── gateway/                 # non-admin MCP/API process",
+      "│   ├── broker/                  # privileged Windows service",
+      "│   ├── watchdog/                # independent TTL and safety service",
+      "│   ├── experiment-runner/",
+      "│   ├── cli/",
+      "│   └── desktop/                 # deferred UI shell",
+      "├── sidecars/",
+      "│   ├── process-lasso/",
+      "│   │   ├── sidecar.yaml",
+      "│   │   ├── src/",
+      "│   │   ├── platform/windows/",
+      "│   │   ├── fixtures/",
+      "│   │   └── tests/",
+      "│   ├── fan-control/",
+      "│   ├── presentmon/",
+      "│   ├── nvidia/",
+      "│   │   └── platform/{windows,linux}/",
+      "│   ├── amd/",
+      "│   ├── windows-power/",
+      "│   └── windows-registry/",
+      "├── crates/",
+      "│   ├── contracts/",
+      "│   ├── capability-registry/",
+      "│   ├── policy-engine/",
+      "│   ├── telemetry-model/",
+      "│   ├── experiment-model/",
+      "│   ├── journal/",
+      "│   ├── ipc/",
+      "│   ├── provider-sdk/",
+      "│   └── testkit/",
+      "├── bridges/",
+      "│   └── dotnet/",
+      "│       └── libre-hardware-monitor/",
+      "│           ├── Bridge.csproj",
+      "│           ├── Program.cs",
+      "│           └── tests/",
+      "├── schemas/",
+      "│   ├── capability.schema.json",
+      "│   ├── sidecar.schema.json",
+      "│   ├── change.schema.json",
+      "│   └── experiment.schema.json",
+      "├── policies/",
+      "│   ├── risk/",
+      "│   ├── conflicts/",
+      "│   └── registry-catalog/",
+      "├── profiles/{process-lasso,fan-control,power}/",
+      "├── tests/{contract,integration,hardware,fault,fixtures}/",
+      "├── packaging/{windows,linux,manifests}/",
+      "├── docs/{adr,threat-model,providers,runbooks}/",
+      "├── tools/{build,dev,release}/",
+      "├── third-party/                # metadata and notices by default",
+      "├── xtask/                       # build, schema, package, release tasks",
+      "├── Cargo.toml                   # apps/*, crates/*, sidecars/*, xtask",
+      "├── Cargo.lock",
+      "├── rust-toolchain.toml          # pinned stable toolchain",
+      "├── rustfmt.toml",
+      "├── clippy.toml",
+      "└── deny.toml"
+    ].join("\n");
+    const container = document.querySelector("#repo-tree-file");
+    if (container) {
+      new File({
+        theme: { light: "github-light", dark: "github-dark" },
+        themeType: "dark",
+        overflow: "wrap"
+      }).render({
+        containerWrapper: container,
+        file: { name: "proposed-tree.txt", contents: tree }
+      });
+    }
+  </script>
+</body>
+</html>
