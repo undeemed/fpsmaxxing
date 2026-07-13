@@ -2,11 +2,13 @@
 
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
+The current read-only alpha implements the gateway and an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, wired to a single mock provider; the privileged broker, watchdog, and experiment runner remain scaffolds.
+
 ## Processes
 
 ### Gateway
 
-The unprivileged MCP server translates agent tool calls into typed capability requests. It may inspect public capability metadata and telemetry but cannot directly mutate the host.
+The unprivileged MCP server translates agent tool calls into typed capability requests. It may inspect public capability metadata and telemetry but cannot directly mutate the host. The alpha gateway serves line-delimited JSON-RPC over stdio.
 
 ### Broker
 
@@ -22,7 +24,7 @@ The runner controls workload setup, warmup, repeated measurements, cooldown, cor
 
 ### Provider sidecars
 
-Each sidecar integrates exactly one service or vendor API. Sidecars advertise semantic capabilities and implement snapshot, apply, verify, and rollback. They do not make cross-provider decisions.
+Each sidecar integrates exactly one service or vendor API. Sidecars advertise semantic capabilities and implement snapshot, preview, apply, verify, and rollback. They do not make cross-provider decisions.
 
 ## Dependency rule
 
