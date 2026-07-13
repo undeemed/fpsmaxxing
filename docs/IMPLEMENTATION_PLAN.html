@@ -21,9 +21,7 @@
     .code-chip { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .78rem; }
     .sticky-nav { position: sticky; top: .75rem; z-index: 20; backdrop-filter: blur(16px); }
     .mermaid { background: var(--color-base-100); border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent); border-radius: 1rem; padding: 1rem; overflow-x: auto; }
-    .decision-form fieldset { width: 100%; max-width: 100%; min-width: 0; min-inline-size: 0; margin-inline: 0; padding-inline: 0; overflow: hidden; }
-    .decision-form select { display: block; width: 100%; max-width: 100%; min-width: 0; text-overflow: ellipsis; }
-    @media print { .sticky-nav, .review-only { display: none !important; } body { background: white; } }
+    @media print { .sticky-nav { display: none !important; } body { background: white; } }
   </style>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
@@ -54,7 +52,7 @@
       <div class="navbar-end gap-2">
         <a href="#monorepo" class="btn btn-ghost btn-sm hidden md:inline-flex">Repository</a>
         <a href="#roadmap" class="btn btn-ghost btn-sm hidden sm:inline-flex">Roadmap</a>
-        <a href="#decisions" class="btn btn-primary btn-sm">Decide scope</a>
+        <a href="IMPLEMENTATION_PLAN.md" class="btn btn-primary btn-sm">Markdown plan</a>
       </div>
     </nav>
 
@@ -317,20 +315,16 @@ flowchart TD
       </div>
     </section>
 
-    <section id="decisions" class="section-anchor review-only mt-12 rounded-box border border-primary/30 bg-base-100 p-6 shadow-xl lg:p-8">
-      <p class="eyebrow">Review decisions</p>
-      <h2 class="mt-2 text-3xl font-bold">Resolve the prototype shape</h2>
-      <p class="mt-2 text-base-content/70">The recommended defaults are selected. Change them if needed, then queue one consolidated decision for the implementation spec.</p>
-      <form class="decision-form mt-6 grid gap-5 lg:grid-cols-2" data-lavish-question="prototype-scope" onsubmit="event.preventDefault(); const f = new FormData(event.currentTarget); const message = `Use these prototype decisions: workload=${f.get('workload')}; GPU=${f.get('gpu')}; third-party delivery=${f.get('delivery')}; medium-risk approvals=${f.get('approval')}. Keep the locked Rust-first language and hybrid repository decisions. Update the implementation plan and produce the detailed provider protocol spec.`; window.lavish.queuePrompt(message, { tag: 'scope', text: 'Prototype scope decisions', element: event.currentTarget, queueKey: 'prototype-scope', data: Object.fromEntries(f.entries()) });">
-        <fieldset class="fieldset"><legend class="fieldset-legend">Primary workload</legend><select class="select select-bordered" name="workload"><option value="gaming latency and frame pacing">Gaming latency and frame pacing</option><option value="AI inference throughput">AI inference throughput</option><option value="mixed workstation responsiveness">Mixed workstation responsiveness</option></select><p class="label">Defines the first immutable evaluator and metrics.</p></fieldset>
-        <fieldset class="fieldset"><legend class="fieldset-legend">First GPU provider</legend><select class="select select-bordered" name="gpu"><option value="NVIDIA NVML">NVIDIA NVML — recommended</option><option value="AMD SMI">AMD SMI</option><option value="no GPU control in first milestone">No GPU control initially</option></select><p class="label">Monitoring can remain cross-vendor even if control begins with one.</p></fieldset>
-        <fieldset class="fieldset"><legend class="fieldset-legend">Third-party delivery</legend><select class="select select-bordered" name="delivery"><option value="user-installed tools detected at runtime">User-installed tools — recommended</option><option value="pursue redistribution agreements before prototype">Pursue redistribution before prototype</option></select><p class="label">Avoids early packaging and licensing commitments.</p></fieldset>
-        <fieldset class="fieldset"><legend class="fieldset-legend">Medium-risk approval</legend><select class="select select-bordered" name="approval"><option value="prompt before every apply">Prompt before every apply — recommended</option><option value="pre-approved signed policies may run unattended">Pre-approved policies may run unattended</option></select><p class="label">Low-risk read-only and temporary profile operations remain autonomous.</p></fieldset>
-        <div class="lg:col-span-2 flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-5">
-          <span class="text-sm text-base-content/60">Selection stays local until you queue it.</span>
-          <button type="submit" class="btn btn-primary">Queue scope decision</button>
-        </div>
-      </form>
+    <section id="decisions" class="section-anchor mt-12 rounded-box border border-primary/30 bg-base-100 p-6 shadow-xl lg:p-8">
+      <p class="eyebrow">Prototype defaults</p>
+      <h2 class="mt-2 text-3xl font-bold">The first vertical slice</h2>
+      <p class="mt-2 text-base-content/70">These defaults keep the initial implementation narrow, measurable, and reversible. Amend the Markdown plan through normal review when the scope changes.</p>
+      <div class="mt-6 grid gap-4 sm:grid-cols-2">
+        <article class="card card-border bg-base-200"><div class="card-body"><h3 class="card-title text-base">Primary workload</h3><p class="font-semibold">Gaming latency and frame pacing</p><p class="text-sm text-base-content/70">Defines the first immutable evaluator and metrics.</p></div></article>
+        <article class="card card-border bg-base-200"><div class="card-body"><h3 class="card-title text-base">First GPU provider</h3><p class="font-semibold">NVIDIA NVML</p><p class="text-sm text-base-content/70">Monitoring can remain cross-vendor while control begins with one supported API.</p></div></article>
+        <article class="card card-border bg-base-200"><div class="card-body"><h3 class="card-title text-base">Third-party delivery</h3><p class="font-semibold">User-installed tools detected at runtime</p><p class="text-sm text-base-content/70">Avoids early packaging and redistribution commitments.</p></div></article>
+        <article class="card card-border bg-base-200"><div class="card-body"><h3 class="card-title text-base">Medium-risk approval</h3><p class="font-semibold">Prompt before every apply</p><p class="text-sm text-base-content/70">Read-only and low-risk temporary operations remain policy-controlled.</p></div></article>
+      </div>
     </section>
 
     <section class="mt-12">

@@ -1,6 +1,6 @@
 # Agent instructions
 
-Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and `docs/threat-model/README.md` before changing architecture or privileged code.
+Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and `docs/threat-model/README.md` before changing architecture or privileged code.
 
 ## Non-negotiable boundaries
 

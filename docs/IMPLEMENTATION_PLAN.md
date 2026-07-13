@@ -1,5 +1,7 @@
 # FPSMaxxing implementation plan
 
+[Documentation index](README.md) · [HTML visualization](IMPLEMENTATION_PLAN.html)
+
 ## Goal
 
 Build a Windows-first, Rust-first performance-control gateway that lets an LLM inspect, propose, measure, and roll back safe system tuning experiments through typed capabilities rather than administrator shell access.

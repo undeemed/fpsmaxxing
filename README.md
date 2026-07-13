@@ -60,7 +60,7 @@ The repository currently includes:
 - A working mock sidecar with snapshot/apply/verify/rollback tests
 - Scaffolds for the gateway, privileged broker, watchdog, experiment runner, and CLI
 - OSS governance, security policy, issue templates, and CI
-- The complete [implementation plan](docs/IMPLEMENTATION_PLAN.md)
+- An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 
 Try the safe scaffold:
 
@@ -85,7 +85,9 @@ telemetry normalizer ◄──────────── independent watchdo
 experiment journal and benchmark decision gate
 ```
 
-See [Architecture](docs/ARCHITECTURE.md), [Implementation Plan](docs/IMPLEMENTATION_PLAN.md), and [Agent Instructions](AGENTS.md).
+## Documentation
+
+Start with the [documentation index](docs/README.md). The core references are the [architecture](docs/ARCHITECTURE.md), implementation plan in [Markdown](docs/IMPLEMENTATION_PLAN.md) or [HTML](docs/IMPLEMENTATION_PLAN.html), [threat model](docs/threat-model/README.md), and [agent instructions](AGENTS.md).
 
 ## Frequently asked questions
 
