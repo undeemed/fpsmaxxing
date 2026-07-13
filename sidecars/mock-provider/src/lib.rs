@@ -41,7 +41,7 @@ impl Provider for MockProvider {
                 input_schema: json!({
                     "type": "object",
                     "required": ["value"],
-                    "properties": { "value": { "type": "integer", "minimum": 0 } }
+                    "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 100 } }
                 }),
             }],
         }

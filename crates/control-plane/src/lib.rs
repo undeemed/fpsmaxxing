@@ -96,13 +96,15 @@ impl ControlPlane {
     }
 
     /// Executes all provider lifecycle stages, restoring the snapshot even
-    /// when verification or journaling fails after the write.
+    /// when apply, verification, or journaling fails after the snapshot is
+    /// captured.
     ///
     /// # Errors
     ///
     /// Returns an error when policy, the provider, or the journal rejects a
-    /// stage; once apply has run, rollback is attempted before any error is
-    /// returned, and a failed restore takes precedence over other failures.
+    /// stage; once apply has been attempted, rollback runs before any error
+    /// is returned, and a failed restore takes precedence over other
+    /// failures.
     pub fn run_lifecycle(
         &mut self,
         request: &ChangeRequest,
@@ -113,8 +115,11 @@ impl ControlPlane {
         self.record(experiment, "snapshot", &snapshot)?;
         let preview = self.provider.preview(request)?;
         self.record(experiment, "preview", &json!({ "description": preview }))?;
-        self.provider.apply(request)?;
-        let observed = self.observe_applied(experiment, request);
+        let observed = self
+            .provider
+            .apply(request)
+            .map_err(ControlPlaneError::from)
+            .and_then(|()| self.observe_applied(experiment, request));
         self.restore(experiment, &snapshot)?;
         let verified = observed?;
         Ok(LifecycleResult {
@@ -252,6 +257,7 @@ mod tests {
     struct FakeProvider {
         value: u64,
         fail_verification: bool,
+        fail_apply: bool,
     }
 
     impl Provider for FakeProvider {
@@ -268,7 +274,7 @@ mod tests {
                     input_schema: json!({
                         "type": "object",
                         "required": ["value"],
-                        "properties": { "value": { "type": "integer", "minimum": 0 } }
+                        "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 100 } }
                     }),
                 }],
             }
@@ -291,6 +297,11 @@ mod tests {
                 .get("value")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| ProviderError::InvalidRequest("value must be a u64".to_owned()))?;
+            if self.fail_apply {
+                return Err(ProviderError::Unavailable(
+                    "apply failed after mutating state".to_owned(),
+                ));
+            }
             Ok(())
         }
 
@@ -331,6 +342,7 @@ mod tests {
             Box::new(FakeProvider {
                 value: 7,
                 fail_verification,
+                fail_apply: false,
             }),
             ":memory:",
         )
@@ -360,6 +372,36 @@ mod tests {
         assert_eq!(
             plane.journal_stages().expect("journal should read"),
             LIFECYCLE_STAGES
+        );
+        let restored: String = plane
+            .journal
+            .query_row(
+                "SELECT payload FROM experiment_journal WHERE stage = 'rollback-verify'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rollback-verify record should exist");
+        assert_eq!(restored, r#"{"restored":true}"#);
+    }
+
+    #[test]
+    fn failed_apply_still_restores_the_snapshot() {
+        let mut plane = ControlPlane::open(
+            Box::new(FakeProvider {
+                value: 7,
+                fail_verification: false,
+                fail_apply: true,
+            }),
+            ":memory:",
+        )
+        .expect("journal should open");
+        let error = plane
+            .run_lifecycle(&request(42))
+            .expect_err("apply should fail");
+        assert!(matches!(error, ControlPlaneError::Provider(_)));
+        assert_eq!(
+            plane.journal_stages().expect("journal should read"),
+            ["snapshot", "preview", "rollback", "rollback-verify"]
         );
         let restored: String = plane
             .journal

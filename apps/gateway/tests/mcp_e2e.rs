@@ -52,6 +52,8 @@ fn mcp_client_discovers_capabilities_and_runs_the_journaled_lifecycle() {
     let journal = temp.path().join("journal.sqlite");
     let (mut child, mut stdin, mut reader) = spawn_gateway(&journal);
 
+    let mut advertised_value_schema = None;
+    let mut registry_value_schema = None;
     for request in [
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
@@ -64,21 +66,22 @@ fn mcp_client_discovers_capabilities_and_runs_the_journaled_lifecycle() {
             "unexpected MCP error: {response}"
         );
         if response["id"] == 2 {
-            assert_eq!(
-                response["result"]["tools"]
-                    .as_array()
-                    .expect("tools array")
-                    .len(),
-                2
-            );
+            let tools = response["result"]["tools"].as_array().expect("tools array");
+            assert_eq!(tools.len(), 2);
+            let lifecycle = tools
+                .iter()
+                .find(|tool| tool["name"] == "fpsmaxxing.run_mock_lifecycle")
+                .expect("lifecycle tool should be listed");
+            advertised_value_schema = Some(lifecycle["inputSchema"]["properties"]["value"].clone());
         }
         if response["id"] == 3 {
-            assert!(
-                response["result"]["content"][0]["text"]
-                    .as_str()
-                    .expect("text")
-                    .contains("mock.value")
-            );
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text");
+            assert!(text.contains("mock.value"));
+            let manifest: Value = serde_json::from_str(text).expect("manifest should be JSON");
+            registry_value_schema =
+                Some(manifest["capabilities"][0]["input_schema"]["properties"]["value"].clone());
         }
         if response["id"] == 4 {
             assert!(
@@ -89,6 +92,11 @@ fn mcp_client_discovers_capabilities_and_runs_the_journaled_lifecycle() {
             );
         }
     }
+    assert_eq!(
+        advertised_value_schema.expect("tools/list should advertise value bounds"),
+        registry_value_schema.expect("registry should advertise value bounds"),
+        "tools/list schema must match the capability registry"
+    );
     drop(stdin);
     assert!(child.wait().expect("gateway should exit").success());
     assert_eq!(
