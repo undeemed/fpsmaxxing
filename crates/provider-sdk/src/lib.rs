@@ -33,6 +33,14 @@ pub trait Provider {
     /// cannot produce a complete rollback snapshot.
     fn snapshot(&self) -> Result<StateSnapshot, ProviderError>;
 
+    /// Produces a human-readable, side-effect-free description of a change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] when the request is not supported or cannot
+    /// be described safely.
+    fn preview(&self, request: &ChangeRequest) -> Result<String, ProviderError>;
+
     /// Applies a previously policy-validated request.
     ///
     /// # Errors

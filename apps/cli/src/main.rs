@@ -1,6 +1,7 @@
 //! Operator CLI for diagnostics and local development.
 
 use std::env;
+use std::path::PathBuf;
 
 fn main() {
     match env::args().nth(1).as_deref() {
@@ -15,9 +16,18 @@ fn main() {
 }
 
 fn doctor() {
-    println!("FPSMaxxing scaffold diagnostics");
+    let journal = env::var("FPSMAXXING_JOURNAL_PATH").map_or_else(
+        |_| PathBuf::from("fpsmaxxing-journal.sqlite"),
+        PathBuf::from,
+    );
+    let journal_status = rusqlite::Connection::open(&journal)
+        .and_then(|connection| connection.execute_batch("PRAGMA journal_mode = WAL;"))
+        .map_or("unavailable", |()| "ready");
+    println!("FPSMaxxing diagnostics");
     println!("  contracts: ready");
     println!("  provider SDK: ready");
+    println!("  gateway: MCP mock path available");
+    println!("  journal: {journal_status} ({})", journal.display());
     println!("  hardware writes: disabled");
-    println!("  status: architecture scaffold only");
+    println!("  status: read-only alpha mock path ready");
 }

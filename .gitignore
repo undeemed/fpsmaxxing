@@ -19,3 +19,6 @@ Thumbs.db
 # .NET bridge output.
 **/bin/
 **/obj/
+
+.sentrux/cache.bin
+.sentrux/churn.bin
