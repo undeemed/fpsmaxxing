@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible problem that is not security-sensitive.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not disclose privilege-boundary or unsafe hardware-control vulnerabilities here. Use private vulnerability reporting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      placeholder: Commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps, logs, and relevant provider versions.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS build, CPU, GPU, motherboard, drivers, and installed providers.
+    validations:
+      required: true

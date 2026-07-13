@@ -1,0 +1,16 @@
+[risk.read-only]
+approval = "automatic"
+requires_snapshot = false
+
+[risk.reversible]
+approval = "policy"
+requires_snapshot = true
+requires_lease = true
+
+[risk.approval-required]
+approval = "interactive"
+requires_snapshot = true
+requires_lease = true
+
+[risk.denied]
+approval = "never"
