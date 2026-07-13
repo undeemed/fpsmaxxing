@@ -46,12 +46,12 @@ Source is organized by deployable role and provider. Release artifacts are assem
 
 Every provider implements the same lifecycle:
 
-1. `discover` — version, health, target, capabilities, valid ranges, conflicts.
-2. `snapshot` — capture the exact state required for reversal.
-3. `preview` — produce a typed, human-readable change description.
-4. `apply` — perform one policy-approved bounded change.
-5. `verify` — read back provider state and observe the real system effect.
-6. `rollback` — restore the snapshot without consulting the LLM.
+1. `discover` - version, health, target, capabilities, valid ranges, conflicts.
+2. `snapshot` - capture the exact state required for reversal.
+3. `preview` - produce a typed, human-readable change description.
+4. `apply` - perform one policy-approved bounded change.
+5. `verify` - read back provider state and observe the real system effect.
+6. `rollback` - restore the snapshot without consulting the LLM.
 
 Every mutation has a TTL lease. If the gateway, workload, or agent dies, the watchdog restores the prior state.
 

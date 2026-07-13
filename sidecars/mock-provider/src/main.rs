@@ -1,6 +1,6 @@
 //! Reference sidecar used to validate the provider lifecycle without hardware.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use fpsmaxxing_contracts::{
     CapabilityDescriptor, ChangeRequest, Persistence, ProviderManifest, RiskClass, StateSnapshot,
@@ -74,7 +74,7 @@ fn main() -> Result<(), ProviderError> {
     let request = ChangeRequest {
         capability_id: "mock.value".to_owned(),
         parameters: json!({ "value": 1 }),
-        lease_seconds: 30,
+        lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
     };
 
     provider.apply(&request)?;
@@ -95,7 +95,7 @@ mod tests {
         let request = ChangeRequest {
             capability_id: "mock.value".to_owned(),
             parameters: json!({ "value": 42 }),
-            lease_seconds: 30,
+            lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
         };
 
         provider.apply(&request).expect("apply should succeed");

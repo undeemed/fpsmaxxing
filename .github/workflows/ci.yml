@@ -17,11 +17,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install pinned Rust toolchain
         run: rustup toolchain install
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check workspace
@@ -35,20 +35,14 @@ jobs:
     name: Cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Check advisories, bans, licenses, and sources
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@d8395c1c8c9df74d968a3bcbba5533e396ff43cf # v2.0.9
 
   schemas:
     name: JSON schemas
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Parse schemas
-        shell: python
-        run: |
-          import json
-          from pathlib import Path
-          for path in Path("schemas").glob("*.json"):
-              json.loads(path.read_text())
-              print(f"validated {path}")
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Validate schemas against their declared metaschema
+        run: pipx run check-jsonschema --check-metaschema schemas/*.json

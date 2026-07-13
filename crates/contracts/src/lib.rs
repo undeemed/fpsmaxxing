@@ -1,6 +1,6 @@
 //! Versioned data contracts shared by `FPSMaxxing` applications and sidecars.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -72,8 +72,9 @@ pub struct ChangeRequest {
     pub capability_id: String,
     /// Capability-specific parameters.
     pub parameters: Value,
-    /// Automatic rollback deadline in seconds.
-    pub lease_seconds: u64,
+    /// Automatic rollback deadline in seconds; every mutation carries a
+    /// non-zero TTL lease.
+    pub lease_seconds: NonZeroU64,
 }
 
 /// Opaque provider state captured before a change.
@@ -92,7 +93,9 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{CapabilityDescriptor, NonZeroU32, Persistence, ProviderManifest, RiskClass};
+    use super::{
+        CapabilityDescriptor, ChangeRequest, NonZeroU32, Persistence, ProviderManifest, RiskClass,
+    };
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
     const SIDECAR_SCHEMA: &str = include_str!("../../../schemas/sidecar.schema.json");
@@ -254,6 +257,60 @@ mod tests {
             serde_json::to_value(sample_manifest()).expect("manifest should serialize");
         serialized["protocol_version"] = json!(0);
         assert!(serde_json::from_value::<ProviderManifest>(serialized).is_err());
+    }
+
+    #[test]
+    fn lease_seconds_zero_is_rejected() {
+        let mut serialized = json!({
+            "capability_id": "mock.value",
+            "parameters": { "value": 1 },
+            "lease_seconds": 1
+        });
+        assert!(serde_json::from_value::<ChangeRequest>(serialized.clone()).is_ok());
+
+        serialized["lease_seconds"] = json!(0);
+        assert!(serde_json::from_value::<ChangeRequest>(serialized).is_err());
+    }
+
+    #[test]
+    fn generated_schemas_match_checked_in_schemas() {
+        let cases = [
+            (
+                schemars::schema_for!(CapabilityDescriptor),
+                serde_json::from_str::<Value>(CAPABILITY_SCHEMA)
+                    .expect("capability schema should parse"),
+            ),
+            (
+                schemars::schema_for!(ProviderManifest),
+                serde_json::from_str::<Value>(SIDECAR_SCHEMA).expect("sidecar schema should parse"),
+            ),
+        ];
+
+        for (generated, checked_in) in cases {
+            let generated =
+                serde_json::to_value(generated).expect("generated schema should serialize");
+            let generated_properties: BTreeSet<String> = generated["properties"]
+                .as_object()
+                .expect("generated schema should declare properties")
+                .keys()
+                .cloned()
+                .collect();
+            let checked_in_properties: BTreeSet<String> = checked_in["properties"]
+                .as_object()
+                .expect("checked-in schema should declare properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(generated_properties, checked_in_properties);
+            assert_eq!(
+                string_set(&generated["required"]),
+                string_set(&checked_in["required"])
+            );
+            assert_eq!(
+                generated["additionalProperties"],
+                checked_in["additionalProperties"]
+            );
+        }
     }
 
     #[test]

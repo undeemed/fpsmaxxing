@@ -2,7 +2,7 @@
 
 **Autonomous, measurement-driven system performance tuning.**
 
-FPSMaxxing is an open-source Rust control plane for using an AI coding agent or LLM—such as Claude, Codex, or another MCP client—to improve gaming FPS, frame pacing, system latency, thermals, power efficiency, and compute throughput through bounded, reversible experiments.
+FPSMaxxing is an open-source Rust control plane for using an AI coding agent or LLM - such as Claude, Codex, or another MCP client - to improve gaming FPS, frame pacing, system latency, thermals, power efficiency, and compute throughput through bounded, reversible experiments.
 
 > [!IMPORTANT]
 > FPSMaxxing is currently an architecture scaffold. It does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.

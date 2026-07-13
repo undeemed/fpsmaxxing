@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Performance Gateway — Implementation Plan</title>
+  <title>FPSMaxxing - Implementation Plan</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
   <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
@@ -46,7 +46,7 @@
     <nav class="sticky-nav navbar rounded-box border border-base-content/10 bg-base-100/85 shadow-lg">
       <div class="navbar-start min-w-0">
         <a href="#top" class="btn btn-ghost min-w-0 text-left">
-          <span class="truncate">Performance Gateway</span>
+          <span class="truncate">FPSMaxxing</span>
         </a>
       </div>
       <div class="navbar-end gap-2">
@@ -59,7 +59,7 @@
     <section id="top" class="hero my-6 rounded-box border border-base-content/10 bg-base-100 shadow-xl">
       <div class="hero-content w-full items-start py-10 lg:py-14">
         <div class="w-full">
-          <p class="eyebrow">Implementation plan · Windows-first prototype</p>
+          <p class="eyebrow">FPSMaxxing implementation plan · Windows-first prototype</p>
           <div class="mt-3 grid gap-8 lg:grid-cols-[minmax(0,1.45fr)_minmax(0,.75fr)] lg:items-end">
             <div>
               <h1 class="pb-1 text-4xl font-black leading-[1.12] tracking-tight sm:text-5xl lg:text-6xl">Build the highways before the research loop.</h1>
@@ -266,7 +266,7 @@ flowchart TD
       <p class="eyebrow">06 · Delivery roadmap</p>
       <h2 class="mt-2 text-3xl font-bold">One-hour AI build sprint with hard promotion gates</h2>
       <div role="alert" class="alert alert-info mt-4">
-        <span><strong>Estimate basis:</strong> approximately 60 minutes of autonomous implementation with dependencies available, administrator access configured, target hardware connected, and parallel test execution. Hardware soak, benchmark duration, reboot cycles, vendor licensing, signing, and human approvals are elapsed validation time—not coding effort—and remain governed by the exit gates below.</span>
+        <span><strong>Estimate basis:</strong> approximately 60 minutes of autonomous implementation with dependencies available, administrator access configured, target hardware connected, and parallel test execution. Hardware soak, benchmark duration, reboot cycles, vendor licensing, signing, and human approvals are elapsed validation time - not coding effort - and remain governed by the exit gates below.</span>
       </div>
       <div class="mt-6 space-y-4">
         <article class="phase-card card card-border bg-base-100"><div class="card-body lg:flex-row lg:items-start lg:gap-8"><div class="lg:w-40"><span class="badge badge-primary badge-soft">Phase 0</span><h3 class="mt-2 font-bold">Workspace + contract</h3><p class="text-sm text-base-content/60">5 minutes</p></div><div class="flex-1"><p>Create the Cargo workspace, pin the stable toolchain, add CI formatting/lint/audit gates, and freeze provider traits, capability schemas, risk classes, conflict model, experiment record, and error taxonomy.</p><p class="mt-2 text-sm font-semibold">Gate: a fake Rust sidecar passes discover → snapshot → apply → verify → rollback over the real IPC protocol.</p></div></div></article>
