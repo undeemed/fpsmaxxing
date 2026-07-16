@@ -149,7 +149,7 @@ flowchart TD
           <thead><tr><th>Concern</th><th>Decision</th><th>Reason</th></tr></thead>
           <tbody>
             <tr><td>Async runtime</td><td class="code-chip">tokio</td><td>Shared runtime for MCP, provider supervision, telemetry streams, timers, and Windows named pipes.</td></tr>
-            <tr><td>LLM interface</td><td class="code-chip">rmcp</td><td>The official Rust MCP SDK already uses Tokio, Serde, and generated JSON Schemas.</td></tr>
+            <tr><td>LLM interface</td><td class="code-chip">stdio JSON-RPC (alpha)</td><td>The Linux-safe mock alpha uses a minimal hand-rolled MCP subset; the official Rust MCP SDK remains the target transport for promotion beyond this seam.</td></tr>
             <tr><td>Windows APIs</td><td class="code-chip">windows-registry, windows-services, windows</td><td>Prefer Microsoft's focused crates; enable only required Win32 namespaces for lower API surface.</td></tr>
             <tr><td>Local privileged IPC</td><td class="code-chip">tokio named pipes + length-prefixed JSON</td><td>Inspectable v1 protocol with named-pipe ACLs; no localhost TCP listener.</td></tr>
             <tr><td>Contracts</td><td class="code-chip">serde + schemars</td><td>One Rust type generates wire-format JSON Schema and validates MCP inputs.</td></tr>
