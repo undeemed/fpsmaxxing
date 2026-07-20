@@ -11,6 +11,7 @@ Each provider must document:
 - persistence and reboot behavior;
 - conflicts and ownership;
 - snapshot format;
+- side-effect-free preview text;
 - verification probe;
 - rollback behavior;
 - test fixtures and failure injection.
