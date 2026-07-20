@@ -54,6 +54,7 @@ impl ControlPlaneError {
 struct StageFailure {
     stage: &'static str,
     error: ControlPlaneError,
+    suppressed: Option<Box<StageFailure>>,
 }
 
 impl StageFailure {
@@ -61,7 +62,13 @@ impl StageFailure {
         Self {
             stage,
             error: error.into(),
+            suppressed: None,
         }
+    }
+
+    fn suppressing(mut self, original: StageFailure) -> Self {
+        self.suppressed = Some(Box::new(original));
+        self
     }
 }
 
@@ -146,9 +153,11 @@ impl ControlPlane {
     /// Returns an error when policy, the provider, or the journal rejects a
     /// stage; once apply has been attempted, rollback runs before any error
     /// is returned, and a failed restore takes precedence over other
-    /// failures. If the terminal `failed` record itself cannot be journaled,
-    /// the original lifecycle error is returned and the journaling failure
-    /// is traced to stderr.
+    /// failures. An apply or verify failure superseded by a restore failure
+    /// is never dropped: it is embedded as a `suppressed` field in the
+    /// terminal `failed` record and traced to stderr. If the terminal
+    /// `failed` record itself cannot be journaled, the original lifecycle
+    /// error is returned and the journaling failure is traced to stderr.
     pub fn run_lifecycle(
         &mut self,
         request: &ChangeRequest,
@@ -225,7 +234,12 @@ impl ControlPlane {
             .apply(request)
             .map_err(|error| StageFailure::new("apply", error))
             .and_then(|()| self.observe_applied(experiment, request));
-        self.restore(experiment, snapshot)?;
+        if let Err(restore_failure) = self.restore(experiment, snapshot) {
+            return Err(match observed {
+                Err(original) => restore_failure.suppressing(original),
+                Ok(_) => restore_failure,
+            });
+        }
         let verified = observed?;
         Ok(LifecycleResult {
             provider_id: self.manifest.id.clone(),
@@ -319,11 +333,22 @@ impl ControlPlane {
                 Ok(result)
             }
             Err(failure) => {
-                let payload = json!({
+                let mut payload = json!({
                     "kind": failure.error.kind(),
                     "stage": failure.stage,
                     "error": failure.error.to_string(),
                 });
+                if let Some(suppressed) = &failure.suppressed {
+                    eprintln!(
+                        "fpsmaxxing-control-plane: experiment {experiment} {} failure suppressed earlier {} failure: {}",
+                        failure.stage, suppressed.stage, suppressed.error
+                    );
+                    payload["suppressed"] = json!({
+                        "kind": suppressed.error.kind(),
+                        "stage": suppressed.stage,
+                        "error": suppressed.error.to_string(),
+                    });
+                }
                 if let Err(journal_error) = self.record(experiment, "failed", &payload) {
                     eprintln!(
                         "fpsmaxxing-control-plane: could not journal terminal outcome for experiment {experiment}: {journal_error}"
@@ -588,6 +613,36 @@ mod tests {
         let outcome = failed_outcome(&plane);
         assert_eq!(outcome["kind"], "rollback-verification-failed");
         assert_eq!(outcome["stage"], "rollback-verify");
+        assert!(outcome.get("suppressed").is_none());
+    }
+
+    #[test]
+    fn failed_restore_journals_the_suppressed_apply_error() {
+        let mut plane = plane_with(
+            FakeProvider {
+                value: 7,
+                fail_apply: true,
+                corrupt_rollback: true,
+                ..FakeProvider::default()
+            },
+            ":memory:",
+        );
+        let error = plane
+            .run_lifecycle(&request(42))
+            .expect_err("restore failure should take precedence");
+        assert!(matches!(
+            error,
+            ControlPlaneError::RollbackVerificationFailed
+        ));
+        let outcome = failed_outcome(&plane);
+        assert_eq!(outcome["kind"], "rollback-verification-failed");
+        assert_eq!(outcome["stage"], "rollback-verify");
+        assert_eq!(outcome["suppressed"]["kind"], "provider");
+        assert_eq!(outcome["suppressed"]["stage"], "apply");
+        assert_eq!(
+            outcome["suppressed"]["error"],
+            "provider unavailable: apply failed after mutating state"
+        );
     }
 
     #[test]

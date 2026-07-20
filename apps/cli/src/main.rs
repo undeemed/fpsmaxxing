@@ -2,6 +2,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn main() {
     match env::args().nth(1).as_deref() {
@@ -38,6 +39,7 @@ fn journal_report(journal: &Path) -> String {
     let dangling =
         rusqlite::Connection::open_with_flags(journal, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .and_then(|connection| {
+                connection.busy_timeout(Duration::from_secs(5))?;
                 let tables: i64 = connection.query_row(
                     "SELECT COUNT(*) FROM sqlite_master
                      WHERE type = 'table' AND name = 'experiment_journal'",

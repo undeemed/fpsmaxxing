@@ -7,6 +7,7 @@
 
 The alpha journal keeps a single `experiment_journal` table of stage records.
 Each lifecycle allocates its correlation ID atomically with the snapshot record, commits a write-ahead `apply-intent` record holding the full change request before the provider mutates state, and closes with exactly one terminal `completed` or `failed` record carrying a structured error kind and the failing stage.
+When a restore failure supersedes an earlier apply or verify failure, the `failed` record embeds the suppressed failure so the audit trail never loses the primary error.
 Full two-phase intent/result journaling for every stage and a dedicated experiments table are deferred until the seam is promoted to the privileged broker.
 
 ## Rationale
@@ -18,4 +19,5 @@ A per-stage two-phase protocol and a separate experiments table would duplicate 
 
 - `doctor` reports experiments with an `apply-intent` record but no terminal outcome as dangling.
 - Correlation IDs are allocated inside an immediate transaction with a busy timeout, so concurrent gateways sharing one journal file cannot mint duplicate IDs.
+- `LifecycleResult` stays in `crates/control-plane` as a deliberate alpha seam even though the gateway serializes it into MCP tool-result text; it moves to `crates/contracts` with a pinned JSON schema at broker promotion.
 - Broker promotion revisits journaling as part of the privileged transaction log design.
