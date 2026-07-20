@@ -54,7 +54,9 @@ Every provider implements the same lifecycle:
 5. `verify` - read back provider state and observe the real system effect.
 6. `rollback` - restore the snapshot without consulting the LLM.
 
-Every mutation has a TTL lease. The durable journal records a per-lifecycle correlation ID and timestamp for every stage. If the gateway, workload, or agent dies, the watchdog restores the prior state.
+Every mutation has a TTL lease.
+The durable journal records a per-lifecycle correlation ID and timestamp for every stage attempt, including a write-ahead apply intent, plus exactly one terminal completed or failed outcome per experiment.
+If the gateway, workload, or agent dies, the watchdog restores the prior state.
 
 ## Integration order
 

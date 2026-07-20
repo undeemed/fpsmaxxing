@@ -78,7 +78,7 @@ printf '%s\n' \
   | cargo run -p fpsmaxxing-gateway
 ```
 
-The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage to `fpsmaxxing-journal.sqlite` by default.
+The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
 Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
 
 ## Architecture

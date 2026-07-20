@@ -104,10 +104,12 @@ fn mcp_client_discovers_capabilities_and_runs_the_journaled_lifecycle() {
         [
             "snapshot",
             "preview",
+            "apply-intent",
             "apply",
             "verify",
             "rollback",
-            "rollback-verify"
+            "rollback-verify",
+            "completed"
         ]
     );
 }
