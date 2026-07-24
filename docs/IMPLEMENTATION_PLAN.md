@@ -33,7 +33,8 @@ The LLM proposes declarative experiments. It never receives administrator creden
 - Rust 2024 edition on the pinned stable toolchain
 - Cargo workspace and `xtask` orchestration
 - Tokio for async services and Windows named pipes
-- Official Rust MCP SDK for the northbound agent interface
+- Interim alpha northbound transport: a minimal, hand-rolled stdio JSON-RPC MCP subset for the Linux-safe mock path
+- Official Rust MCP SDK remains the target northbound interface once the transport is promoted beyond the alpha seam
 - Microsoft Rust crates for focused Windows Registry and service APIs
 - Serde and Schemars for wire contracts and JSON Schema
 - SQLite journal through Rusqlite
@@ -53,7 +54,9 @@ Every provider implements the same lifecycle:
 5. `verify` - read back provider state and observe the real system effect.
 6. `rollback` - restore the snapshot without consulting the LLM.
 
-Every mutation has a TTL lease. If the gateway, workload, or agent dies, the watchdog restores the prior state.
+Every mutation has a TTL lease.
+The durable journal records a per-lifecycle correlation ID and timestamp for every stage attempt, including a write-ahead apply intent, plus exactly one terminal completed or failed outcome per experiment.
+If the gateway, workload, or agent dies, the watchdog restores the prior state.
 
 ## Integration order
 

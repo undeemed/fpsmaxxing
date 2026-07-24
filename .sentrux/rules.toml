@@ -1,0 +1,22 @@
+# Sentrux architectural rules — generic starter. Copy to <repo>/.sentrux/rules.toml.
+# `sentrux check .` enforces these; `sentrux gate .` compares vs .sentrux/baseline.json.
+# Tune the caps to the repo; add [[layers]] only once you know its structure.
+
+[constraints]
+max_cycles = 0        # no circular dependencies
+max_cc = 25           # max cyclomatic complexity per function
+max_fn_lines = 100    # functions over this are refactor targets
+no_god_files = false  # flip to true once files are reasonably split
+
+# Optional layer ordering — a layer may depend only on layers of EQUAL OR HIGHER order
+# (foundation layers carry the HIGHER number). Uncomment + adjust paths per repo:
+#
+# [[layers]]
+# name = "features"
+# paths = ["src/features/*", "src/pages/*"]
+# order = 0
+#
+# [[layers]]
+# name = "core"
+# paths = ["src/core/*", "src/lib/*"]
+# order = 1

@@ -5,7 +5,8 @@
 FPSMaxxing is an open-source Rust control plane for using an AI coding agent or LLM - such as Claude, Codex, or another MCP client - to improve gaming FPS, frame pacing, system latency, thermals, power efficiency, and compute throughput through bounded, reversible experiments.
 
 > [!IMPORTANT]
-> FPSMaxxing is currently an architecture scaffold. It does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
+> FPSMaxxing is currently a read-only alpha built around a mock provider.
+> An MCP client can discover typed capabilities and run the full snapshot, preview, apply, verify, and rollback lifecycle, but FPSMaxxing does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
 
 ## Why FPSMaxxing?
 
@@ -57,18 +58,28 @@ The repository currently includes:
 - A Rust 2024 Cargo workspace
 - Shared capability and provider contracts
 - A provider SDK lifecycle
-- A working mock sidecar with snapshot/apply/verify/rollback tests
-- Scaffolds for the gateway, privileged broker, watchdog, experiment runner, and CLI
+- A working mock provider with snapshot/preview/apply/verify/rollback tests
+- A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal
+- A working stdio MCP gateway that serves the mock path end to end
+- A CLI `doctor` command that reports gateway and journal status
+- Scaffolds for the privileged broker, watchdog, and experiment runner
 - OSS governance, security policy, issue templates, and CI
 - An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 
-Try the safe scaffold:
+Try the read-only alpha:
 
 ```bash
 cargo test --workspace
 cargo run -p fpsmaxxing-cli -- doctor
 cargo run -p fpsmaxxing-mock-provider
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fpsmaxxing.run_mock_lifecycle","arguments":{"value":42,"lease_seconds":30}}}' \
+  | cargo run -p fpsmaxxing-gateway
 ```
+
+The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
+Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
 
 ## Architecture
 
@@ -93,7 +104,7 @@ Start with the [documentation index](docs/README.md). The core references are th
 
 ### Can Claude optimize my PC for higher FPS?
 
-That is the intended workflow. A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy. That closed loop is planned but not implemented yet.
+That is the intended workflow. A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy. The alpha already runs capability discovery and the bounded snapshot-to-rollback lifecycle over MCP against a mock provider; the measurement-driven keep-or-rollback decision and real hardware providers are not implemented yet.
 
 ### Can an AI safely overclock a GPU?
 

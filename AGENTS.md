@@ -16,6 +16,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 
 - Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
+- Keep the capability registry, policy, broker lifecycle, and experiment journal in `crates/control-plane`.
 - Put provider-specific code in one `sidecars/<provider>` package; sidecars may not import each other.
 - Put non-Rust compatibility processes under `bridges/` and isolate them behind the sidecar protocol.
 - Do not vendor third-party binaries without confirmed redistribution rights.
@@ -33,3 +34,10 @@ cargo deny check
 
 `cargo deny check` requires [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) and enforces the advisory, ban, license, and source policies in `deny.toml`.
 CI runs the same checks, plus JSON schema validation, on every pull request and push to `main`.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
