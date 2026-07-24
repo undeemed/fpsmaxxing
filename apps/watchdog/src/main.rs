@@ -106,6 +106,7 @@ impl Config {
                 _ => {}
             }
         }
+        once = once || recover_all;
         let journal_path = journal_path
             .or_else(|| env::var("FPSMAXXING_JOURNAL_PATH").ok().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_JOURNAL));
@@ -123,5 +124,28 @@ impl Config {
         } else {
             ReclaimPolicy::ExpiredLeasesOnly
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(args: &[&str]) -> Config {
+        Config::from_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn recover_all_forces_single_pass() {
+        let config = config(&["--recover-all"]);
+        assert!(config.once);
+        assert_eq!(config.policy(), ReclaimPolicy::AllUnclosed);
+    }
+
+    #[test]
+    fn steady_state_poll_stays_expired_leases_only() {
+        let config = config(&[]);
+        assert!(!config.once);
+        assert_eq!(config.policy(), ReclaimPolicy::ExpiredLeasesOnly);
     }
 }
