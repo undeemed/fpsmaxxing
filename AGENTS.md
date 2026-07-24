@@ -17,6 +17,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 - Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
 - Keep the capability registry, policy, broker lifecycle, and experiment journal in `crates/control-plane`.
+- Keep the independent crash and lease recovery path in `apps/watchdog`; it reads the journal owned by `crates/control-plane` and writes only its own restore-outcome records, never the schema.
 - Put provider-specific code in one `sidecars/<provider>` package; sidecars may not import each other.
 - Put non-Rust compatibility processes under `bridges/` and isolate them behind the sidecar protocol.
 - Do not vendor third-party binaries without confirmed redistribution rights.

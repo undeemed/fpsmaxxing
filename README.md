@@ -62,7 +62,8 @@ The repository currently includes:
 - A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal
 - A working stdio MCP gateway that serves the mock path end to end
 - A CLI `doctor` command that reports gateway and journal status
-- Scaffolds for the privileged broker, watchdog, and experiment runner
+- An independent watchdog that restores prior state from the journal after a crash or lease expiry, on the Linux-safe mock path
+- Scaffolds for the privileged broker and experiment runner
 - OSS governance, security policy, issue templates, and CI
 - An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 

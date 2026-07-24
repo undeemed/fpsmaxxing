@@ -2,7 +2,8 @@
 
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
-The current read-only alpha implements the gateway and an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, wired to a single mock provider; the privileged broker, watchdog, and experiment runner remain scaffolds.
+The current read-only alpha implements the gateway and an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, wired to a single mock provider.
+The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker and experiment runner remain scaffolds.
 
 ## Processes
 
@@ -17,6 +18,13 @@ The privileged Windows service accepts authenticated local requests from the gat
 ### Watchdog
 
 The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner.
+
+`apps/watchdog` implements this on the Linux-safe mock path.
+It reads the durable journal owned by the control plane and scans for experiments that recorded a write-ahead `apply-intent` with no terminal `completed` or `failed` record: either a crash between the mutation and its rollback, or an elapsed TTL lease.
+Each selected experiment is rolled back through its provider using the journaled snapshot, and the restore is verified by re-reading provider state against that snapshot.
+The watchdog writes nothing to the journal except its own correlation-ID-linked `watchdog-restore` record and the terminal record that closes an experiment it has restored, so it never depends on the components it recovers from and never mutates the schema.
+Restores are idempotent: a closed experiment is never rolled back twice, and a failed rollback is left unclosed for a later pass to retry.
+A steady-state poll reclaims only expired leases, while a crash-recovery pass (`--recover-all`) reclaims every unclosed experiment; a single `--once` pass is the unit a later Windows-service timer would drive.
 
 ### Experiment runner
 
