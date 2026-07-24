@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/verdict.schema.json",
+  "title": "FPSMaxxing experiment verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "reason", "fps_improvement", "baseline", "candidate"],
+  "properties": {
+    "decision": { "enum": ["promote", "reject"] },
+    "reason": {
+      "enum": [
+        "promoted",
+        "insufficient-samples",
+        "temperature-exceeded",
+        "power-exceeded",
+        "errors-exceeded",
+        "insufficient-improvement"
+      ]
+    },
+    "fps_improvement": { "type": "number" },
+    "baseline": { "$ref": "#/$defs/metric_summary" },
+    "candidate": { "$ref": "#/$defs/metric_summary" }
+  },
+  "$defs": {
+    "metric_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "samples",
+        "mean_fps",
+        "max_temperature_c",
+        "max_power_w",
+        "total_errors"
+      ],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 0 },
+        "mean_fps": { "type": "number" },
+        "max_temperature_c": { "type": "number" },
+        "max_power_w": { "type": "number" },
+        "total_errors": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

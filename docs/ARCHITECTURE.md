@@ -2,8 +2,8 @@
 
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
-The current read-only alpha implements the gateway and an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, wired to a single mock provider.
-The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker and experiment runner remain scaffolds.
+The current read-only alpha implements the gateway, an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, and a deterministic experiment runner (`apps/experiment-runner`) that gates measured trials through an immutable evaluator, all wired to a single mock provider.
+The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker remains a scaffold.
 
 ## Processes
 
@@ -29,6 +29,8 @@ A steady-state poll reclaims only expired leases, while a crash-recovery pass (`
 ### Experiment runner
 
 The runner controls workload setup, warmup, repeated measurements, cooldown, correctness checks, and promotion decisions. Evaluator code is outside the LLM's writable surface.
+
+In the safe alpha (`apps/experiment-runner`) the runner measures a baseline and a candidate against a deterministic model, then a pure immutable evaluator returns a promote or reject verdict from the recorded samples and fixed bounds alone - no clock, no LLM, no I/O. Every trial is journaled as a self-describing record so it can be replayed and re-evaluated from the journal without the original conversation. Because mock capabilities are leased and the broker lifecycle always rolls back, the verdict gates whether the candidate is applied at all rather than whether it persists; durable keep-or-rollback awaits the privileged broker.
 
 ### Provider sidecars
 

@@ -124,6 +124,11 @@ impl ControlPlane {
                 stage TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS experiment_trials (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                payload TEXT NOT NULL
             );",
         )?;
         Ok(Self {
@@ -178,6 +183,67 @@ impl ControlPlane {
         let mut statement = self
             .journal
             .prepare("SELECT stage FROM experiment_journal ORDER BY sequence")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(ControlPlaneError::from)
+    }
+
+    /// Reads the provider's current typed state snapshot.
+    ///
+    /// This read-only accessor lets an experiment runner establish a baseline
+    /// before measuring a candidate; it mutates no provider or journal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot produce a snapshot.
+    pub fn snapshot(&self) -> Result<StateSnapshot, ControlPlaneError> {
+        Ok(self.provider.snapshot()?)
+    }
+
+    /// Appends a self-describing trial record to the durable trial journal and
+    /// returns its identifier.
+    ///
+    /// The payload is opaque to the control plane: a runner stores the spec,
+    /// recorded samples, and verdict together so the trial can be replayed and
+    /// re-evaluated from the journal alone, without chat history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be encoded or the durable journal
+    /// cannot be written.
+    pub fn record_trial(&self, payload: &impl Serialize) -> Result<i64, ControlPlaneError> {
+        self.journal.execute(
+            "INSERT INTO experiment_trials (recorded_at, payload)
+             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?1)",
+            params![serde_json::to_string(payload)?],
+        )?;
+        Ok(self.journal.last_insert_rowid())
+    }
+
+    /// Reads one trial record by identifier for replay and re-evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no trial has the identifier, or the durable journal
+    /// cannot be read or decoded.
+    pub fn read_trial(&self, id: i64) -> Result<Value, ControlPlaneError> {
+        let payload: String = self.journal.query_row(
+            "SELECT payload FROM experiment_trials WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    /// Lists recorded trial identifiers in insertion order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable journal cannot be queried.
+    pub fn trial_ids(&self) -> Result<Vec<i64>, ControlPlaneError> {
+        let mut statement = self
+            .journal
+            .prepare("SELECT id FROM experiment_trials ORDER BY id")?;
         let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(ControlPlaneError::from)
@@ -773,5 +839,32 @@ mod tests {
             .err()
             .expect("foreign targets should be rejected");
         assert!(matches!(error, ControlPlaneError::PolicyDenied(_)));
+    }
+
+    #[test]
+    fn trial_records_round_trip_through_the_journal() {
+        let plane = plane(false);
+        assert!(
+            plane.trial_ids().expect("ids should read").is_empty(),
+            "a fresh journal has no trials"
+        );
+        let first = plane
+            .record_trial(&json!({ "hypothesis": "higher clocks help", "decision": "promote" }))
+            .expect("first trial should record");
+        let second = plane
+            .record_trial(&json!({ "hypothesis": "wider power budget", "decision": "reject" }))
+            .expect("second trial should record");
+        assert_eq!(plane.trial_ids().expect("ids should read"), [first, second]);
+        let read = plane.read_trial(first).expect("trial should read");
+        assert_eq!(read["hypothesis"], "higher clocks help");
+        assert_eq!(read["decision"], "promote");
+    }
+
+    #[test]
+    fn snapshot_reads_the_current_provider_state() {
+        let plane = plane(false);
+        let snapshot = plane.snapshot().expect("snapshot should read");
+        assert_eq!(snapshot.state["value"], 7);
+        assert_eq!(snapshot.provider_id, "fake");
     }
 }
