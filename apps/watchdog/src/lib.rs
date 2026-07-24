@@ -177,6 +177,11 @@ impl<P: Provider> Watchdog<P> {
     /// record cannot be written; per-experiment rollback failures are reported
     /// in the returned [`Restoration`] list, not as errors.
     pub fn reclaim(&mut self, policy: ReclaimPolicy) -> Result<Vec<Restoration>, WatchdogError> {
+        // Candidates arrive ordered by experiment_id (journal scan). This
+        // assumes at most one unclosed experiment per knob: simultaneous
+        // same-knob leaks would require a prior breach of one-owner-per-knob,
+        // and choosing the true original baseline in that case is out of scope
+        // until concurrent multi-owner providers exist.
         let candidates = self.scan()?;
         let mut restorations = Vec::new();
         for experiment in candidates {

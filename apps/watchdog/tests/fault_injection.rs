@@ -398,6 +398,61 @@ fn failed_rollback_leaves_the_experiment_for_a_later_pass() {
 }
 
 #[test]
+fn repeated_identical_failures_are_not_re_journaled_but_stay_retryable() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = journal_path(&dir);
+    create_journal(&path);
+    let conn = Connection::open(&path).expect("journal opens");
+    seed_leaked(
+        &conn,
+        &Leaked {
+            experiment_id: 1,
+            provider_id: "mock",
+            snapshot_value: 7,
+            request_value: 99,
+            lease_seconds: 30,
+            intent_age: "-3600 seconds",
+        },
+    );
+
+    // A knob that fails rollback identically on three consecutive poll passes.
+    let provider = FaultyProvider {
+        value: 99,
+        fail_rollbacks: 3,
+        corrupt_rollbacks: 0,
+    };
+    let mut watchdog = Watchdog::open(provider, &path).expect("watchdog opens");
+
+    for _ in 0..3 {
+        let restorations = watchdog
+            .reclaim(ReclaimPolicy::ExpiredLeasesOnly)
+            .expect("reclaim reports per-experiment failures rather than erroring");
+        assert_eq!(
+            restorations.len(),
+            1,
+            "the stuck experiment is retried each pass"
+        );
+        assert!(!restorations[0].restored);
+    }
+
+    assert_eq!(
+        stage_count(&conn, 1, "watchdog-restore"),
+        1,
+        "an unchanged repeat failure is not re-journaled"
+    );
+    assert_eq!(
+        terminal_count(&conn, 1),
+        0,
+        "the stuck experiment is left unclosed for a later pass"
+    );
+    assert_eq!(
+        watchdog.scan().expect("scan succeeds").len(),
+        1,
+        "the experiment stays selectable, so retry is preserved"
+    );
+}
+
+#[test]
 fn corrupted_rollback_is_detected_by_the_verify_probe() {
     let dir = TempDir::new().expect("temp dir");
     let path = journal_path(&dir);

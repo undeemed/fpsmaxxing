@@ -9,8 +9,8 @@
 use std::{path::Path, time::Duration};
 
 use fpsmaxxing_contracts::{ChangeRequest, StateSnapshot};
-use rusqlite::{Connection, TransactionBehavior, params};
-use serde_json::json;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 use crate::{ReclaimReason, UnclosedExperiment, WatchdogError};
 
@@ -130,7 +130,11 @@ impl WatchdogJournal {
     }
 
     /// Records a failed restore attempt without a terminal record, leaving the
-    /// experiment unclosed so a later pass retries it.
+    /// experiment unclosed so a later pass retries it. When the most recent
+    /// `watchdog-restore` record for the experiment is already an identical
+    /// failure (still unrestored, same error), the row is not re-appended: the
+    /// experiment stays selectable and is retried on every later pass, but a
+    /// permanently stuck knob no longer grows the shared journal each interval.
     pub(crate) fn record_failure(
         &mut self,
         experiment_id: i64,
@@ -139,6 +143,9 @@ impl WatchdogJournal {
         snapshot: &StateSnapshot,
         error: &str,
     ) -> Result<(), WatchdogError> {
+        if self.last_failure_matches(experiment_id, error)? {
+            return Ok(());
+        }
         let payload = serde_json::to_string(&json!({
             "reason": reason,
             "restored": false,
@@ -150,6 +157,30 @@ impl WatchdogJournal {
             params![experiment_id, "watchdog-restore", provider_id, payload],
         )?;
         Ok(())
+    }
+
+    /// Reports whether the most recent `watchdog-restore` record for
+    /// `experiment_id` is a failure carrying the same error text, so an
+    /// unchanged repeat failure can be suppressed.
+    fn last_failure_matches(&self, experiment_id: i64, error: &str) -> Result<bool, WatchdogError> {
+        let latest: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM experiment_journal
+                 WHERE experiment_id = ?1 AND stage = 'watchdog-restore'
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![experiment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = latest else {
+            return Ok(false);
+        };
+        let record: Value = serde_json::from_str(&payload)?;
+        let unrestored = record.get("restored").and_then(Value::as_bool) == Some(false);
+        let same_error = record.get("error").and_then(Value::as_str) == Some(error);
+        Ok(unrestored && same_error)
     }
 
     fn journal_ready(&self) -> Result<bool, WatchdogError> {
