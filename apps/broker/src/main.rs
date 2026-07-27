@@ -55,6 +55,9 @@ mod unix {
     const FLAGS: [&str; 2] = ["--socket", "--journal"];
 
     /// Arguments that ask for [`USAGE`] instead of a run.
+    ///
+    /// Recognized by [`parse_args`] only where a flag is expected, never as the
+    /// value of one.
     const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 
     /// What `--help` prints.
@@ -69,9 +72,9 @@ Usage: fpsmaxxing-broker [--socket <path>] [--journal <path>]
 
 A flag wins over its environment variable. Unset, each falls back into an
 owner-only directory under $XDG_RUNTIME_DIR (or /run when it is unset, is not
-absolute, or the broker runs as root). Every path must be absolute and sit
-under a parent chain owned by the broker or root that no other user can
-write, or the broker refuses to start.";
+absolute, or the broker runs as root). Every path must be absolute and sit in
+an existing directory no other user can write, under a parent chain owned by
+the broker or root, or the broker refuses to start.";
 
     /// Environment override for `--socket`.
     const SOCKET_ENV: &str = "FPSMAXXING_BROKER_SOCKET";
@@ -127,7 +130,7 @@ write, or the broker refuses to start.";
         /// A recognized flag was given more than once.
         #[error("{0} was given more than once")]
         Repeated(String),
-        /// An argument is not one of [`FLAGS`].
+        /// An argument is neither one of [`FLAGS`] nor one of [`HELP_FLAGS`].
         #[error("unrecognized argument {argument}; expected one of {expected}", expected = FLAGS.join(", "))]
         Unrecognized {
             /// The rejected argument, verbatim.
@@ -144,13 +147,23 @@ write, or the broker refuses to start.";
         pub journal: Option<String>,
     }
 
+    /// What a parsed command line asks the binary to do.
+    #[derive(Debug, Eq, PartialEq)]
+    pub enum Invocation {
+        /// Serve with these locations.
+        Run(Options),
+        /// Print [`USAGE`] and exit successfully.
+        Help,
+    }
+
     pub async fn run() -> Result<(), Box<dyn Error>> {
-        let arguments: Vec<String> = env::args().skip(1).collect();
-        if arguments.iter().any(|argument| wants_help(argument)) {
-            println!("{USAGE}");
-            return Ok(());
-        }
-        let options = parse_args(arguments)?;
+        let options = match parse_args(env::args().skip(1))? {
+            Invocation::Help => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            Invocation::Run(options) => options,
+        };
         let authorizer = SameUidAuthorizer::for_current_process();
         let broker_uid = authorizer.expected_uid();
         let (socket_path, journal_path) = resolve_paths(options, broker_uid)?;
@@ -172,14 +185,6 @@ write, or the broker refuses to start.";
         );
         serve(transport, broker, authorizer).await?;
         Ok(())
-    }
-
-    /// Whether an argument asks for [`USAGE`] rather than a run.
-    ///
-    /// Checked before [`parse_args`], which knows only [`FLAGS`] and would
-    /// otherwise refuse `--help` as an unrecognized argument and exit non-zero.
-    fn wants_help(argument: &str) -> bool {
-        HELP_FLAGS.contains(&argument)
     }
 
     /// Resolves the socket and journal locations, in override order.
@@ -242,14 +247,23 @@ write, or the broker refuses to start.";
     /// A relative path would resolve against the inherited working directory,
     /// which is as much the caller's choice as the variable that named it. A
     /// parent another user may write is what makes the socket path raceable at
-    /// bind time and the journal readable, so the whole chain above the file
-    /// goes through [`vet_ancestors`] - the same vet the default directory gets.
+    /// bind time and the journal readable, so the whole chain above the file is
+    /// vetted - the same vet the default directory gets.
+    ///
+    /// The directory that directly holds the entry is held to a stricter bar
+    /// than the ancestors above it: no other user may write it, sticky or not.
+    /// Sticky stops another user renaming or removing the broker's socket or
+    /// journal, but not creating that entry first in a shared directory like
+    /// `/tmp` and keeping ownership of the file a privileged broker then writes
+    /// every `apply-intent` record into. Higher up, creating an entry is not
+    /// the threat - swapping a vetted directory is - and sticky does prevent
+    /// that.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::PermissionDenied`] for a path that is not
-    /// absolute or names no parent directory, or whatever [`vet_ancestors`]
-    /// refuses the parent with.
+    /// absolute or names no parent directory, or whatever [`vet_directory`]
+    /// refuses the parent or an ancestor with.
     fn vet_resolved_path(path: &Path, broker_uid: u32) -> io::Result<()> {
         let parent = path
             .parent()
@@ -263,7 +277,11 @@ write, or the broker refuses to start.";
                     ),
                 )
             })?;
-        vet_ancestors(parent, broker_uid)
+        vet_directory(parent, broker_uid, Sticky::Insufficient)?;
+        match parent.parent() {
+            Some(above) => vet_ancestors(above, broker_uid),
+            None => Ok(()),
+        }
     }
 
     /// Restricts the audit journal to its owner before the journal is opened.
@@ -377,14 +395,58 @@ write, or the broker refuses to start.";
         }
     }
 
+    /// Whether the sticky bit redeems a group- or world-writable directory.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Sticky {
+        /// Sticky is enough: only an entry's owner may rename or remove it, so
+        /// the directory below cannot be swapped for one the broker does not
+        /// own. This is how `/tmp` and similar shared roots are protected.
+        Redeems,
+        /// Sticky is not enough: it does not stop another user creating an
+        /// entry the broker is about to create itself, and the creator keeps
+        /// ownership of it.
+        Insufficient,
+    }
+
+    /// Refuses a directory another user could tamper with.
+    ///
+    /// It must be a real directory - not a symlink - owned by the broker or by
+    /// root, and not writable by group or world unless `sticky` redeems it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::PermissionDenied`] if the directory fails the
+    /// bar, or the underlying error - named with the directory, since a path
+    /// the broker will not create is the likeliest reason it cannot be
+    /// inspected - if it cannot be inspected at all.
+    fn vet_directory(directory: &Path, broker_uid: u32, sticky: Sticky) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{} cannot be inspected: {error}", directory.display()),
+            )
+        })?;
+        let mode = metadata.mode();
+        let owned_by_trusted_uid = metadata.uid() == broker_uid || metadata.uid() == ROOT_UID;
+        let redeemed = sticky == Sticky::Redeems && mode & STICKY_BIT != 0;
+        let writable_by_others = mode & OTHER_WRITE_BITS != 0 && !redeemed;
+        if !metadata.is_dir() || !owned_by_trusted_uid || writable_by_others {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a directory owned by uid {broker_uid} or root that no other user can write",
+                    directory.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuses a base whose own path another user could tamper with.
     ///
-    /// Every component from `base` up to `/` must be a real directory - not a
-    /// symlink - owned by the broker or by root, and must not be writable by
-    /// group or world unless it is sticky. Sticky is the one sound exception:
-    /// on such a directory only an entry's owner may rename or remove it, which
-    /// is exactly the swap this vet exists to prevent, and it is how `/tmp` and
-    /// similar shared roots are already protected.
+    /// Every component from `base` up to `/` goes through [`vet_directory`],
+    /// where a sticky directory is sound: the threat an ancestor carries is the
+    /// swap of the directory below it, which sticky prevents.
     ///
     /// # Errors
     ///
@@ -392,24 +454,25 @@ write, or the broker refuses to start.";
     /// fails, or the underlying error if a component cannot be inspected.
     fn vet_ancestors(base: &Path, broker_uid: u32) -> io::Result<()> {
         for ancestor in base.ancestors() {
-            let metadata = std::fs::symlink_metadata(ancestor)?;
-            let mode = metadata.mode();
-            let owned_by_trusted_uid = metadata.uid() == broker_uid || metadata.uid() == ROOT_UID;
-            let writable_by_others = mode & OTHER_WRITE_BITS != 0 && mode & STICKY_BIT == 0;
-            if !metadata.is_dir() || !owned_by_trusted_uid || writable_by_others {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} must be a directory owned by uid {broker_uid} or root that no other user can write",
-                        ancestor.display()
-                    ),
-                ));
-            }
+            vet_directory(ancestor, broker_uid, Sticky::Redeems)?;
         }
         Ok(())
     }
 
+    /// Whether an argument standing in value position is really a flag.
+    ///
+    /// Every value-taking flag is long, and [`HELP_FLAGS`] adds the one short
+    /// flag, so a value matching either is a mistyped command line, not a path.
+    fn looks_like_flag(value: &str) -> bool {
+        value.starts_with("--") || HELP_FLAGS.contains(&value)
+    }
+
     /// Parses `--flag value` and `--flag=value` pairs, rejecting anything else.
+    ///
+    /// A help flag is recognized only where a flag is expected. In value
+    /// position it is refused like any other flag-shaped value, so the mistyped
+    /// `--socket --help` stays fatal instead of exiting successfully - which a
+    /// supervisor would read as a clean stop of a broker that never came up.
     ///
     /// In the separated form the value may not itself look like a flag, so
     /// `--socket --journal /var/j.sqlite` is a mistyped command line rather than
@@ -419,13 +482,16 @@ write, or the broker refuses to start.";
     ///
     /// Returns [`ArgError`] for an unrecognized argument, a repeated flag, or a
     /// flag whose value is missing, empty, or another flag.
-    pub fn parse_args<I>(arguments: I) -> Result<Options, ArgError>
+    pub fn parse_args<I>(arguments: I) -> Result<Invocation, ArgError>
     where
         I: IntoIterator<Item = String>,
     {
         let mut options = Options::default();
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
+            if HELP_FLAGS.contains(&argument.as_str()) {
+                return Ok(Invocation::Help);
+            }
             let (flag, inline) = match argument.split_once('=') {
                 Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
                 None => (argument.clone(), None),
@@ -442,7 +508,7 @@ write, or the broker refuses to start.";
                 Some(value) => value,
                 None => arguments
                     .next()
-                    .filter(|value| !value.starts_with("--"))
+                    .filter(|value| !looks_like_flag(value))
                     .ok_or_else(|| ArgError::MissingValue(flag.clone()))?,
             };
             if value.is_empty() {
@@ -450,7 +516,7 @@ write, or the broker refuses to start.";
             }
             *slot = Some(value);
         }
-        Ok(options)
+        Ok(Invocation::Run(options))
     }
 
     #[cfg(test)]
@@ -466,9 +532,9 @@ write, or the broker refuses to start.";
         use fpsmaxxing_mock_provider::MockProvider;
 
         use super::{
-            ArgError, FALLBACK_RUNTIME_BASE, HELP_FLAGS, JOURNAL_ENV, JOURNAL_FILE_MODE, Options,
-            PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV, parse_args,
-            private_directory_in, resolve_paths_from, restrict_journal, runtime_base, wants_help,
+            ArgError, FALLBACK_RUNTIME_BASE, HELP_FLAGS, Invocation, JOURNAL_ENV,
+            JOURNAL_FILE_MODE, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV,
+            parse_args, private_directory_in, resolve_paths_from, restrict_journal, runtime_base,
         };
 
         /// The variable the unprivileged gateway and CLI use for their journal.
@@ -477,8 +543,16 @@ write, or the broker refuses to start.";
         /// An unprivileged uid, so `XDG_RUNTIME_DIR` is eligible at all.
         const SESSION_UID: u32 = 1000;
 
-        fn parse(arguments: &[&str]) -> Result<Options, ArgError> {
+        fn parse(arguments: &[&str]) -> Result<Invocation, ArgError> {
             parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
+        }
+
+        /// The [`Options`] a command line that asks for a run resolves to.
+        fn run_options(arguments: &[&str]) -> Options {
+            match parse(arguments).expect("the command line should parse") {
+                Invocation::Run(options) => options,
+                Invocation::Help => panic!("{arguments:?} should not ask for usage"),
+            }
         }
 
         /// A lookup that answers every name with a vettable path under `base`.
@@ -521,19 +595,14 @@ write, or the broker refuses to start.";
 
         #[test]
         fn both_flag_forms_are_accepted() {
-            let options = parse(&["--socket", "/run/b.sock", "--journal=/var/j.sqlite"])
-                .expect("both forms should parse");
             assert_eq!(
-                options,
+                run_options(&["--socket", "/run/b.sock", "--journal=/var/j.sqlite"]),
                 Options {
                     socket: Some("/run/b.sock".to_owned()),
                     journal: Some("/var/j.sqlite".to_owned()),
                 }
             );
-            assert_eq!(
-                parse(&[]).expect("no arguments should parse"),
-                Options::default()
-            );
+            assert_eq!(run_options(&[]), Options::default());
         }
 
         #[test]
@@ -543,7 +612,7 @@ write, or the broker refuses to start.";
                     .expect_err("a swallowed flag must not become the socket path"),
                 ArgError::MissingValue(_)
             ));
-            let options = parse(&["--socket=--journal"]).expect("the inline form is explicit");
+            let options = run_options(&["--socket=--journal"]);
             assert_eq!(options.socket.as_deref(), Some("--journal"));
         }
 
@@ -670,6 +739,47 @@ write, or the broker refuses to start.";
         }
 
         #[test]
+        fn a_sticky_directory_may_not_hold_the_socket_or_the_journal() {
+            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(outer.path());
+            let shared = outer.path().join("shared");
+            std::fs::create_dir(&shared).expect("directory should create");
+            chmod(&shared, 0o1777);
+
+            // Sticky stops another user removing the broker's entry, not
+            // creating it first and keeping ownership of what the broker writes.
+            let options = Options {
+                socket: Some(path_string(&shared.join("broker.sock"))),
+                journal: Some(path_string(&outer.path().join("j.sqlite"))),
+            };
+            let error = resolve_paths_from(options, uid, |_| None)
+                .expect_err("a sticky world-writable parent must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+            let options = Options {
+                socket: Some(path_string(&outer.path().join("b.sock"))),
+                journal: Some(path_string(&shared.join("j.sqlite"))),
+            };
+            let error = resolve_paths_from(options, uid, |_| None)
+                .expect_err("the journal is held to the same bar as the socket");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+            // Higher up, sticky is sound: it prevents the swap of the
+            // owner-only directory that does hold them.
+            let private = shared.join(PRIVATE_DIR_NAME);
+            std::fs::create_dir(&private).expect("directory should create");
+            chmod(&private, PRIVATE_DIR_MODE);
+            let options = Options {
+                socket: Some(path_string(&private.join("broker.sock"))),
+                journal: Some(path_string(&private.join("j.sqlite"))),
+            };
+            let (socket, journal) = resolve_paths_from(options, uid, |_| None)
+                .expect("an owner-only directory under a sticky ancestor is sound");
+            assert_eq!(socket, private.join("broker.sock"));
+            assert_eq!(journal, private.join("j.sqlite"));
+        }
+
+        #[test]
         fn a_flag_path_is_vetted_the_same_way_as_the_environment() {
             let base = tempfile::tempdir().expect("temporary directory should exist");
             let uid = own_uid(base.path());
@@ -717,15 +827,23 @@ write, or the broker refuses to start.";
         }
 
         #[test]
-        fn help_is_recognized_before_the_command_line_is_parsed() {
+        fn a_help_flag_is_recognized_only_in_flag_position() {
             for flag in HELP_FLAGS {
-                assert!(wants_help(flag), "{flag} should ask for usage");
+                assert_eq!(
+                    parse(&[flag]).expect("a help flag should parse"),
+                    Invocation::Help,
+                    "{flag} should ask for usage"
+                );
+                assert_eq!(
+                    parse(&["--journal", "/var/j.sqlite", flag])
+                        .expect("a help flag should parse anywhere a flag may stand"),
+                    Invocation::Help
+                );
                 assert!(
-                    matches!(parse(&[flag]), Err(ArgError::Unrecognized { .. })),
-                    "{flag} is intercepted before the parser, which knows only FLAGS"
+                    matches!(parse(&["--socket", flag]), Err(ArgError::MissingValue(_))),
+                    "{flag} in value position is a mistyped command line, not usage"
                 );
             }
-            assert!(!wants_help("--socket"));
         }
 
         #[test]

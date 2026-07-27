@@ -121,9 +121,17 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
 It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket; only the Linux transport is implemented, so the binary refuses to run elsewhere.
 
+Run it with no arguments; it creates and vets its own private directory for the socket and the journal.
+
 ```bash
 cargo run -p fpsmaxxing-broker
 cargo run -p fpsmaxxing-broker -- --help
+```
+
+An explicit path is never created for you, and its directory must already be mode `0700` and owned by the user the broker runs as, so create it first:
+
+```bash
+sudo install -d -m 700 -o "$(id -un)" /run/fpsmaxxing
 cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal /run/fpsmaxxing/journal.sqlite
 ```
 
@@ -135,8 +143,9 @@ cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal
 A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
 The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
 The broker creates it mode `0700`, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
-A path from a flag or an environment variable is held to the same bar: it must be absolute, and every directory above it is vetted the same way, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
-Give the journal a directory of its own at mode `0700` - the default private directory already is one.
+A path from a flag or an environment variable is held to the same bar: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
+Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
+That directory is the one place the sticky bit does not excuse group or world write: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
 The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
 
 ## Architecture
