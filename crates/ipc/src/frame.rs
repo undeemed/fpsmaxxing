@@ -27,18 +27,25 @@ pub enum FrameError {
         /// The rejected frame length in bytes.
         length: u64,
     },
+    /// The frame declared a zero-length body; every frame carries a message.
+    #[error("frame body is empty")]
+    Empty,
 }
 
 /// Writes one length-delimited frame and flushes it.
 ///
 /// # Errors
 ///
-/// Returns [`FrameError::TooLarge`] when `body` exceeds [`MAX_FRAME_BYTES`], or
-/// [`FrameError::Io`] when the transport write fails.
+/// Returns [`FrameError::Empty`] when `body` is empty and
+/// [`FrameError::TooLarge`] when it exceeds [`MAX_FRAME_BYTES`] - the two frames
+/// [`read_frame`] refuses - or [`FrameError::Io`] when the transport write fails.
 pub async fn write_frame<W>(writer: &mut W, body: &[u8]) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
 {
+    if body.is_empty() {
+        return Err(FrameError::Empty);
+    }
     let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
     if len > u64::from(MAX_FRAME_BYTES) {
         return Err(FrameError::TooLarge { length: len });
@@ -58,9 +65,12 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`FrameError::TooLarge`] when the declared length exceeds
-/// [`MAX_FRAME_BYTES`] (the reader refuses to allocate it), or [`FrameError::Io`]
-/// when the transport fails or a frame is truncated mid-stream.
+/// Returns [`FrameError::Empty`] when the declared length is zero,
+/// [`FrameError::TooLarge`] when it exceeds [`MAX_FRAME_BYTES`] (the reader
+/// refuses to allocate it), or [`FrameError::Io`] when the transport fails or a
+/// frame is truncated mid-stream. Both typed rejections are answerable: an empty
+/// frame leaves the stream at a frame boundary, and an over-long one leaves the
+/// undrained body behind, so a serve loop replies and then closes.
 pub async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>, FrameError>
 where
     R: AsyncRead + Unpin,
@@ -82,10 +92,7 @@ where
     }
     let len = u32::from_be_bytes(len_buf);
     if len == 0 {
-        return Err(FrameError::Io(io::Error::new(
-            ErrorKind::InvalidData,
-            "empty frame",
-        )));
+        return Err(FrameError::Empty);
     }
     if len > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge {
@@ -135,6 +142,22 @@ mod tests {
             .await
             .expect_err("oversized frame should be refused");
         assert!(matches!(error, FrameError::TooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_is_refused_by_the_writer_and_the_reader() {
+        let mut buffer = Vec::new();
+        let error = write_frame(&mut buffer, b"")
+            .await
+            .expect_err("an empty body must not reach the wire");
+        assert!(matches!(error, FrameError::Empty));
+        assert!(buffer.is_empty(), "a refused frame writes no bytes");
+
+        let mut cursor = std::io::Cursor::new(0u32.to_be_bytes().to_vec());
+        let error = read_frame(&mut cursor)
+            .await
+            .expect_err("an empty frame must be refused");
+        assert!(matches!(error, FrameError::Empty));
     }
 
     #[tokio::test]

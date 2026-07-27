@@ -21,6 +21,15 @@ It owns the control plane on a dedicated worker thread and serves exactly two op
 Three fail-closed checks guard the boundary: peer authentication before any request is read (a Linux `SO_PEERCRED` same-uid ACL, shaped so a Windows SID ACL can satisfy the same trait), a capability-catalog check that rejects raw shell, arbitrary Registry paths, and out-of-catalog ids, and single-owner-per-knob enforcement that refuses a second concurrent owner of a setting.
 Typed request and response messages live in `crates/contracts` with `schemas/*.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
 
+The same-uid ACL is the deliberate interim policy for the current single-user, Linux-safe mock path, where the broker and its only client run as the same desktop user.
+It is not the shipping policy for the privilege split described above: once the broker runs as a service account, an unprivileged gateway would be refused by construction.
+The real privilege-split ACL arrives with the Windows named-pipe SID implementation of the `PeerAuthorizer` trait, tracked separately; because every caller reaches the ACL through that trait, no call site changes when it lands.
+The trusted uid is read from the broker's own effective credentials rather than from the socket file's owner, so replacing the socket path cannot redirect the ACL.
+
+The broker fails fast rather than degrading.
+Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.
+Deploy it under a supervisor that restarts on failure, and let the watchdog own recovery of any state left behind.
+
 ### Watchdog
 
 The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner. On lease expiry or a safety violation it reverts to the pre-state snapshot through the privileged broker.

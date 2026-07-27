@@ -13,9 +13,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net"] }
-tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

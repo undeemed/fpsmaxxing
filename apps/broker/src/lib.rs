@@ -17,12 +17,22 @@
 //! accepted asynchronously over the [`fpsmaxxing_ipc::LocalTransport`] seam - a
 //! Unix domain socket today, a Windows named pipe later - and each connection's
 //! decoded requests are dispatched to that worker.
+//!
+//! The broker fails fast rather than degrading. If the worker thread ever stops,
+//! including by panicking mid-lifecycle and leaving provider state applied and
+//! un-rolled-back, [`serve`] returns an error instead of answering every later
+//! request with an internal fault, and the process exits non-zero. A fatal
+//! accept error does the same. Deploy the broker under a supervisor (systemd
+//! `Restart=on-failure` or equivalent) so that exit becomes a restart, and let
+//! the watchdog own recovery of any state left behind.
 
 mod ownership;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use fpsmaxxing_contracts::ChangeRequest;
 use fpsmaxxing_contracts::ipc::{
@@ -33,12 +43,24 @@ use fpsmaxxing_ipc::{
     Accepted, FrameError, LocalTransport, PeerAuthorizer, read_frame, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 pub use ownership::{OwnerConflict, OwnershipGuard, OwnershipLedger};
 
 /// Backlog of in-flight requests queued for the single control-plane worker.
 const REQUEST_BACKLOG: usize = 64;
+
+/// Connections served at once; further peers wait in the transport's backlog.
+pub const MAX_CONNECTIONS: usize = 32;
+
+/// How long a served connection may stay silent before the broker closes it.
+///
+/// This bounds both an idle peer holding a descriptor and a peer that declares a
+/// large frame and then stalls while the reader holds its buffer.
+pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after a per-connection accept failure, so a repeated one cannot spin.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// The request handler at the trusted end of the IPC boundary.
 ///
@@ -47,7 +69,7 @@ const REQUEST_BACKLOG: usize = 64;
 /// plane, one instance lives on a dedicated worker thread; use [`spawn_service`]
 /// to create it there and reach it through a [`BrokerHandle`].
 pub struct BrokerService {
-    plane: Mutex<ControlPlane>,
+    plane: RefCell<ControlPlane>,
     ledger: Arc<OwnershipLedger>,
     catalog: BTreeSet<String>,
 }
@@ -66,7 +88,7 @@ impl BrokerService {
             .map(|capability| capability.id.clone())
             .collect();
         Self {
-            plane: Mutex::new(plane),
+            plane: RefCell::new(plane),
             ledger,
             catalog,
         }
@@ -85,12 +107,7 @@ impl BrokerService {
     }
 
     fn discover(&self) -> BrokerResponse {
-        match self.plane.lock() {
-            Ok(plane) => BrokerResponse::capabilities(plane.capabilities().clone()),
-            Err(_) => {
-                BrokerResponse::error(BrokerErrorKind::Internal, "control plane is unavailable")
-            }
-        }
+        BrokerResponse::capabilities(self.plane.borrow().capabilities().clone())
     }
 
     fn run_lifecycle(
@@ -122,15 +139,7 @@ impl BrokerService {
                 return BrokerResponse::error(BrokerErrorKind::OwnerConflict, conflict.to_string());
             }
         };
-        let outcome = match self.plane.lock() {
-            Ok(mut plane) => plane.run_lifecycle(&change),
-            Err(_) => {
-                return BrokerResponse::error(
-                    BrokerErrorKind::Internal,
-                    "control plane is unavailable",
-                );
-            }
-        };
+        let outcome = self.plane.borrow_mut().run_lifecycle(&change);
         match outcome {
             Ok(result) => BrokerResponse::lifecycle(LifecycleReport {
                 provider_id: result.provider_id,
@@ -138,7 +147,7 @@ impl BrokerService {
                 verified: result.verified,
                 rolled_back: result.rolled_back,
             }),
-            Err(error) => BrokerResponse::error(error_kind(&error), error.to_string()),
+            Err(error) => BrokerResponse::error(error_kind(&error), client_message(&error)),
         }
     }
 }
@@ -148,6 +157,26 @@ fn error_kind(error: &ControlPlaneError) -> BrokerErrorKind {
         ControlPlaneError::UnknownCapability(_) => BrokerErrorKind::UnknownCapability,
         ControlPlaneError::PolicyDenied(_) => BrokerErrorKind::PolicyDenied,
         _ => BrokerErrorKind::LifecycleFailed,
+    }
+}
+
+/// Reduces a control-plane failure to text that may cross the privilege boundary.
+///
+/// Only the two client-caused variants describe the caller's own request, so
+/// only they are forwarded verbatim. Every other variant wraps a `SQLite`,
+/// serialization, or provider error whose `Display` can carry journal paths and
+/// other host detail, which [`fpsmaxxing_contracts::ipc::BrokerErrorBody`]
+/// promises never to expose: those are reduced to the stable machine-readable
+/// stage kind and the full error is traced locally instead.
+fn client_message(error: &ControlPlaneError) -> String {
+    match error {
+        ControlPlaneError::UnknownCapability(_) | ControlPlaneError::PolicyDenied(_) => {
+            error.to_string()
+        }
+        _ => {
+            eprintln!("fpsmaxxing-broker: lifecycle failed: {error}");
+            format!("lifecycle failed: {}", error.kind())
+        }
     }
 }
 
@@ -181,6 +210,17 @@ impl BrokerHandle {
                 "broker worker dropped the request",
             )
         })
+    }
+
+    /// Resolves once the control-plane worker thread has stopped.
+    ///
+    /// The worker owns the receiving end of the job channel, so it is dropped
+    /// when the thread ends for any reason - including a panic unwinding out of
+    /// [`BrokerService::handle`]. [`serve`] waits on this so a broker that has
+    /// permanently lost its control plane exits instead of staying up and
+    /// answering every request with an internal fault.
+    pub async fn worker_stopped(&self) {
+        self.jobs.closed().await;
     }
 }
 
@@ -223,16 +263,22 @@ where
     }
 }
 
-/// Serves broker requests over `transport` until it stops accepting.
+/// Serves broker requests over `transport` until the broker can no longer run.
 ///
 /// Each connection is authenticated once against `authorizer` before any request
-/// is read, then handled on its own task and dispatched to `broker`. A transient
-/// accept error is logged and the loop continues; a per-connection fault ends
-/// only that connection, never the broker.
+/// is read, then handled on its own task and dispatched to `broker`. A
+/// per-connection fault - including an accept error that aborted a single
+/// connection - ends only that connection. At most [`MAX_CONNECTIONS`] are
+/// served concurrently, and a connection idle for [`CONNECTION_IDLE_TIMEOUT`] is
+/// closed, so a peer cannot pin a task, a descriptor, or a frame buffer forever.
+///
+/// This never returns `Ok`: it runs until a fatal condition, then reports it so
+/// the process can exit non-zero and a supervisor can restart it.
 ///
 /// # Errors
 ///
-/// Returns an error only if the transport itself fails irrecoverably.
+/// Returns an error when the control-plane worker thread has stopped or the
+/// transport fails in a way that is not specific to one connection.
 pub async fn serve<T>(
     transport: T,
     broker: BrokerHandle,
@@ -241,22 +287,65 @@ pub async fn serve<T>(
 where
     T: LocalTransport,
 {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let accepted = match transport.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                eprintln!("fpsmaxxing-broker: accept failed: {error}");
-                continue;
+        let (permit, accepted) = tokio::select! {
+            biased;
+            () = broker.worker_stopped() => {
+                return Err(io::Error::other(
+                    "broker control-plane worker stopped; restart the broker process",
+                ));
             }
+            admitted = admit(&transport, &connections) => match admitted {
+                Ok(admitted) => admitted,
+                Err(error) if is_transient_accept_error(&error) => {
+                    eprintln!("fpsmaxxing-broker: accept failed: {error}");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
         };
-        let broker = broker.clone();
+        let connection_broker = broker.clone();
         let authorizer = Arc::clone(&authorizer);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(accepted, broker, authorizer).await {
+            let _permit = permit;
+            if let Err(error) = handle_connection(accepted, connection_broker, authorizer).await {
                 eprintln!("fpsmaxxing-broker: connection error: {error}");
             }
         });
     }
+}
+
+/// Waits for a free connection slot, then accepts the next peer into it.
+///
+/// The slot is taken before the accept so a peer beyond [`MAX_CONNECTIONS`]
+/// waits in the transport's own backlog rather than in a task of its own. This
+/// whole future is dropped when [`serve`] sees the worker stop, so a queued slot
+/// or a pending accept is released rather than leaked.
+async fn admit<T>(
+    transport: &T,
+    connections: &Arc<Semaphore>,
+) -> io::Result<(OwnedSemaphorePermit, Accepted<T::Stream>)>
+where
+    T: LocalTransport,
+{
+    let permit = Arc::clone(connections)
+        .acquire_owned()
+        .await
+        .map_err(io::Error::other)?;
+    Ok((permit, transport.accept().await?))
+}
+
+/// Whether an accept failure aborted one connection rather than the endpoint.
+///
+/// Anything else - a closed or unusable listener, descriptor exhaustion - is
+/// persistent: retrying it would spin, so [`serve`] surfaces it as fatal.
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+    )
 }
 
 async fn handle_connection<S>(
@@ -274,9 +363,21 @@ where
         return Ok(());
     }
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let read = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, read_frame(&mut stream)).await;
+        let Ok(read) = read else {
+            return Ok(());
+        };
+        let frame = match read {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
+            Err(FrameError::Empty) => {
+                // The body was zero bytes, so the stream is still at a frame
+                // boundary and this peer can keep talking.
+                let response =
+                    BrokerResponse::error(BrokerErrorKind::Malformed, "frame body is empty");
+                write_response(&mut stream, &response).await?;
+                continue;
+            }
             Err(FrameError::TooLarge { length }) => {
                 let response = BrokerResponse::error(
                     BrokerErrorKind::Malformed,
@@ -311,17 +412,53 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::Arc;
 
-    use fpsmaxxing_contracts::ChangeRequest;
     use fpsmaxxing_contracts::ipc::{BrokerErrorKind, BrokerOutcome, BrokerRequest};
+    use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, StateSnapshot};
     use fpsmaxxing_control_plane::ControlPlane;
     use fpsmaxxing_mock_provider::MockProvider;
+    use fpsmaxxing_provider_sdk::{Provider, ProviderError};
     use serde_json::json;
 
     use super::{BrokerService, OwnershipLedger};
 
+    /// Host detail a provider error might carry; it must not reach the wire.
+    const HOST_DETAIL: &str = "/var/lib/fpsmaxxing/private/journal.sqlite";
+
+    /// A provider whose apply fails with an error carrying host detail.
+    struct LeakyProvider;
+
+    impl Provider for LeakyProvider {
+        fn manifest(&self) -> ProviderManifest {
+            MockProvider::new(0).manifest()
+        }
+
+        fn snapshot(&self) -> Result<StateSnapshot, ProviderError> {
+            MockProvider::new(0).snapshot()
+        }
+
+        fn preview(&self, request: &ChangeRequest) -> Result<String, ProviderError> {
+            MockProvider::new(0).preview(request)
+        }
+
+        fn apply(&mut self, _request: &ChangeRequest) -> Result<(), ProviderError> {
+            Err(ProviderError::Unavailable(HOST_DETAIL.to_owned()))
+        }
+
+        fn verify(&self, _request: &ChangeRequest) -> Result<bool, ProviderError> {
+            Ok(true)
+        }
+
+        fn rollback(&mut self, _snapshot: &StateSnapshot) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
     fn service() -> (BrokerService, Arc<OwnershipLedger>) {
-        let plane = ControlPlane::open(Box::new(MockProvider::new(0)), ":memory:")
-            .expect("control plane should open");
+        service_with(Box::new(MockProvider::new(0)))
+    }
+
+    fn service_with(provider: Box<dyn Provider>) -> (BrokerService, Arc<OwnershipLedger>) {
+        let plane = ControlPlane::open(provider, ":memory:").expect("control plane should open");
         let ledger = Arc::new(OwnershipLedger::new());
         (BrokerService::new(plane, Arc::clone(&ledger)), ledger)
     }
@@ -405,6 +542,33 @@ mod tests {
             change("mock.value", 101, 30),
         ));
         assert_eq!(error_kind(&response), BrokerErrorKind::PolicyDenied);
+        let message = &response
+            .error
+            .expect("response should carry an error")
+            .message;
+        assert_eq!(
+            message,
+            "policy denied request: mock.value is bounded to 0..=100"
+        );
+    }
+
+    #[test]
+    fn an_internal_failure_does_not_cross_the_boundary_verbatim() {
+        let (service, _ledger) = service_with(Box::new(LeakyProvider));
+        let response = service.handle(BrokerRequest::run_lifecycle(
+            "gateway",
+            change("mock.value", 42, 30),
+        ));
+        assert_eq!(error_kind(&response), BrokerErrorKind::LifecycleFailed);
+        let message = response
+            .error
+            .expect("response should carry an error")
+            .message;
+        assert!(
+            !message.contains(HOST_DETAIL),
+            "host detail leaked to the client: {message}"
+        );
+        assert_eq!(message, "lifecycle failed: provider");
     }
 
     #[test]

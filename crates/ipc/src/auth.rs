@@ -53,6 +53,15 @@ pub enum AuthError {
 /// This is the Linux ACL primitive: the broker trusts exactly the uid it runs
 /// as, so a process owned by any other user is refused before any request is
 /// read.
+///
+/// This same-uid ACL is the deliberate *interim* policy for the current
+/// single-user, Linux-safe mock path, where the broker and its only client run
+/// as the same desktop user. It is not the shipping policy for the privileged
+/// split described in `docs/ARCHITECTURE.md`: once the broker runs as a service
+/// account, an unprivileged gateway is refused by construction. The real
+/// privilege-split ACL arrives with the Windows named-pipe SID implementation of
+/// [`PeerAuthorizer`], which is tracked separately; callers reach it through
+/// this trait, so no call site changes when it lands.
 pub struct SameUidAuthorizer {
     expected_uid: u32,
 }
@@ -62,6 +71,17 @@ impl SameUidAuthorizer {
     #[must_use]
     pub const fn new(expected_uid: u32) -> Self {
         Self { expected_uid }
+    }
+
+    /// Builds an authorizer that trusts the calling process's own effective uid.
+    ///
+    /// The trust anchor is the broker's own credentials, never a by-name
+    /// filesystem lookup of the socket: an attacker who can replace the socket
+    /// path must not be able to redirect the ACL onto their own uid.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn for_current_process() -> Self {
+        Self::new(rustix::process::geteuid().as_raw())
     }
 
     /// Returns the uid this authorizer trusts.
@@ -115,5 +135,16 @@ mod tests {
                 actual: 1001
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_current_process_is_authorized_by_its_own_credentials() {
+        let authorizer = SameUidAuthorizer::for_current_process();
+        let peer = PeerIdentity {
+            uid: rustix::process::geteuid().as_raw(),
+            pid: Some(std::process::id().cast_signed()),
+        };
+        assert!(authorizer.authorize(&peer).is_ok());
     }
 }

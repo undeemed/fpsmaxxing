@@ -44,8 +44,9 @@ pub use unix::UnixSocketTransport;
 
 #[cfg(unix)]
 mod unix {
+    use std::fs::Permissions;
     use std::io;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use tokio::net::{UnixListener, UnixStream};
@@ -53,10 +54,14 @@ mod unix {
     use super::{Accepted, LocalTransport};
     use crate::auth::PeerIdentity;
 
+    /// Filesystem mode applied to the listening socket: owner access only.
+    const SOCKET_MODE: u32 = 0o600;
+
     /// A Unix domain socket implementation of [`LocalTransport`].
     ///
     /// The socket file is removed when the transport is dropped so a restarted
     /// broker can rebind cleanly.
+    #[derive(Debug)]
     pub struct UnixSocketTransport {
         listener: UnixListener,
         path: PathBuf,
@@ -65,31 +70,38 @@ mod unix {
     impl UnixSocketTransport {
         /// Binds a fresh socket at `path`, replacing a stale socket file.
         ///
+        /// Only an existing socket is replaced. A regular file, a directory, or
+        /// a symlink already at `path` fails closed with
+        /// [`io::ErrorKind::AlreadyExists`] rather than being deleted, so a
+        /// mistyped `--socket` on a privileged broker cannot destroy an
+        /// unrelated file.
+        ///
+        /// The bound socket is restricted to [`SOCKET_MODE`] so the filesystem
+        /// denies other users a `connect()` regardless of the inherited umask;
+        /// the peer-credential ACL remains the authoritative check.
+        ///
         /// # Errors
         ///
-        /// Returns an error if an existing non-socket file cannot be removed or
-        /// the socket cannot be bound.
+        /// Returns an error if `path` holds a non-socket entry, an existing
+        /// stale socket cannot be removed, the socket cannot be bound, or its
+        /// mode cannot be restricted.
         pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
             let path = path.as_ref().to_path_buf();
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(&path)?,
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} exists and is not a socket", path.display()),
+                    ));
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
             let listener = UnixListener::bind(&path)?;
-            Ok(Self { listener, path })
-        }
-
-        /// Returns the uid that owns the bound socket file.
-        ///
-        /// A freshly created socket is owned by the broker's effective uid, so
-        /// this is the uid a [`crate::SameUidAuthorizer`] should trust.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error if the socket file metadata cannot be read.
-        pub fn owner_uid(&self) -> io::Result<u32> {
-            Ok(std::fs::metadata(&self.path)?.uid())
+            let transport = Self { listener, path };
+            std::fs::set_permissions(transport.path(), Permissions::from_mode(SOCKET_MODE))?;
+            Ok(transport)
         }
 
         /// Returns the bound socket path.
@@ -116,6 +128,56 @@ mod unix {
     impl Drop for UnixSocketTransport {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io;
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::{SOCKET_MODE, UnixSocketTransport};
+
+        #[tokio::test]
+        async fn bind_restricts_the_socket_to_its_owner() {
+            let dir = tempfile::tempdir().expect("temporary directory should exist");
+            let path = dir.path().join("broker.sock");
+            let transport = UnixSocketTransport::bind(&path).expect("socket should bind");
+            let mode = std::fs::metadata(transport.path())
+                .expect("socket metadata should read")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, SOCKET_MODE);
+        }
+
+        #[tokio::test]
+        async fn bind_replaces_a_stale_socket() {
+            let dir = tempfile::tempdir().expect("temporary directory should exist");
+            let path = dir.path().join("broker.sock");
+            // std's listener leaves the socket file behind, like a crashed broker.
+            drop(std::os::unix::net::UnixListener::bind(&path).expect("stale socket should bind"));
+            UnixSocketTransport::bind(&path).expect("a stale socket should be replaced");
+        }
+
+        #[tokio::test]
+        async fn bind_refuses_to_delete_a_non_socket_path() {
+            let dir = tempfile::tempdir().expect("temporary directory should exist");
+            for name in ["regular-file", "directory", "symlink"] {
+                let path = dir.path().join(name);
+                match name {
+                    "directory" => std::fs::create_dir(&path).expect("directory should create"),
+                    "symlink" => std::os::unix::fs::symlink("/dev/null", &path)
+                        .expect("symlink should create"),
+                    _ => std::fs::write(&path, b"not a socket").expect("file should write"),
+                }
+                let error = UnixSocketTransport::bind(&path)
+                    .expect_err("a non-socket path must not be replaced");
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{name}");
+                assert!(
+                    std::fs::symlink_metadata(&path).is_ok(),
+                    "{name} must survive the refused bind"
+                );
+            }
         }
     }
 }

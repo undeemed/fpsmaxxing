@@ -90,6 +90,7 @@ dependencies = [
  "fpsmaxxing-control-plane",
  "fpsmaxxing-ipc",
  "fpsmaxxing-mock-provider",
+ "fpsmaxxing-provider-sdk",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -160,6 +161,7 @@ name = "fpsmaxxing-ipc"
 version = "0.1.0"
 dependencies = [
  "fpsmaxxing-contracts",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",

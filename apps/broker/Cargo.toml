@@ -14,11 +14,12 @@ fpsmaxxing-ipc = { path = "../../crates/ipc" }
 fpsmaxxing-mock-provider = { path = "../../sidecars/mock-provider" }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
 
 [dev-dependencies]
+fpsmaxxing-provider-sdk.workspace = true
 rusqlite.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 
 [lints]
 workspace = true
