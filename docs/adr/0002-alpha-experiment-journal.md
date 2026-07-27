@@ -24,7 +24,8 @@ The write-ahead apply intent makes a crash between mutation and journaling disti
 A per-stage two-phase protocol would duplicate that machinery for the mock-only alpha before the broker owns the transaction log.
 Trial records carry a `schema_version` so a future field addition is a version bump a reader can refuse rather than a silent misread of journaled history.
 The version gate only catches a writer that bumps it, so the record types also reject unknown fields: a row carrying a field this build does not know, under a version it does, means a divergent writer or a rewritten row and fails the replay rather than decoding with that field dropped.
-Replay re-checks the journaled decision bounds against the policy envelope as well, because a row whose thresholds were widened after the fact re-evaluates to the same verdict under those same widened thresholds and so is invisible to a verdict comparison alone.
+Replay re-runs the full run-time gate over the journaled spec as well - capability, sample counts, decision bounds, and candidate value - and cross-checks the record's redundant fields against that spec, because a coherently rewritten row re-evaluates to the verdict it carries and so is invisible to a verdict comparison alone.
+A row whose thresholds were widened, whose target was pointed at a capability the measurement model never described, or whose samples contradict the counts its spec declared is reported as outside policy even when the recomputed verdict matches.
 
 ## Consequences
 

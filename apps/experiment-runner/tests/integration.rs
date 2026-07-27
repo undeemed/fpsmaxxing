@@ -13,7 +13,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use fpsmaxxing_contracts::{
     ChangeRequest, Decision, DecisionBounds, ExperimentSpec, VerdictReason,
 };
-use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, MAX_MOCK_VALUE};
 use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use serde_json::json;
@@ -337,6 +337,90 @@ fn a_replay_reports_bounds_outside_the_policy_envelope() {
     // The trial as it was actually run stays legal.
     let outcome = replay_trial(&plane, trial.id).expect("replay trial");
     assert!(outcome.is_consistent() && outcome.policy_legal);
+}
+
+#[test]
+fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+    let recorded = plane.read_trial(trial.id).expect("trial should read");
+
+    // Each of these rows re-evaluates to exactly the verdict it carries, so
+    // comparing verdicts cannot catch any of them. Replay re-runs the whole
+    // run-time gate over the journaled spec instead, and cross-checks the
+    // record against the spec it carries.
+    let refused = [
+        ("a capability the model never described", {
+            let mut payload = recorded.clone();
+            payload["spec"]["target"]["capability_id"] = json!("gpu.core-clock-offset");
+            payload
+        }),
+        ("a candidate value above the policy ceiling", {
+            let mut payload = recorded.clone();
+            payload["spec"]["target"]["parameters"]["value"] = json!(MAX_MOCK_VALUE + 1);
+            payload["candidate_value"] = json!(MAX_MOCK_VALUE + 1);
+            payload
+        }),
+        ("a candidate value contradicting its own spec", {
+            let mut payload = recorded.clone();
+            payload["candidate_value"] = json!(41);
+            payload
+        }),
+        ("a baseline outside the policy envelope", {
+            let mut payload = recorded.clone();
+            payload["baseline_value"] = json!(MAX_MOCK_VALUE + 1);
+            payload
+        }),
+        ("fewer samples than the spec declared", {
+            let mut payload = recorded.clone();
+            payload["spec"]["candidate_samples"] = json!(4);
+            payload
+        }),
+    ];
+
+    for (rewrite, payload) in refused {
+        let tampered = plane
+            .record_trial(&payload)
+            .expect("a rewritten record should append");
+        let outcome = replay_trial(&plane, tampered).expect("replay trial");
+        assert!(
+            outcome.is_consistent(),
+            "{rewrite} still reproduces the recorded verdict"
+        );
+        assert!(!outcome.policy_legal, "{rewrite} must replay as illegal");
+    }
+
+    // The trial as it was actually run stays legal.
+    let outcome = replay_trial(&plane, trial.id).expect("replay trial");
+    assert!(outcome.is_consistent() && outcome.policy_legal);
+}
+
+#[test]
+fn a_baseline_outside_the_policy_bound_is_refused_before_any_measurement() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane = ControlPlane::open(
+        Box::new(MockProvider::new(MAX_MOCK_VALUE + 1)),
+        journal.path(),
+    )
+    .expect("open");
+
+    // The baseline drives the same model as the candidate, so a provider parked
+    // outside the envelope fails closed rather than being measured into a
+    // journaled trial the policy would never have permitted.
+    let error = run_trial(&mut plane, &spec_for(40, 5.0, 80.0))
+        .expect_err("an out-of-policy baseline should be refused");
+    assert!(
+        matches!(error, RunnerError::BaselineOutOfPolicy(value) if value == MAX_MOCK_VALUE + 1),
+        "{error:?}"
+    );
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused baseline journals nothing"
+    );
+    assert_eq!(current_value(&plane), MAX_MOCK_VALUE + 1);
 }
 
 #[test]

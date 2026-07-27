@@ -14,6 +14,13 @@
 
 use fpsmaxxing_contracts::MetricSample;
 
+/// The one capability [`measure`] describes.
+///
+/// Every coefficient below is a property of the bounded mock knob, so a trial
+/// against any other capability would be measured by a model that says nothing
+/// about it. The runner refuses such a target rather than measuring it.
+pub(crate) const MODELED_CAPABILITY_ID: &str = "mock.value";
+
 /// Frames per second reported while warming up, before steady state.
 const COLD_FPS: f64 = 60.0;
 /// Steady-state frames per second at the lowest knob value.
