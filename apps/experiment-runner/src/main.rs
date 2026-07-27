@@ -7,11 +7,13 @@
 //!
 //! A replay that diverges from the journal means the record was tampered with
 //! or the immutable evaluator drifted, and a replay the policy gate refuses -
-//! its capability, sample counts, decision bounds, candidate value, baseline
-//! ceiling, the lifecycle fields its decision implies, or the agreement between
-//! the record and the spec it carries - means the journaled row is not one this
-//! runner would have written. The demo exits non-zero on either rather than
-//! reporting it as a successful run.
+//! its capability, sample counts, decision bounds, candidate value, TTL lease,
+//! baseline ceiling, the lifecycle fields its decision implies, or the
+//! agreement between the record and the spec it carries - means the journaled
+//! row is not one this runner would have written. A lifecycle that fails after
+//! the trial was measured is the third failure: the trial is journaled anyway
+//! and the error names the row, which the demo reports. It exits non-zero on
+//! any of the three rather than reporting a successful run.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -28,7 +30,22 @@ fn main() -> Result<ExitCode, RunnerError> {
     let mut plane = ControlPlane::open(Box::new(MockProvider::new(10)), ":memory:")?;
     let spec = demo_spec();
 
-    let trial = run_trial(&mut plane, &spec)?;
+    let trial = match run_trial(&mut plane, &spec) {
+        Ok(trial) => trial,
+        Err(RunnerError::LifecycleFailed { trial_id, source }) => {
+            // The measurements that authorized the promotion were journaled
+            // before the broker error surfaced, and the error names that row.
+            eprintln!(
+                "fpsmaxxing-experiment-runner: the lifecycle failed after the trial was journaled: {source}"
+            );
+            match trial_id {
+                Some(id) => eprintln!("  the trial recording it is {id}"),
+                None => eprintln!("  the trial recording it could not be journaled"),
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(error) => return Err(error),
+    };
     let verdict = &trial.record.verdict;
     println!(
         "trial {} -> {:?} ({:?}); fps_improvement = {:.1}",

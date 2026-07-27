@@ -14,7 +14,9 @@
 //! afterwards. A lifecycle that fails after a promotion - a policy denial, a
 //! provider fault, or a rollback that could not be verified - is therefore
 //! still recorded, as a [`LifecycleFailure`] carried by the same record as the
-//! measurements that authorized the apply, and is also returned to the caller.
+//! measurements that authorized the apply, and is also returned to the caller
+//! together with the identifier that record was stored under, so the caller
+//! addresses its own row rather than the journal's last one.
 //! Crash safety for the window between the mutation and that record stays with
 //! the lifecycle journal's write-ahead `apply-intent` stage (ADR 0002).
 //!
@@ -38,11 +40,10 @@ use std::num::NonZeroU32;
 
 use fpsmaxxing_contracts::{
     Decision, DecisionBounds, ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
-    MAX_DECISION_TEMPERATURE_C, MAX_SAMPLES, MetricSample, ProviderManifest, Verdict,
+    MAX_DECISION_TEMPERATURE_C, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample, ProviderManifest,
+    Verdict,
 };
-use fpsmaxxing_control_plane::{
-    ControlPlane, ControlPlaneError, LifecycleResult, MAX_LEASE_SECONDS, MAX_MOCK_VALUE,
-};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -61,6 +62,23 @@ pub enum RunnerError {
     /// The broker or the durable journal rejected an operation.
     #[error(transparent)]
     ControlPlane(#[from] ControlPlaneError),
+    /// A promoted trial's lifecycle failed after its record was journaled.
+    ///
+    /// The record carrying the measurements that authorized the promotion is
+    /// written before the error surfaces, so its identifier travels with the
+    /// error and the caller can address that exact row. Recovering it by
+    /// reading back the last identifier the journal holds would be wrong: the
+    /// trial journal is shared, and a concurrent runner can append between the
+    /// write and the read.
+    #[error("lifecycle failed after {}: {source}", journaled_as(*trial_id))]
+    LifecycleFailed {
+        /// Identifier of the journaled trial, absent only when journaling the
+        /// record failed too; that failure is traced to stderr.
+        trial_id: Option<i64>,
+        /// The broker error that ended the lifecycle.
+        #[source]
+        source: ControlPlaneError,
+    },
     /// The experiment specification is outside the bounded alpha envelope.
     #[error("experiment spec rejected: {0}")]
     InvalidSpec(String),
@@ -237,8 +255,10 @@ impl ReplayOutcome {
 /// if the provider snapshot lacks one or reports one outside the policy
 /// envelope, or if the broker or durable journal rejects an operation. A
 /// lifecycle error is returned only after the trial record carrying it has been
-/// journaled; if that write also fails, the lifecycle error still takes
-/// precedence and the journal failure is traced to stderr.
+/// journaled, as a [`LifecycleFailed`](RunnerError::LifecycleFailed) naming the
+/// identifier that record was stored under; if that write also fails, the
+/// lifecycle error still takes precedence, the identifier is absent, and the
+/// journal failure is traced to stderr.
 pub fn run_trial(
     plane: &mut ControlPlane,
     spec: &ExperimentSpec,
@@ -278,13 +298,17 @@ pub fn run_trial(
             .map(LifecycleFailure::from),
     };
     let journaled = plane.record_trial(&record);
-    if let Some(Err(error)) = outcome {
-        if let Err(journal_error) = journaled {
-            eprintln!(
-                "fpsmaxxing-experiment-runner: could not journal the trial whose lifecycle failed: {journal_error}"
-            );
-        }
-        return Err(error.into());
+    if let Some(Err(source)) = outcome {
+        let trial_id = match journaled {
+            Ok(id) => Some(id),
+            Err(journal_error) => {
+                eprintln!(
+                    "fpsmaxxing-experiment-runner: could not journal the trial whose lifecycle failed: {journal_error}"
+                );
+                None
+            }
+        };
+        return Err(RunnerError::LifecycleFailed { trial_id, source });
     }
     Ok(StoredTrial {
         id: journaled?,
@@ -302,7 +326,7 @@ pub fn run_trial(
 /// The journaled record is re-checked against the policy gate as well, so a row
 /// that was rewritten after the fact is reported as `policy_legal = false`, with
 /// the gate it tripped in `policy_reason`, even when re-evaluating it reproduces
-/// the recorded verdict; see [`check_policy`].
+/// the recorded verdict.
 ///
 /// # Errors
 ///
@@ -344,9 +368,9 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 ///
 /// Replay is the tamper-detection read, so it re-runs the whole of
 /// [`validate_spec`] over the journaled spec rather than only its bounds: a row
-/// whose capability, sample counts, decision bounds, or candidate value were
-/// rewritten is reported as illegal even though re-evaluating it reproduces the
-/// recorded verdict.
+/// whose capability, sample counts, decision bounds, candidate value, or TTL
+/// lease were rewritten is reported as illegal even though re-evaluating it
+/// reproduces the recorded verdict.
 ///
 /// The attached provider's manifest is deliberately not consulted. A trial
 /// journal outlives the process that wrote it, so requiring the provider running
@@ -435,6 +459,14 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
         )));
     }
     Ok(())
+}
+
+/// Renders where a failed lifecycle's trial record came to rest.
+fn journaled_as(trial_id: Option<i64>) -> String {
+    match trial_id {
+        Some(id) => format!("journaling trial {id}"),
+        None => "failing to journal its trial".to_owned(),
+    }
 }
 
 /// Renders whether an optional record field was journaled.

@@ -11,12 +11,10 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use fpsmaxxing_contracts::{
-    CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, Persistence,
-    ProviderManifest, RiskClass, StateSnapshot, VerdictReason,
+    CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
+    MAX_LEASE_SECONDS, Persistence, ProviderManifest, RiskClass, StateSnapshot, VerdictReason,
 };
-use fpsmaxxing_control_plane::{
-    ControlPlane, ControlPlaneError, MAX_LEASE_SECONDS, MAX_MOCK_VALUE,
-};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, MAX_MOCK_VALUE};
 use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
@@ -233,21 +231,30 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
     // never runs.
     let spec = spec_for(40, 5.0, 80.0);
     let error = run_trial(&mut plane, &spec).expect_err("policy should deny the risk class");
-    assert!(matches!(
-        error,
-        RunnerError::ControlPlane(ControlPlaneError::PolicyDenied(_))
-    ));
+    let reported = error.to_string();
 
     // The measurements that authorized the promotion are journaled with the
-    // refusal, in one append, so the trial is still discoverable and replayable.
-    let ids = plane.trial_ids().expect("trial ids");
+    // refusal, in one append, and the error names the row it was written to, so
+    // the caller addresses its own trial instead of the journal's last one.
+    let RunnerError::LifecycleFailed { trial_id, source } = error else {
+        panic!("a refused lifecycle reports the trial it journaled, got {reported}");
+    };
+    assert!(
+        matches!(source, ControlPlaneError::PolicyDenied(_)),
+        "{source:?}"
+    );
+    let trial_id = trial_id.expect("the refused lifecycle journaled its trial");
+    assert!(
+        reported.contains(&format!("trial {trial_id}")),
+        "the reported error names the journaled row: {reported}"
+    );
     assert_eq!(
-        ids.len(),
-        1,
+        plane.trial_ids().expect("trial ids"),
+        [trial_id],
         "the failed promotion is journaled exactly once"
     );
     let record: TrialRecord =
-        serde_json::from_value(plane.read_trial(ids[0]).expect("trial should read"))
+        serde_json::from_value(plane.read_trial(trial_id).expect("trial should read"))
             .expect("trial should decode");
     assert_eq!(record.verdict.decision, Decision::Promote);
     assert!(
@@ -266,7 +273,7 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
         failure.error
     );
 
-    let outcome = replay_trial(&plane, ids[0]).expect("replay trial");
+    let outcome = replay_trial(&plane, trial_id).expect("replay trial");
     assert!(outcome.is_consistent());
     assert_eq!(outcome.recomputed.decision, Decision::Promote);
 

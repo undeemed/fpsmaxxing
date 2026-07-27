@@ -64,6 +64,16 @@ pub struct ProviderManifest {
     pub capabilities: Vec<CapabilityDescriptor>,
 }
 
+/// Inclusive ceiling on a [`ChangeRequest`]'s TTL lease, in seconds.
+///
+/// The lease is what bounds how long a mutation may survive, so the ceiling
+/// belongs to the shared request type rather than to any one enforcement point:
+/// it is mirrored as `maximum` on `lease_seconds` in
+/// `schemas/experiment.schema.json`, applied by the broker policy in
+/// `crates/control-plane` before a lifecycle runs, and applied again by the
+/// experiment runner, which bounds a spec before it measures anything.
+pub const MAX_LEASE_SECONDS: u64 = 300;
+
 /// A requested provider change after policy validation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,7 +83,8 @@ pub struct ChangeRequest {
     /// Capability-specific parameters.
     pub parameters: Value,
     /// Automatic rollback deadline in seconds; every mutation carries a
-    /// non-zero TTL lease.
+    /// non-zero TTL lease, at most [`MAX_LEASE_SECONDS`].
+    #[schemars(range(max = MAX_LEASE_SECONDS))]
     pub lease_seconds: NonZeroU64,
 }
 
@@ -263,9 +274,9 @@ mod tests {
 
     use super::{
         CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
-        MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C, MAX_SAMPLES,
-        MetricSample, MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest,
-        RiskClass, Verdict, VerdictReason,
+        MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C, MAX_LEASE_SECONDS,
+        MAX_SAMPLES, MetricSample, MetricSummary, NonZeroU32, NonZeroU64, Persistence,
+        ProviderManifest, RiskClass, Verdict, VerdictReason,
     };
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
@@ -444,6 +455,26 @@ mod tests {
 
         serialized["lease_seconds"] = json!(0);
         assert!(serde_json::from_value::<ChangeRequest>(serialized).is_err());
+    }
+
+    #[test]
+    fn lease_seconds_is_bounded_like_the_schema() {
+        // The lease bounds how long a mutation may survive, so the ceiling is
+        // declared once on the shared request type and mirrored wherever a
+        // change request is published for an agent to author against.
+        let checked_in: Value =
+            serde_json::from_str(EXPERIMENT_SCHEMA).expect("experiment schema should parse");
+        assert_eq!(
+            checked_in["$defs"]["change_request"]["properties"]["lease_seconds"]["maximum"],
+            json!(MAX_LEASE_SECONDS)
+        );
+
+        let generated = serde_json::to_value(schemars::schema_for!(ExperimentSpec))
+            .expect("generated schema should serialize");
+        assert_eq!(
+            generated["$defs"]["ChangeRequest"]["properties"]["lease_seconds"]["maximum"],
+            json!(MAX_LEASE_SECONDS)
+        );
     }
 
     /// Asserts that two object schemas declare the same fields.

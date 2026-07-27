@@ -2,7 +2,9 @@
 
 use std::{path::Path, time::Duration};
 
-use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, RiskClass, StateSnapshot};
+use fpsmaxxing_contracts::{
+    ChangeRequest, MAX_LEASE_SECONDS, ProviderManifest, RiskClass, StateSnapshot,
+};
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -13,17 +15,10 @@ use thiserror::Error;
 ///
 /// [`ControlPlane::run_lifecycle`] rejects any change above it. It is exported
 /// so the experiment runner, which acts on a candidate value before the
-/// lifecycle runs, can refuse the same values this policy would.
+/// lifecycle runs, can refuse the same values this policy would. Callers that
+/// publish their own request schema, such as the gateway's advertised tool
+/// input, state the bound independently.
 pub const MAX_MOCK_VALUE: u64 = 100;
-
-/// Inclusive ceiling the bounded alpha policy enforces on a change request's
-/// TTL lease, in seconds.
-///
-/// [`ControlPlane::run_lifecycle`] rejects any change above it. It is exported
-/// alongside [`MAX_MOCK_VALUE`] so the experiment runner, which bounds a spec
-/// before the lifecycle runs, holds the lease to the same ceiling this policy
-/// does rather than restating it.
-pub const MAX_LEASE_SECONDS: u64 = 300;
 
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
@@ -569,10 +564,14 @@ mod tests {
     ];
 
     fn request(value: u64) -> ChangeRequest {
+        leased_request(value, 30)
+    }
+
+    fn leased_request(value: u64, lease_seconds: u64) -> ChangeRequest {
         ChangeRequest {
             capability_id: "mock.value".to_owned(),
             parameters: json!({ "value": value }),
-            lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
+            lease_seconds: NonZeroU64::new(lease_seconds).expect("lease is non-zero"),
         }
     }
 
@@ -872,6 +871,38 @@ mod tests {
             .err()
             .expect("foreign targets should be rejected");
         assert!(matches!(error, ControlPlaneError::PolicyDenied(_)));
+    }
+
+    #[test]
+    fn a_lease_above_the_policy_ceiling_is_denied() {
+        // The lease is the TTL that bounds how long a mutation may persist, and
+        // the gateway hands one straight from an agent to this seam, so the
+        // ceiling is checked before the provider is touched at all.
+        let mut plane = plane(false);
+        let error = plane
+            .run_lifecycle(&leased_request(42, MAX_LEASE_SECONDS + 1))
+            .expect_err("an oversized lease should be denied");
+        assert!(
+            matches!(&error, ControlPlaneError::PolicyDenied(message) if message.contains("lease")),
+            "{error:?}"
+        );
+        assert!(
+            plane
+                .journal_stages()
+                .expect("journal should read")
+                .is_empty(),
+            "a denied request opens no experiment"
+        );
+
+        // The ceiling is inclusive, so a lease exactly at it still runs.
+        let result = plane
+            .run_lifecycle(&leased_request(42, MAX_LEASE_SECONDS))
+            .expect("a lease at the ceiling is inside the envelope");
+        assert!(result.verified && result.rolled_back);
+        assert_eq!(
+            plane.journal_stages().expect("journal should read"),
+            LIFECYCLE_STAGES
+        );
     }
 
     #[test]
