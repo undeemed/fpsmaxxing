@@ -11,10 +11,35 @@ use thiserror::Error;
 
 /// Inclusive ceiling the bounded alpha policy enforces on `mock.value`.
 ///
-/// The broker rejects any change above it. Callers that act on a value before
-/// the lifecycle runs - a runner measuring a candidate, for instance - check it
-/// against this constant so their envelope cannot drift from the policy's.
+/// [`ControlPlane::run_lifecycle`] rejects any change above it. It is exported
+/// so the experiment runner, which acts on a candidate value before the
+/// lifecycle runs, can refuse the same values this policy would.
 pub const MAX_MOCK_VALUE: u64 = 100;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's temperature
+/// bound, in degrees Celsius.
+///
+/// The thresholds an immutable evaluator applies arrive in an LLM-authored
+/// experiment spec, so a spec could otherwise disarm its own safety gate by
+/// declaring an unreachable ceiling. Policy owns the hard envelope: a spec may
+/// tighten these bounds but never loosen them. This value sits below the
+/// throttle point of the consumer hardware the alpha targets.
+pub const MAX_DECISION_TEMPERATURE_C: f64 = 90.0;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's power
+/// bound, in watts.
+///
+/// See [`MAX_DECISION_TEMPERATURE_C`] for why the envelope is policy-owned.
+pub const MAX_DECISION_POWER_W: f64 = 250.0;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's error
+/// budget.
+///
+/// A correctness fault is never an acceptable cost of a performance gain on
+/// this path, so the alpha promotes nothing that reported one; a spec may
+/// restate this ceiling but not raise it. See [`MAX_DECISION_TEMPERATURE_C`]
+/// for why the envelope is policy-owned.
+pub const MAX_DECISION_ERRORS: u64 = 0;
 
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
@@ -214,6 +239,10 @@ impl ControlPlane {
     /// recorded samples, and verdict together so the trial can be replayed and
     /// re-evaluated from the journal alone, without chat history.
     ///
+    /// This is the only write the trial journal exposes, so the table is
+    /// append-only like the lifecycle journal: a recorded trial has no API that
+    /// can rewrite its verdict.
+    ///
     /// # Errors
     ///
     /// Returns an error if the payload cannot be encoded or the durable journal
@@ -225,31 +254,6 @@ impl ControlPlane {
             params![serde_json::to_string(payload)?],
         )?;
         Ok(self.journal.last_insert_rowid())
-    }
-
-    /// Replaces the payload of an already-recorded trial.
-    ///
-    /// A runner journals its measured trial ahead of the broker lifecycle so
-    /// the measurements that authorized a promotion survive a lifecycle
-    /// failure, then amends the same row with the outcome it could not know
-    /// yet. The trial's identity, spec, samples, and verdict are fixed at
-    /// insertion; only the outcome fields are filled in.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no trial has the identifier, the payload cannot be
-    /// encoded, or the durable journal cannot be written.
-    pub fn amend_trial(&self, id: i64, payload: &impl Serialize) -> Result<(), ControlPlaneError> {
-        let updated = self.journal.execute(
-            "UPDATE experiment_trials SET payload = ?2 WHERE id = ?1",
-            params![id, serde_json::to_string(payload)?],
-        )?;
-        if updated == 0 {
-            return Err(ControlPlaneError::Journal(
-                rusqlite::Error::QueryReturnedNoRows,
-            ));
-        }
-        Ok(())
     }
 
     /// Reads one trial record by identifier for replay and re-evaluation.
@@ -893,23 +897,19 @@ mod tests {
     }
 
     #[test]
-    fn amending_a_trial_replaces_only_that_payload() {
+    fn recording_a_trial_never_disturbs_an_earlier_one() {
+        // The trial journal exposes no update, so a recorded verdict stays as
+        // it was written and later trials only ever append.
         let plane = plane(false);
         let first = plane
-            .record_trial(&json!({ "decision": "promote", "lifecycle": null }))
+            .record_trial(&json!({ "decision": "promote", "lifecycle": { "verified": true } }))
             .expect("first trial should record");
         let second = plane
             .record_trial(&json!({ "decision": "reject" }))
             .expect("second trial should record");
-        plane
-            .amend_trial(
-                first,
-                &json!({ "decision": "promote", "lifecycle": { "verified": true } }),
-            )
-            .expect("trial should amend");
         assert_eq!(
-            plane.read_trial(first).expect("trial should read")["lifecycle"]["verified"],
-            true
+            plane.read_trial(first).expect("trial should read"),
+            json!({ "decision": "promote", "lifecycle": { "verified": true } })
         );
         assert_eq!(
             plane.read_trial(second).expect("trial should read")["decision"],
@@ -919,11 +919,11 @@ mod tests {
     }
 
     #[test]
-    fn amending_an_unknown_trial_fails_closed() {
+    fn reading_an_unknown_trial_fails_closed() {
         let plane = plane(false);
         let error = plane
-            .amend_trial(404, &json!({ "decision": "promote" }))
-            .expect_err("an unrecorded trial cannot be amended");
+            .read_trial(404)
+            .expect_err("an unrecorded trial cannot be read");
         assert!(matches!(
             error,
             ControlPlaneError::Journal(rusqlite::Error::QueryReturnedNoRows)

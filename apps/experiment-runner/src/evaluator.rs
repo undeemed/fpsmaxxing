@@ -73,18 +73,29 @@ pub fn evaluate(
 
 /// Aggregates one measurement set deterministically.
 ///
-/// The FPS mean is the arithmetic mean (zero for an empty set), while the
-/// temperature and power fields report the worst (highest) observed value and
-/// errors are summed. Counting the divisor as an `f64` avoids a lossy
-/// integer-to-float cast without changing the result for realistic sample
-/// counts. Samples may come from a journaled record this build did not write,
-/// so the error total saturates rather than overflowing: a saturated total is
-/// far above any ceiling and still rejects.
+/// The FPS mean is the arithmetic mean, while the temperature and power fields
+/// report the worst (highest) observed value and errors are summed. An empty
+/// set reports zero throughout, having observed nothing. Counting the divisor
+/// as an `f64` avoids a lossy integer-to-float cast without changing the result
+/// for realistic sample counts. Samples may come from a journaled record this
+/// build did not write, so the aggregates state only what the samples hold: the
+/// error total saturates rather than overflowing, and the maxima fold from
+/// negative infinity so an all-negative set reports its true worst observation
+/// instead of a value the journal never recorded.
 fn summarize(samples: &[MetricSample]) -> MetricSummary {
+    if samples.is_empty() {
+        return MetricSummary {
+            samples: 0,
+            mean_fps: 0.0,
+            max_temperature_c: 0.0,
+            max_power_w: 0.0,
+            total_errors: 0,
+        };
+    }
     let mut sum_fps = 0.0_f64;
     let mut divisor = 0.0_f64;
-    let mut max_temperature_c = 0.0_f64;
-    let mut max_power_w = 0.0_f64;
+    let mut max_temperature_c = f64::NEG_INFINITY;
+    let mut max_power_w = f64::NEG_INFINITY;
     let mut total_errors = 0_u64;
     for sample in samples {
         sum_fps += sample.fps;
@@ -95,11 +106,7 @@ fn summarize(samples: &[MetricSample]) -> MetricSummary {
     }
     MetricSummary {
         samples: samples.len() as u64,
-        mean_fps: if samples.is_empty() {
-            0.0
-        } else {
-            sum_fps / divisor
-        },
+        mean_fps: sum_fps / divisor,
         max_temperature_c,
         max_power_w,
         total_errors,
@@ -216,6 +223,30 @@ mod tests {
         assert_eq!(verdict.candidate.total_errors, u64::MAX);
         assert_eq!(verdict.decision, Decision::Reject);
         assert_eq!(verdict.reason, VerdictReason::ErrorsExceeded);
+    }
+
+    #[test]
+    fn maxima_report_the_worst_observation_even_when_all_are_negative() {
+        // The summary is journaled verbatim in the verdict, so it must not
+        // claim a temperature or power draw the samples never held.
+        let baseline = samples(100.0, -40.0, -10.0, 0, 3);
+        let candidate = samples(140.0, -30.0, -5.0, 0, 3);
+        let verdict = evaluate(&baseline, &candidate, &bounds());
+        assert!((verdict.baseline.max_temperature_c - -40.0).abs() < f64::EPSILON);
+        assert!((verdict.baseline.max_power_w - -10.0).abs() < f64::EPSILON);
+        assert!((verdict.candidate.max_temperature_c - -30.0).abs() < f64::EPSILON);
+        assert!((verdict.candidate.max_power_w - -5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_empty_set_reports_zero_throughout() {
+        let verdict = evaluate(&[], &[], &bounds());
+        assert_eq!(verdict.baseline.samples, 0);
+        assert!((verdict.baseline.mean_fps - 0.0).abs() < f64::EPSILON);
+        assert!((verdict.baseline.max_temperature_c - 0.0).abs() < f64::EPSILON);
+        assert!((verdict.baseline.max_power_w - 0.0).abs() < f64::EPSILON);
+        assert_eq!(verdict.decision, Decision::Reject);
+        assert_eq!(verdict.reason, VerdictReason::InsufficientSamples);
     }
 
     #[test]

@@ -224,14 +224,15 @@ mod tests {
 
     use super::{
         CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, MAX_SAMPLES,
-        MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict,
-        VerdictReason,
+        MetricSample, MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest,
+        RiskClass, Verdict, VerdictReason,
     };
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
     const SIDECAR_SCHEMA: &str = include_str!("../../../schemas/sidecar.schema.json");
     const EXPERIMENT_SCHEMA: &str = include_str!("../../../schemas/experiment.schema.json");
     const VERDICT_SCHEMA: &str = include_str!("../../../schemas/verdict.schema.json");
+    const METRIC_SAMPLE_SCHEMA: &str = include_str!("../../../schemas/metric-sample.schema.json");
 
     fn wire_string(value: impl serde::Serialize) -> String {
         serde_json::to_value(value)
@@ -498,6 +499,14 @@ mod tests {
                 checked_in: serde_json::from_str(VERDICT_SCHEMA)
                     .expect("verdict schema should parse"),
                 definitions: &[("MetricSummary", Some("metric_summary"))],
+            },
+            SchemaCase {
+                label: "MetricSample",
+                generated: serde_json::to_value(schemars::schema_for!(MetricSample))
+                    .expect("generated schema should serialize"),
+                checked_in: serde_json::from_str(METRIC_SAMPLE_SCHEMA)
+                    .expect("metric sample schema should parse"),
+                definitions: &[],
             },
         ]
     }

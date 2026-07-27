@@ -7,15 +7,16 @@
 //! [`replay_trial`] can re-evaluate it from the journal alone and confirm the
 //! recorded verdict without chat history or re-running the workload.
 //!
-//! # Write-ahead trial records
+//! # Append-only trial records
 //!
-//! The record is journaled *before* the lifecycle runs, following the same
-//! write-ahead principle the lifecycle journal uses (ADR 0002). A lifecycle
-//! that fails after a promotion - a policy denial, a provider fault, or a
-//! rollback that could not be verified - therefore still leaves a replayable
-//! record of the measurements that authorized the apply; the failure is
-//! amended onto that record as a [`LifecycleFailure`] and also returned to the
-//! caller.
+//! A trial is journaled exactly once, after the lifecycle it authorized has
+//! finished, and the trial journal exposes no write that could rewrite that row
+//! afterwards. A lifecycle that fails after a promotion - a policy denial, a
+//! provider fault, or a rollback that could not be verified - is therefore
+//! still recorded, as a [`LifecycleFailure`] carried by the same record as the
+//! measurements that authorized the apply, and is also returned to the caller.
+//! Crash safety for the window between the mutation and that record stays with
+//! the lifecycle journal's write-ahead `apply-intent` stage (ADR 0002).
 //!
 //! # Keep-or-rollback in the safe alpha
 //!
@@ -33,8 +34,13 @@
 //! written, so swapping it in means moving the candidate measurement inside the
 //! apply/lease window and running the evaluator gate after it.
 
-use fpsmaxxing_contracts::{Decision, ExperimentSpec, MAX_SAMPLES, MetricSample, Verdict};
-use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
+use fpsmaxxing_contracts::{
+    Decision, DecisionBounds, ExperimentSpec, MAX_SAMPLES, MetricSample, Verdict,
+};
+use fpsmaxxing_control_plane::{
+    ControlPlane, ControlPlaneError, LifecycleResult, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
+    MAX_DECISION_TEMPERATURE_C, MAX_MOCK_VALUE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -126,9 +132,9 @@ impl From<&ControlPlaneError> for LifecycleFailure {
 /// and candidate samples, and the verdict the evaluator produced.
 ///
 /// On a [`Promote`](Decision::Promote) exactly one of `lifecycle` and
-/// `lifecycle_error` is normally set. Both being absent means the amend that
-/// follows the lifecycle never reached the journal, and the lifecycle journal's
-/// stage records for that experiment are the authoritative account.
+/// `lifecycle_error` is set, because the record is written once the lifecycle
+/// has finished. On a [`Reject`](Decision::Reject) both are absent: no
+/// lifecycle ran.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrialRecord {
     /// Version of the record format; see [`TRIAL_RECORD_VERSION`].
@@ -186,23 +192,25 @@ impl ReplayOutcome {
 /// Validates the spec, measures the baseline from the provider's current
 /// state, measures the candidate from the spec target, evaluates the two, and
 /// runs the candidate through the broker lifecycle only on a
-/// [`Promote`](Decision::Promote). The record is written to the durable trial
-/// journal before the lifecycle runs and amended with its outcome afterwards,
-/// so the trial is replayable whether or not the lifecycle succeeds.
+/// [`Promote`](Decision::Promote). The record is appended to the durable trial
+/// journal once, carrying whichever of the lifecycle outcome or the lifecycle
+/// error the promotion produced, so the trial is replayable whether or not the
+/// lifecycle succeeded.
 ///
 /// # Errors
 ///
 /// Returns an error if the spec is outside the bounded envelope, if the spec
 /// target or provider snapshot lacks an unsigned mock value, or if the broker
 /// or durable journal rejects an operation. A lifecycle error is returned only
-/// after the trial record has been amended with it.
+/// after the trial record carrying it has been journaled; if that write also
+/// fails, the lifecycle error still takes precedence and the journal failure is
+/// traced to stderr.
 pub fn run_trial(
     plane: &mut ControlPlane,
     spec: &ExperimentSpec,
 ) -> Result<StoredTrial, RunnerError> {
-    validate(spec)?;
+    let candidate_value = validate(spec)?;
     let baseline_value = baseline_value(plane)?;
-    let candidate_value = candidate_value(spec)?;
     let baseline_samples = model::measure(
         baseline_value,
         spec.warmup_samples,
@@ -214,7 +222,11 @@ pub fn run_trial(
         spec.candidate_samples.get(),
     );
     let verdict = evaluate(&baseline_samples, &candidate_samples, &spec.bounds);
-    let mut record = TrialRecord {
+    let outcome = match verdict.decision {
+        Decision::Promote => Some(plane.run_lifecycle(&spec.target)),
+        Decision::Reject => None,
+    };
+    let record = TrialRecord {
         schema_version: TRIAL_RECORD_VERSION,
         spec: spec.clone(),
         baseline_value,
@@ -222,29 +234,28 @@ pub fn run_trial(
         baseline_samples,
         candidate_samples,
         verdict,
-        lifecycle: None,
-        lifecycle_error: None,
+        lifecycle: outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok())
+            .map(LifecycleOutcome::from),
+        lifecycle_error: outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().err())
+            .map(LifecycleFailure::from),
     };
-    let id = plane.record_trial(&record)?;
-    match record.verdict.decision {
-        Decision::Promote => match plane.run_lifecycle(&spec.target) {
-            Ok(result) => {
-                record.lifecycle = Some(LifecycleOutcome::from(&result));
-                plane.amend_trial(id, &record)?;
-            }
-            Err(error) => {
-                record.lifecycle_error = Some(LifecycleFailure::from(&error));
-                if let Err(journal_error) = plane.amend_trial(id, &record) {
-                    eprintln!(
-                        "fpsmaxxing-experiment-runner: could not amend trial {id} with its lifecycle failure: {journal_error}"
-                    );
-                }
-                return Err(error.into());
-            }
-        },
-        Decision::Reject => {}
+    let journaled = plane.record_trial(&record);
+    if let Some(Err(error)) = outcome {
+        if let Err(journal_error) = journaled {
+            eprintln!(
+                "fpsmaxxing-experiment-runner: could not journal the trial whose lifecycle failed: {journal_error}"
+            );
+        }
+        return Err(error.into());
     }
-    Ok(StoredTrial { id, record })
+    Ok(StoredTrial {
+        id: journaled?,
+        record,
+    })
 }
 
 /// Re-evaluates a journaled trial from the journal alone.
@@ -285,21 +296,26 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
     })
 }
 
-/// Rejects a spec whose parameters are unbounded or self-contradictory.
+/// Rejects a spec whose parameters are unbounded or self-contradictory and
+/// returns the validated candidate knob value.
 ///
-/// Everything the measurement phase consumes arrives over the wire, so it is
-/// bounded before any measurement work runs: sample counts size the measurement
-/// buffers and are checked against [`MAX_SAMPLES`], and the candidate knob value
-/// drives the modeled metrics and is checked against [`MAX_MOCK_VALUE`], the
-/// same ceiling the broker policy enforces later in the lifecycle. A spec that
-/// asks for fewer counted samples than its own bounds require can never promote,
-/// so it is refused up front rather than measured and then rejected.
-fn validate(spec: &ExperimentSpec) -> Result<(), RunnerError> {
+/// Everything the measurement phase and the decision gate consume arrives over
+/// the wire, so all of it is bounded before any measurement work runs: sample
+/// counts size the measurement buffers and are checked against [`MAX_SAMPLES`],
+/// the decision bounds are intersected with the policy envelope by
+/// [`validate_bounds`], and the candidate knob value drives the modeled metrics
+/// and is checked against [`MAX_MOCK_VALUE`], the same ceiling the broker policy
+/// enforces later in the lifecycle. A spec that asks for fewer counted samples
+/// than its own bounds require can never promote, so it is refused up front
+/// rather than measured and then rejected. The validated value is returned so
+/// the measurement uses exactly what was bounded here.
+fn validate(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
     let min_samples = spec.bounds.min_samples.get();
     for (label, count) in [
         ("warmup_samples", spec.warmup_samples),
         ("baseline_samples", spec.baseline_samples.get()),
         ("candidate_samples", spec.candidate_samples.get()),
+        ("min_samples", min_samples),
     ] {
         if count > MAX_SAMPLES {
             return Err(RunnerError::InvalidSpec(format!(
@@ -317,10 +333,51 @@ fn validate(spec: &ExperimentSpec) -> Result<(), RunnerError> {
             )));
         }
     }
+    validate_bounds(&spec.bounds)?;
     let value = candidate_value(spec)?;
     if value > MAX_MOCK_VALUE {
         return Err(RunnerError::InvalidSpec(format!(
             "target value is {value}, above the {MAX_MOCK_VALUE} the policy allows"
+        )));
+    }
+    Ok(value)
+}
+
+/// Rejects decision bounds that are looser than the policy envelope.
+///
+/// The evaluator is immutable, but its thresholds arrive in the spec, so a spec
+/// could otherwise disarm the gate it is supposed to pass by declaring a
+/// ceiling nothing can exceed. Each threshold is intersected with the
+/// policy-owned envelope: a spec may tighten a bound but never loosen it past
+/// [`MAX_DECISION_TEMPERATURE_C`], [`MAX_DECISION_POWER_W`], or
+/// [`MAX_DECISION_ERRORS`], and a required improvement must be a finite,
+/// non-negative gain. Non-finite thresholds are refused outright, because a
+/// `NaN` compares false against every ceiling and would silently pass the gate.
+fn validate_bounds(bounds: &DecisionBounds) -> Result<(), RunnerError> {
+    for (label, bound, ceiling) in [
+        (
+            "max_temperature_c",
+            bounds.max_temperature_c,
+            MAX_DECISION_TEMPERATURE_C,
+        ),
+        ("max_power_w", bounds.max_power_w, MAX_DECISION_POWER_W),
+    ] {
+        if !bound.is_finite() || bound <= 0.0 || bound > ceiling {
+            return Err(RunnerError::InvalidSpec(format!(
+                "{label} is {bound}, outside the 0 exclusive to {ceiling} inclusive the policy allows"
+            )));
+        }
+    }
+    let improvement = bounds.min_fps_improvement;
+    if !improvement.is_finite() || improvement < 0.0 {
+        return Err(RunnerError::InvalidSpec(format!(
+            "min_fps_improvement is {improvement}, but the policy requires a finite gain of at least 0"
+        )));
+    }
+    if bounds.max_errors > MAX_DECISION_ERRORS {
+        return Err(RunnerError::InvalidSpec(format!(
+            "max_errors is {}, above the {MAX_DECISION_ERRORS} the policy allows",
+            bounds.max_errors
         )));
     }
     Ok(())
@@ -352,7 +409,10 @@ mod tests {
     use fpsmaxxing_contracts::{ChangeRequest, DecisionBounds};
     use serde_json::json;
 
-    use super::{ExperimentSpec, MAX_MOCK_VALUE, MAX_SAMPLES, RunnerError, validate};
+    use super::{
+        ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
+        MAX_MOCK_VALUE, MAX_SAMPLES, RunnerError, validate,
+    };
 
     fn spec(warmup: u32, baseline: u32, candidate: u32, min_samples: u32) -> ExperimentSpec {
         spec_for_value(warmup, baseline, candidate, min_samples, 40)
@@ -394,8 +454,56 @@ mod tests {
 
     #[test]
     fn accepts_a_spec_inside_the_envelope() {
-        assert!(validate(&spec(2, 5, 5, 3)).is_ok());
+        assert_eq!(
+            validate(&spec(2, 5, 5, 3)).expect("spec is in envelope"),
+            40
+        );
         assert!(validate(&spec(MAX_SAMPLES, MAX_SAMPLES, MAX_SAMPLES, 3)).is_ok());
+    }
+
+    #[test]
+    fn rejects_bounds_looser_than_the_policy_envelope() {
+        // The gate's own thresholds arrive in the spec, so a spec that declares
+        // ceilings nothing can exceed would promote unconditionally.
+        let mut loosened = spec(2, 5, 5, 3);
+        loosened.bounds.max_temperature_c = MAX_DECISION_TEMPERATURE_C + 0.1;
+        assert!(rejection(&loosened).contains("max_temperature_c"));
+        loosened.bounds.max_temperature_c = f64::INFINITY;
+        assert!(rejection(&loosened).contains("max_temperature_c"));
+        loosened.bounds.max_temperature_c = f64::NAN;
+        assert!(rejection(&loosened).contains("max_temperature_c"));
+        loosened.bounds.max_temperature_c = 0.0;
+        assert!(rejection(&loosened).contains("max_temperature_c"));
+
+        let mut loosened = spec(2, 5, 5, 3);
+        loosened.bounds.max_power_w = MAX_DECISION_POWER_W + 0.1;
+        assert!(rejection(&loosened).contains("max_power_w"));
+
+        let mut loosened = spec(2, 5, 5, 3);
+        loosened.bounds.min_fps_improvement = -1.0;
+        assert!(rejection(&loosened).contains("min_fps_improvement"));
+        loosened.bounds.min_fps_improvement = f64::NAN;
+        assert!(rejection(&loosened).contains("min_fps_improvement"));
+
+        let mut loosened = spec(2, 5, 5, 3);
+        loosened.bounds.max_errors = MAX_DECISION_ERRORS + 1;
+        assert!(rejection(&loosened).contains("max_errors"));
+
+        let mut loosened = spec(2, 5, 5, 3);
+        loosened.bounds.min_samples =
+            NonZeroU32::new(MAX_SAMPLES + 1).expect("min samples is non-zero");
+        assert!(rejection(&loosened).contains("min_samples"));
+    }
+
+    #[test]
+    fn accepts_bounds_exactly_at_the_policy_envelope() {
+        // The envelope is inclusive, and a spec is free to tighten within it.
+        let mut tightest = spec(2, 5, 5, 3);
+        tightest.bounds.max_temperature_c = MAX_DECISION_TEMPERATURE_C;
+        tightest.bounds.max_power_w = MAX_DECISION_POWER_W;
+        tightest.bounds.max_errors = MAX_DECISION_ERRORS;
+        tightest.bounds.min_fps_improvement = 0.0;
+        assert!(validate(&tightest).is_ok());
     }
 
     #[test]

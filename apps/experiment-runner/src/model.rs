@@ -37,8 +37,12 @@ const ERROR_ONSET: u64 = 90;
 /// the returned vector always holds exactly `counted` steady-state samples. The
 /// output depends only on `value`, `warmup`, and `counted`, never on wall-clock
 /// time or external state.
+///
+/// This is crate-internal because the allocation it makes is only as bounded as
+/// its arguments: the runner intersects every count with the spec ceiling before
+/// it calls in.
 #[must_use]
-pub fn measure(value: u64, warmup: u32, counted: u32) -> Vec<MetricSample> {
+pub(crate) fn measure(value: u64, warmup: u32, counted: u32) -> Vec<MetricSample> {
     let setting = knob_to_setting(value);
     let warmup = u64::from(warmup);
     // Widening before the sum keeps the count exact for every `u32` pair, and

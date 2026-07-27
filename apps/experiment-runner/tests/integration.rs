@@ -4,9 +4,9 @@
 //! the mock provider through the broker: a promoted experiment that runs the
 //! full lifecycle, a rejected experiment that is never applied and leaves the
 //! baseline untouched, a promoted experiment whose lifecycle the broker refuses
-//! but whose write-ahead record survives, and a replay from the durable journal
-//! alone - reopened as a fresh handle - that reproduces the recorded verdict
-//! exactly. The final test states the MVP acceptance criterion directly.
+//! but which is still journaled, and a replay from the durable journal alone -
+//! reopened as a fresh handle - that reproduces the recorded verdict exactly.
+//! The final test states the MVP acceptance criterion directly.
 
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -78,6 +78,7 @@ fn a_promoted_experiment_runs_the_full_lifecycle() {
     let lifecycle = trial
         .record
         .lifecycle
+        .clone()
         .expect("a promoted trial records a lifecycle");
     assert_eq!(lifecycle.provider_id, "mock");
     assert!(
@@ -85,6 +86,23 @@ fn a_promoted_experiment_runs_the_full_lifecycle() {
         "candidate value must verify after apply"
     );
     assert!(lifecycle.rolled_back, "leased change must be rolled back");
+    assert!(
+        trial.record.lifecycle_error.is_none(),
+        "a completed lifecycle records no failure"
+    );
+
+    // The trial journal is append-only: the outcome is carried by the single
+    // row the trial inserted, which is exactly what replay reads back.
+    assert_eq!(plane.trial_ids().expect("trial ids"), [trial.id]);
+    let journaled: TrialRecord =
+        serde_json::from_value(plane.read_trial(trial.id).expect("trial should read"))
+            .expect("trial should decode");
+    assert_eq!(journaled, trial.record);
+    assert!(
+        replay_trial(&plane, trial.id)
+            .expect("replay trial")
+            .is_consistent()
+    );
 
     // The leased lifecycle restores the pre-state, so the provider is left at
     // its baseline value even after a promotion.
@@ -130,10 +148,14 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
         RunnerError::ControlPlane(ControlPlaneError::PolicyDenied(_))
     ));
 
-    // The measurements that authorized the promotion were journaled ahead of
-    // the lifecycle, so the trial is still discoverable and replayable.
+    // The measurements that authorized the promotion are journaled with the
+    // refusal, in one append, so the trial is still discoverable and replayable.
     let ids = plane.trial_ids().expect("trial ids");
-    assert_eq!(ids.len(), 1, "the failed promotion is still journaled");
+    assert_eq!(
+        ids.len(),
+        1,
+        "the failed promotion is journaled exactly once"
+    );
     let record: TrialRecord =
         serde_json::from_value(plane.read_trial(ids[0]).expect("trial should read"))
             .expect("trial should decode");
@@ -228,27 +250,33 @@ fn a_trial_record_from_an_unsupported_version_fails_closed() {
         ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
     let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
 
-    // Stand in for a record a future runner wrote: the reader must refuse it
+    // Stand in for a record a future runner appended: the reader must refuse it
     // rather than decode it under this version's field meanings.
     let mut payload = plane.read_trial(trial.id).expect("trial should read");
     payload["schema_version"] = json!(2);
-    plane
-        .amend_trial(trial.id, &payload)
-        .expect("trial should amend");
-
-    let error = replay_trial(&plane, trial.id).expect_err("a future record should be refused");
+    let future = plane
+        .record_trial(&payload)
+        .expect("a future record should append");
+    let error = replay_trial(&plane, future).expect_err("a future record should be refused");
     assert!(matches!(error, RunnerError::UnsupportedRecordVersion(2)));
 
     // A future record that also reshaped a field must still report the version
     // that wrote it, not an opaque decode error about the reshaped field.
     payload["verdict"] = json!("promote");
-    plane
-        .amend_trial(trial.id, &payload)
-        .expect("trial should amend");
-    let error = replay_trial(&plane, trial.id).expect_err("a future record should be refused");
+    let reshaped = plane
+        .record_trial(&payload)
+        .expect("a future record should append");
+    let error = replay_trial(&plane, reshaped).expect_err("a future record should be refused");
     assert!(
         matches!(error, RunnerError::UnsupportedRecordVersion(2)),
         "expected a version error, got {error:?}"
+    );
+
+    // Appending those rows left the original trial exactly as it was recorded.
+    assert!(
+        replay_trial(&plane, trial.id)
+            .expect("replay trial")
+            .is_consistent()
     );
 }
 

@@ -31,8 +31,8 @@ A steady-state poll reclaims only expired leases, while a crash-recovery pass (`
 The runner controls workload setup, warmup, repeated measurements, cooldown, correctness checks, and promotion decisions. Evaluator code is outside the LLM's writable surface.
 
 In the safe alpha (`apps/experiment-runner`) the runner measures a baseline and a candidate against a deterministic model, then a pure immutable evaluator returns a promote or reject verdict from the recorded samples and fixed bounds alone - no clock, no LLM, no I/O. Every trial is journaled as a self-describing, versioned record so it can be replayed and re-evaluated from the journal without the original conversation.
-The record is written ahead of the broker lifecycle and amended with its outcome, so a promotion the broker refuses still leaves the measurements that authorized it.
-Sample counts are bounded by the spec schema and rechecked by the runner before any measurement runs. Because mock capabilities are leased and the broker lifecycle always rolls back, the verdict gates whether the candidate is applied at all rather than whether it persists; durable keep-or-rollback awaits the privileged broker.
+The record is appended once, after the broker lifecycle it authorized has finished and carrying either that lifecycle's outcome or the error the broker returned, so a promotion the broker refuses still leaves the measurements that authorized it and no API can rewrite a recorded verdict.
+Sample counts are bounded by the spec schema and rechecked by the runner before any measurement runs, and the spec's decision bounds are intersected with a policy-owned envelope so a spec can tighten its own safety gate but never loosen it. Because mock capabilities are leased and the broker lifecycle always rolls back, the verdict gates whether the candidate is applied at all rather than whether it persists; durable keep-or-rollback awaits the privileged broker.
 
 ### Provider sidecars
 

@@ -14,7 +14,9 @@ The same journal database also keeps an `experiment_trials` table of self-descri
 This supersedes the original deferral of a dedicated experiments table.
 A trial record is a different kind of row from a lifecycle stage record: it holds the spec, the recorded baseline and candidate samples, and the immutable evaluator's verdict, so a trial re-evaluates from the journal alone without chat history or a re-run workload.
 Storing that under the stage schema would have meant either overloading `payload` with a shape `doctor` cannot interpret or restructuring the stage table, so a second table was the smaller change.
-Trial rows follow the same write-ahead principle as the lifecycle journal: the runner records the measured trial before invoking the lifecycle and amends that row with the outcome, so a promotion the broker refuses still leaves the measurements that authorized it.
+Trial rows are append-only: the journal exposes an insert and no update, and the runner writes each trial exactly once, after the lifecycle it authorized has finished, carrying either that lifecycle's outcome or the error the broker returned.
+A promotion the broker refuses therefore still leaves the measurements that authorized it, and a recorded verdict has no API that can rewrite it.
+Crash safety for the window between a mutation and that record stays with the lifecycle journal's write-ahead `apply-intent` record rather than being duplicated in the trial table.
 
 ## Rationale
 
