@@ -28,10 +28,12 @@ pub enum ClientError {
 
 /// A client for the broker's authenticated local IPC boundary.
 ///
-/// The unprivileged gateway uses this to reach the privileged broker without
-/// linking against the control plane. It speaks the same length-delimited
-/// framing and typed [`BrokerRequest`]/[`BrokerResponse`] contract that a
-/// Windows named-pipe client would reuse unchanged.
+/// This is the unprivileged side of that boundary: it reaches the privileged
+/// broker without linking against the control plane. The alpha gateway is not
+/// wired to it yet - it still opens an in-process control plane of its own - so
+/// today's only caller is the broker's end-to-end coverage. It speaks the same
+/// length-delimited framing and typed [`BrokerRequest`]/[`BrokerResponse`]
+/// contract that a Windows named-pipe client would reuse unchanged.
 pub struct BrokerClient {
     stream: UnixStream,
 }

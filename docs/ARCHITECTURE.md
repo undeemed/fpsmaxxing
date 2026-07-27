@@ -19,7 +19,9 @@ The privileged Windows service accepts authenticated local requests from the gat
 `apps/broker` implements this on the Linux-safe path.
 It owns the control plane on a dedicated worker thread and serves exactly two operations - capability discovery and a bounded provider lifecycle - to authenticated local peers over the transport seam in `crates/ipc` (a Unix domain socket now, a Windows named pipe later).
 Three fail-closed checks guard the boundary: peer authentication before any request is read (a Linux `SO_PEERCRED` same-uid ACL, shaped so a Windows SID ACL can satisfy the same trait), a capability-catalog check that rejects raw shell, arbitrary Registry paths, and out-of-catalog ids, and single-owner-per-knob enforcement that refuses a second concurrent owner of a setting.
-Typed request and response messages live in `crates/contracts` with `schemas/*.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
+Typed request and response messages live in `crates/contracts` with `schemas/broker-request.schema.json` and `schemas/broker-response.schema.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
+A frame is a big-endian `u32` body length followed by that many bytes of JSON, bounded at one mebibyte so a hostile peer cannot force an unbounded allocation; the framing is transport-agnostic, so a named-pipe transport would reuse it unchanged.
+At most 32 connections are served at once, and one that stalls for 30 seconds in either direction is closed, so a peer cannot pin a task, a descriptor, or a frame buffer; a peer refused by the ACL gets a far shorter deadline to take its rejection frame, because it has not authenticated and must not be able to hold a connection slot for the full idle budget.
 A response is a tagged union of its outcome and that outcome's payload, so a tag without its payload never crosses the boundary and no consumer has to unwrap one.
 Any text a client chose is truncated before it is quoted back in an error message, so a rejected request is always answered with a typed error rather than a response too large for the frame limit.
 
@@ -61,6 +63,7 @@ Deploy it under a supervisor that restarts on failure, and let the watchdog own 
 
 #### Deferred broker work
 
+- Gateway wiring: nothing shipped connects to the broker yet, because the gateway still opens its own in-process control plane, so `BrokerClient` in `crates/ipc` is exercised only by the broker's end-to-end tests. Promoting the gateway onto that client also has to settle what becomes of the gateway's own journal once the privileged audit journal is the record of every apply.
 - `fpsm-broker-splitacl`: the real split-privilege ACL, replacing the interim same-uid policy described above, plus journaling the verified peer uid and pid against each lifecycle and authenticating the client-supplied owner label against them.
 - Client reconnect on `Closed`: the broker closes a connection idle for 30 seconds, and `BrokerClient` holds one long-lived stream with no keepalive or reconnect, so a caller whose requests are further apart than that gets `ClientError::Closed`. Whether the client reconnects transparently, the server distinguishes a healthy idle peer from a stalled one, or callers connect per request is undecided.
 - `broker-dispatch-unbounded`: neither `BrokerHandle::dispatch` nor `BrokerClient::request` bounds the wait on the single control-plane worker, so a provider that blocks inside `apply` or `verify` stalls every peer rather than failing one. Deferred to the pass that adds graceful shutdown, which has to answer the same question: what a request already in flight is owed when the broker stops serving.

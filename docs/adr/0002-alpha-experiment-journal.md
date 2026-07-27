@@ -44,5 +44,5 @@ Attributing a flagged archive to the constant that moved needs the policy envelo
 
 - `doctor` reports experiments with an `apply-intent` record but no terminal outcome as dangling; it does not yet inspect `experiment_trials`.
 - Correlation IDs are allocated inside an immediate transaction with a busy timeout, so concurrent gateways sharing one journal file cannot mint duplicate IDs.
-- `LifecycleResult` stays in `crates/control-plane` as a deliberate alpha seam even though the gateway serializes it into MCP tool-result text; it moves to `crates/contracts` with a pinned JSON schema at broker promotion.
-- Broker promotion revisits journaling as part of the privileged transaction log design.
+- `LifecycleResult` stays in `crates/control-plane` for the gateway, which still serializes it into MCP tool-result text; the privileged broker mirrors the same fields onto the wire as `LifecycleReport` in `crates/contracts`, pinned by `schemas/broker-response.schema.json`, so the unprivileged side of that boundary never links against the control plane.
+- The privileged broker owns a control plane and an audit journal of its own, in this same single-table format, at `FPSMAXXING_BROKER_JOURNAL_PATH` or inside its private directory; full two-phase intent/result journaling for every stage and a dedicated experiments table remain outstanding for the privileged transaction log design.

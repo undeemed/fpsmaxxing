@@ -120,6 +120,7 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 
 The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
 It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket; only the Linux transport is implemented, so the binary refuses to run elsewhere.
+The gateway does not connect to it yet - it still opens an in-process control plane of its own - so the broker path is driven by the `BrokerClient` in `crates/ipc` and its end-to-end tests rather than by the MCP command above.
 
 Run it with no arguments; it creates and vets its own private directory for the socket and the journal.
 
@@ -128,7 +129,7 @@ cargo run -p fpsmaxxing-broker
 cargo run -p fpsmaxxing-broker -- --help
 ```
 
-An explicit path is never created for you, and the directory holding it must already be mode `0700` and owned by the broker or root, so create it first:
+An explicit path is never created for you, and the directory holding it must already be owned by the broker or root and closed to every other user (mode `0700`), so create it first:
 
 ```bash
 mkdir -p "$HOME/.local/state/fpsmaxxing" && chmod 700 "$HOME/.local/state/fpsmaxxing"
