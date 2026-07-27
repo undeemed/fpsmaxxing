@@ -128,7 +128,7 @@ cargo run -p fpsmaxxing-broker
 cargo run -p fpsmaxxing-broker -- --help
 ```
 
-An explicit path is never created for you, and its directory must already be mode `0700` and owned by the user the broker runs as, so create it first:
+An explicit path is never created for you, and the directory holding it must already be mode `0700` and owned by the broker or root, so create it first:
 
 ```bash
 mkdir -p "$HOME/.local/state/fpsmaxxing" && chmod 700 "$HOME/.local/state/fpsmaxxing"
@@ -138,8 +138,10 @@ cargo run -p fpsmaxxing-broker -- \
 ```
 
 Do not put that directory at `/run/fpsmaxxing`.
-That is the privileged broker's own private directory, and because a broker only accepts a private directory it owns itself, creating it as your user leaves a later root broker refusing to start until it is chowned to root or removed.
-A root broker creates and vets it on its own, as does a systemd unit with `RuntimeDirectory=fpsmaxxing`.
+That is the privileged broker's own private directory, and it is the one directory held to exact ownership: root ownership satisfies an explicit `--socket` or `--journal` parent, but a broker accepts its private directory only when it owns that itself.
+Creating `/run/fpsmaxxing` as your user therefore leaves a later root broker refusing to start until it is chowned to root or removed.
+A root broker creates and vets it on its own.
+A systemd unit needs both `RuntimeDirectory=fpsmaxxing` and `RuntimeDirectoryMode=0700`: `RuntimeDirectoryMode` defaults to `0755`, and the broker validates an existing private directory rather than correcting its mode, so a unit that omits the mode is refused on every start.
 The broker still establishes its private directory even when both paths are given, because the single-instance lock lives there, so it also needs to be able to create `$XDG_RUNTIME_DIR/fpsmaxxing` - or `/run/fpsmaxxing`, when that variable is unset - on every start.
 
 | Setting | Flag | Environment variable | Default |
