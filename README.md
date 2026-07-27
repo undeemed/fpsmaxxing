@@ -113,9 +113,9 @@ LLM / MCP client
        │
        ▼
 Rust gateway ──► policy engine ──► privileged broker ──► provider sidecars
-       ▲                                  │
-       │                                  ▼
-telemetry normalizer ◄──────────── independent watchdog
+       ▲                                  ▲                      │
+       │                           independent watchdog          │
+telemetry normalizer ◄───────────────────────────────────────────┘
        │
        ▼
 experiment journal and benchmark decision gate
