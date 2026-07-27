@@ -62,6 +62,13 @@ pub enum AuthError {
 /// privilege-split ACL arrives with the Windows named-pipe SID implementation of
 /// [`PeerAuthorizer`], which is tracked separately; callers reach it through
 /// this trait, so no call site changes when it lands.
+///
+/// One consequence of the interim: every authorized peer is the same identity,
+/// so the verified [`PeerIdentity`] distinguishes nothing once the ACL has
+/// passed. Journaling the peer uid and pid against each lifecycle, and
+/// authenticating the client-supplied owner label against them, only carry their
+/// weight once split-privilege ACLs arrive; both are tracked as follow-up work
+/// `fpsm-broker-splitacl`.
 pub struct SameUidAuthorizer {
     expected_uid: u32,
 }

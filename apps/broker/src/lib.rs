@@ -53,10 +53,13 @@ const REQUEST_BACKLOG: usize = 64;
 /// Connections served at once; further peers wait in the transport's backlog.
 pub const MAX_CONNECTIONS: usize = 32;
 
-/// How long a served connection may stay silent before the broker closes it.
+/// How long a served connection may stall in one direction before it is closed.
 ///
-/// This bounds both an idle peer holding a descriptor and a peer that declares a
-/// large frame and then stalls while the reader holds its buffer.
+/// Both directions are bounded by it: an idle peer holding a descriptor, a peer
+/// that declares a large frame and then stalls while the reader holds its
+/// buffer, and a peer that stops draining its responses until the broker's own
+/// write blocks. Without the last of these a peer that never reads could pin a
+/// connection slot in `write_all` forever.
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause after a per-connection accept failure, so a repeated one cannot spin.
@@ -147,20 +150,15 @@ impl BrokerService {
                 verified: result.verified,
                 rolled_back: result.rolled_back,
             }),
-            Err(error) => BrokerResponse::error(error_kind(&error), client_message(&error)),
+            Err(error) => wire_error(&error),
         }
     }
 }
 
-fn error_kind(error: &ControlPlaneError) -> BrokerErrorKind {
-    match error {
-        ControlPlaneError::UnknownCapability(_) => BrokerErrorKind::UnknownCapability,
-        ControlPlaneError::PolicyDenied(_) => BrokerErrorKind::PolicyDenied,
-        _ => BrokerErrorKind::LifecycleFailed,
-    }
-}
-
-/// Reduces a control-plane failure to text that may cross the privilege boundary.
+/// Reduces a control-plane failure to a response that may cross the boundary.
+///
+/// One match decides both the wire kind and the message, so the two cannot
+/// disagree about whether a variant is client-caused when a new one is added.
 ///
 /// Only the two client-caused variants describe the caller's own request, so
 /// only they are forwarded verbatim. Every other variant wraps a `SQLite`,
@@ -168,14 +166,20 @@ fn error_kind(error: &ControlPlaneError) -> BrokerErrorKind {
 /// other host detail, which [`fpsmaxxing_contracts::ipc::BrokerErrorBody`]
 /// promises never to expose: those are reduced to the stable machine-readable
 /// stage kind and the full error is traced locally instead.
-fn client_message(error: &ControlPlaneError) -> String {
+fn wire_error(error: &ControlPlaneError) -> BrokerResponse {
     match error {
-        ControlPlaneError::UnknownCapability(_) | ControlPlaneError::PolicyDenied(_) => {
-            error.to_string()
+        ControlPlaneError::UnknownCapability(_) => {
+            BrokerResponse::error(BrokerErrorKind::UnknownCapability, error.to_string())
+        }
+        ControlPlaneError::PolicyDenied(_) => {
+            BrokerResponse::error(BrokerErrorKind::PolicyDenied, error.to_string())
         }
         _ => {
             eprintln!("fpsmaxxing-broker: lifecycle failed: {error}");
-            format!("lifecycle failed: {}", error.kind())
+            BrokerResponse::error(
+                BrokerErrorKind::LifecycleFailed,
+                format!("lifecycle failed: {}", error.kind()),
+            )
         }
     }
 }
@@ -269,8 +273,10 @@ where
 /// is read, then handled on its own task and dispatched to `broker`. A
 /// per-connection fault - including an accept error that aborted a single
 /// connection - ends only that connection. At most [`MAX_CONNECTIONS`] are
-/// served concurrently, and a connection idle for [`CONNECTION_IDLE_TIMEOUT`] is
-/// closed, so a peer cannot pin a task, a descriptor, or a frame buffer forever.
+/// served concurrently, and a connection that stalls for
+/// [`CONNECTION_IDLE_TIMEOUT`] in either direction - a peer that sends nothing,
+/// or one that stops reading its responses - is closed, so a peer cannot pin a
+/// task, a descriptor, or a frame buffer forever.
 ///
 /// This never returns `Ok`: it runs until a fatal condition, then reports it so
 /// the process can exit non-zero and a supervisor can restart it.
@@ -348,6 +354,14 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
     )
 }
 
+/// Authenticates one peer, then serves its framed requests until it goes away.
+///
+/// The verified [`fpsmaxxing_ipc::PeerIdentity`] is used for the ACL check and
+/// then dropped. Under the interim same-uid ACL every authorized peer is the
+/// same identity, so journaling the peer uid and pid against each lifecycle, and
+/// authenticating the client-supplied owner label against them, only carry their
+/// weight once split-privilege ACLs arrive; both are tracked as follow-up work
+/// `fpsm-broker-splitacl`.
 async fn handle_connection<S>(
     accepted: Accepted<S>,
     broker: BrokerHandle,
@@ -399,27 +413,48 @@ where
     }
 }
 
+/// Writes one response, giving the peer [`CONNECTION_IDLE_TIMEOUT`] to take it.
+///
+/// A peer that pipelines requests and never reads fills the socket's send buffer
+/// and would otherwise park this task in `write_all` for good, holding its
+/// connection slot; the timeout turns that into an error that ends the
+/// connection and returns the slot.
 async fn write_response<W>(writer: &mut W, response: &BrokerResponse) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
 {
     let bytes = serde_json::to_vec(response).map_err(io::Error::other)?;
-    write_frame(writer, &bytes).await
+    tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, write_frame(writer, &bytes))
+        .await
+        .map_err(|_| {
+            FrameError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer did not accept the response within the idle timeout",
+            ))
+        })?
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::num::NonZeroU64;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
 
     use fpsmaxxing_contracts::ipc::{BrokerErrorKind, BrokerOutcome, BrokerRequest};
     use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, StateSnapshot};
     use fpsmaxxing_control_plane::ControlPlane;
+    use fpsmaxxing_ipc::{Accepted, FrameError, PeerAuthorizer, PeerIdentity, SameUidAuthorizer};
     use fpsmaxxing_mock_provider::MockProvider;
     use fpsmaxxing_provider_sdk::{Provider, ProviderError};
     use serde_json::json;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::mpsc;
 
-    use super::{BrokerService, OwnershipLedger};
+    use super::{
+        BrokerHandle, BrokerService, CONNECTION_IDLE_TIMEOUT, OwnershipLedger, handle_connection,
+    };
 
     /// Host detail a provider error might carry; it must not reach the wire.
     const HOST_DETAIL: &str = "/var/lib/fpsmaxxing/private/journal.sqlite";
@@ -582,5 +617,90 @@ mod tests {
             change("mock.value", 42, 30),
         ));
         assert_eq!(error_kind(&response), BrokerErrorKind::OwnerConflict);
+    }
+
+    /// The uid both the stalled peer and its authorizer are built around.
+    const TEST_UID: u32 = 4242;
+
+    /// A peer that sends one frame and then never reads and never writes.
+    ///
+    /// Writes park forever, standing in for a socket whose send buffer a peer
+    /// has stopped draining.
+    struct StalledPeer {
+        request: Vec<u8>,
+        sent: usize,
+    }
+
+    impl AsyncRead for StalledPeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let peer = self.get_mut();
+            let remaining = &peer.request[peer.sent..];
+            if remaining.is_empty() {
+                return Poll::Pending;
+            }
+            let take = remaining.len().min(buffer.remaining());
+            buffer.put_slice(&remaining[..take]);
+            peer.sent += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StalledPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_reads_its_response_cannot_pin_the_connection() {
+        // The worker is never reached: an undecodable body is answered inline,
+        // so the connection only has the stalled write left to block on.
+        let (jobs, _worker) = mpsc::channel(1);
+        let mut request = 4u32.to_be_bytes().to_vec();
+        request.extend_from_slice(b"junk");
+        let accepted = Accepted {
+            stream: StalledPeer { request, sent: 0 },
+            peer: PeerIdentity {
+                uid: TEST_UID,
+                pid: None,
+            },
+        };
+        let authorizer: Arc<dyn PeerAuthorizer> = Arc::new(SameUidAuthorizer::new(TEST_UID));
+
+        // The outer bound turns a regression into a failure rather than a hang:
+        // with the write unbounded it is the only timer left to fire.
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            CONNECTION_IDLE_TIMEOUT * 4,
+            handle_connection(accepted, BrokerHandle { jobs }, authorizer),
+        )
+        .await
+        .expect("the connection must not outlive the idle timeout")
+        .expect_err("a peer that never reads must not hold the connection");
+
+        assert!(
+            matches!(&error, FrameError::Io(io) if io.kind() == io::ErrorKind::TimedOut),
+            "unexpected connection outcome: {error}"
+        );
+        assert!(
+            started.elapsed() >= CONNECTION_IDLE_TIMEOUT,
+            "the connection ended before the idle timeout"
+        );
     }
 }

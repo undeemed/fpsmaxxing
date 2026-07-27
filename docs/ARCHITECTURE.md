@@ -25,6 +25,8 @@ The same-uid ACL is the deliberate interim policy for the current single-user, L
 It is not the shipping policy for the privilege split described above: once the broker runs as a service account, an unprivileged gateway would be refused by construction.
 The real privilege-split ACL arrives with the Windows named-pipe SID implementation of the `PeerAuthorizer` trait, tracked separately; because every caller reaches the ACL through that trait, no call site changes when it lands.
 The trusted uid is read from the broker's own effective credentials rather than from the socket file's owner, so replacing the socket path cannot redirect the ACL.
+In this interim every authorized peer is the same identity, so journaling the verified peer uid and pid against each lifecycle, and authenticating the client-supplied owner label against them, only carry their weight once split-privilege ACLs arrive; both are tracked as follow-up work `fpsm-broker-splitacl`.
+Unless an explicit path is given, the broker keeps its socket and its journal in an owner-only directory under `$XDG_RUNTIME_DIR` (or `/run`) rather than beside the inherited working directory, so no other user can race the socket path or read the audit journal.
 
 The broker fails fast rather than degrading.
 Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.

@@ -7,6 +7,10 @@
 //! Only the Unix domain socket transport is implemented; the Windows named-pipe
 //! transport is deliberately out of scope, so the binary refuses to run there.
 //!
+//! Unless `--socket`/`--journal` or their environment overrides name a path, the
+//! socket and the journal live in an owner-only directory under
+//! `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited working directory.
+//!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
 
@@ -31,7 +35,10 @@ fn main() {
 mod unix {
     use std::env;
     use std::error::Error;
+    use std::fs::DirBuilder;
     use std::io;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use fpsmaxxing_broker::{BrokerService, OwnershipLedger, serve, spawn_service};
@@ -42,6 +49,21 @@ mod unix {
 
     /// Flags this binary accepts, in `--help` order.
     const FLAGS: [&str; 2] = ["--socket", "--journal"];
+
+    /// Directory the broker keeps its socket and journal in by default.
+    const PRIVATE_DIR_NAME: &str = "fpsmaxxing";
+
+    /// Where [`PRIVATE_DIR_NAME`] lives when `XDG_RUNTIME_DIR` is unset.
+    const FALLBACK_RUNTIME_BASE: &str = "/run";
+
+    /// The only mode the broker's private directory may have: owner access only.
+    const PRIVATE_DIR_MODE: u32 = 0o700;
+
+    /// Socket file name inside the broker's private directory.
+    const DEFAULT_SOCKET_NAME: &str = "broker.sock";
+
+    /// Journal file name inside the broker's private directory.
+    const DEFAULT_JOURNAL_NAME: &str = "journal.sqlite";
 
     /// Why the command line was refused.
     ///
@@ -74,14 +96,9 @@ mod unix {
 
     pub async fn run() -> Result<(), Box<dyn Error>> {
         let options = parse_args(env::args().skip(1))?;
-        let socket_path = options
-            .socket
-            .or_else(|| env::var("FPSMAXXING_BROKER_SOCKET").ok())
-            .unwrap_or_else(|| "fpsmaxxing-broker.sock".to_owned());
-        let journal_path = options
-            .journal
-            .or_else(|| env::var("FPSMAXXING_JOURNAL_PATH").ok())
-            .unwrap_or_else(|| "fpsmaxxing-journal.sqlite".to_owned());
+        let authorizer = SameUidAuthorizer::for_current_process();
+        let broker_uid = authorizer.expected_uid();
+        let (socket_path, journal_path) = resolve_paths(options, broker_uid)?;
 
         let ledger = Arc::new(OwnershipLedger::new());
         let broker = spawn_service(move || {
@@ -92,12 +109,82 @@ mod unix {
         .await?;
 
         let transport = UnixSocketTransport::bind(&socket_path)?;
-        let authorizer = SameUidAuthorizer::for_current_process();
-        let broker_uid = authorizer.expected_uid();
         let authorizer: Arc<dyn PeerAuthorizer> = Arc::new(authorizer);
-        println!("fpsmaxxing-broker: listening on {socket_path} (same-uid ACL, uid {broker_uid})");
+        println!(
+            "fpsmaxxing-broker: listening on {} (same-uid ACL, uid {broker_uid})",
+            socket_path.display()
+        );
         serve(transport, broker, authorizer).await?;
         Ok(())
+    }
+
+    /// Resolves the socket and journal locations, in override order.
+    ///
+    /// An explicit flag wins over the matching environment variable, and either
+    /// is taken verbatim: the operator has named a path they control. Anything
+    /// left unset falls back into [`private_directory`] rather than beside the
+    /// inherited working directory, so a privileged daemon never places its IPC
+    /// endpoint or its durable audit journal somewhere it does not own.
+    fn resolve_paths(options: Options, broker_uid: u32) -> io::Result<(PathBuf, PathBuf)> {
+        let socket = options
+            .socket
+            .or_else(|| env::var("FPSMAXXING_BROKER_SOCKET").ok());
+        let journal = options
+            .journal
+            .or_else(|| env::var("FPSMAXXING_JOURNAL_PATH").ok());
+        match (socket, journal) {
+            (Some(socket), Some(journal)) => Ok((PathBuf::from(socket), PathBuf::from(journal))),
+            (socket, journal) => {
+                let directory = private_directory(broker_uid)?;
+                Ok((
+                    socket.map_or_else(|| directory.join(DEFAULT_SOCKET_NAME), PathBuf::from),
+                    journal.map_or_else(|| directory.join(DEFAULT_JOURNAL_NAME), PathBuf::from),
+                ))
+            }
+        }
+    }
+
+    /// Returns the broker's private directory, creating it when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, is not a directory,
+    /// is not owned by `broker_uid`, or is not mode [`PRIVATE_DIR_MODE`] - a
+    /// parent another user may write is what makes the socket path raceable at
+    /// bind time and the journal readable, so an unsound one fails closed.
+    fn private_directory(broker_uid: u32) -> io::Result<PathBuf> {
+        let base = env::var_os("XDG_RUNTIME_DIR")
+            .map_or_else(|| PathBuf::from(FALLBACK_RUNTIME_BASE), PathBuf::from);
+        private_directory_in(&base, broker_uid)
+    }
+
+    /// Creates and vets [`PRIVATE_DIR_NAME`] under `base`.
+    ///
+    /// A directory the broker created is vetted too: the inherited umask can
+    /// strip bits from the requested mode, and the entry may already have been
+    /// something else.
+    fn private_directory_in(base: &Path, broker_uid: u32) -> io::Result<PathBuf> {
+        let directory = base.join(PRIVATE_DIR_NAME);
+        match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if metadata.is_dir()
+            && metadata.uid() == broker_uid
+            && metadata.mode() & 0o777 == PRIVATE_DIR_MODE
+        {
+            Ok(directory)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a directory owned by uid {broker_uid} with mode {PRIVATE_DIR_MODE:o}",
+                    directory.display()
+                ),
+            ))
+        }
     }
 
     /// Parses `--flag value` and `--flag=value` pairs, rejecting anything else.
@@ -146,10 +233,28 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::{ArgError, Options, parse_args};
+        use std::io;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::path::Path;
+
+        use super::{
+            ArgError, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, parse_args, private_directory_in,
+        };
 
         fn parse(arguments: &[&str]) -> Result<Options, ArgError> {
             parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
+        }
+
+        /// The uid the test process creates files as, read from one it created.
+        fn own_uid(created: &Path) -> u32 {
+            std::fs::symlink_metadata(created)
+                .expect("a just-created path should stat")
+                .uid()
+        }
+
+        fn chmod(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("mode should apply");
         }
 
         #[test]
@@ -204,6 +309,64 @@ mod unix {
                     .expect_err("a repeated flag must be refused"),
                 ArgError::Repeated(_)
             ));
+        }
+
+        #[test]
+        fn a_missing_private_directory_is_created_owner_only() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let directory =
+                private_directory_in(base.path(), uid).expect("the directory should be created");
+            assert_eq!(directory, base.path().join(PRIVATE_DIR_NAME));
+            let metadata = std::fs::symlink_metadata(&directory).expect("directory should stat");
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.mode() & 0o777, PRIVATE_DIR_MODE);
+        }
+
+        #[test]
+        fn an_existing_owner_only_private_directory_is_reused() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let directory = base.path().join(PRIVATE_DIR_NAME);
+            std::fs::create_dir(&directory).expect("directory should create");
+            chmod(&directory, PRIVATE_DIR_MODE);
+            assert_eq!(
+                private_directory_in(base.path(), uid).expect("an owner-only directory is sound"),
+                directory
+            );
+        }
+
+        #[test]
+        fn a_reachable_or_foreign_private_directory_is_refused() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let directory = base.path().join(PRIVATE_DIR_NAME);
+
+            std::fs::create_dir(&directory).expect("directory should create");
+            chmod(&directory, 0o755);
+            let error = private_directory_in(base.path(), uid)
+                .expect_err("a group- and world-reachable directory must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+            chmod(&directory, PRIVATE_DIR_MODE);
+            let error = private_directory_in(base.path(), uid.wrapping_add(1))
+                .expect_err("a directory owned by another uid must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn a_symlinked_private_directory_is_refused() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let target = base.path().join("elsewhere");
+            std::fs::create_dir(&target).expect("target should create");
+            chmod(&target, PRIVATE_DIR_MODE);
+            std::os::unix::fs::symlink(&target, base.path().join(PRIVATE_DIR_NAME))
+                .expect("symlink should create");
+
+            let error = private_directory_in(base.path(), uid)
+                .expect_err("a symlink must not stand in for the private directory");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         }
     }
 }
