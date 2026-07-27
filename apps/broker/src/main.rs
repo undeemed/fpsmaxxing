@@ -7,18 +7,19 @@
 //! Only the Unix domain socket transport is implemented; the Windows named-pipe
 //! transport is deliberately out of scope, so the binary refuses to run there.
 //!
-//! Unless `--socket`/`--journal` or their environment overrides
-//! (`FPSMAXXING_BROKER_SOCKET` and `FPSMAXXING_BROKER_JOURNAL_PATH`, both
-//! broker-only) name a path, the socket and the journal live in an owner-only
-//! directory under `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited
-//! working directory. Wherever a path came from, it is held to the same bar
-//! before it is used: absolute, directly inside a directory no other user can
-//! reach, under an ancestor chain no other user can write.
+//! The broker always establishes one owner-only private directory of its own,
+//! under `$XDG_RUNTIME_DIR` (or `/run`). Unless `--socket`/`--journal` or their
+//! environment overrides (`FPSMAXXING_BROKER_SOCKET` and
+//! `FPSMAXXING_BROKER_JOURNAL_PATH`, both broker-only) name a path, the socket
+//! and the journal live there rather than beside the inherited working
+//! directory. Wherever a path came from, it is held to the same bar before it
+//! is used: absolute, directly inside a directory no other user can reach,
+//! under an ancestor chain no other user can write.
 //!
-//! Only one broker may run against a journal. An exclusive advisory lock beside
-//! it is taken before the journal is opened and before the socket is bound, so
-//! a second process refuses to start rather than driving the same knobs through
-//! an ownership ledger of its own.
+//! Only one broker may run per uid. An exclusive advisory lock on a fixed file
+//! in that private directory is taken before the journal is opened and before
+//! the socket is bound, so a second process refuses to start rather than
+//! driving the same knobs through an ownership ledger of its own.
 //!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
@@ -78,12 +79,14 @@ Usage: fpsmaxxing-broker [--socket <path>] [--journal <path>]
                     (environment: FPSMAXXING_BROKER_JOURNAL_PATH)
   -h, --help        Print this message and exit
 
-A flag wins over its environment variable. Unset, each falls back into an
-owner-only directory under $XDG_RUNTIME_DIR (or /run when it is unset, is not
-absolute, or the broker runs as root). Every path must be absolute and sit in
-an existing directory owned by the broker or root that no other user can reach
-(mode 0700), itself under a chain of directories owned by the broker or root
-that no other user can write, or the broker refuses to start.";
+A flag wins over its environment variable. Unset, each falls back into the
+broker's own owner-only directory under $XDG_RUNTIME_DIR (or /run when it is
+unset, is not absolute, or the broker runs as root); that directory is
+established either way, because the lock that admits one broker per uid lives
+in it. Every path must be absolute and sit in an existing directory owned by
+the broker or root that no other user can reach (mode 0700), itself under a
+chain of directories owned by the broker or root that no other user can write,
+or the broker refuses to start.";
 
     /// Environment override for `--socket`.
     const SOCKET_ENV: &str = "FPSMAXXING_BROKER_SOCKET";
@@ -130,11 +133,12 @@ that no other user can write, or the broker refuses to start.";
     /// Suffixes `SQLite` appends to a database path for its side files.
     const JOURNAL_SIDE_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
-    /// Suffix the single-instance lock file takes beside the audit journal.
+    /// Single-instance lock file name inside the broker's private directory.
     ///
-    /// Deliberately not one of [`JOURNAL_SIDE_SUFFIXES`], so the lock can never
-    /// collide with a file `SQLite` owns.
-    const LOCK_FILE_SUFFIX: &str = ".lock";
+    /// Fixed rather than derived from the socket or the journal: the knobs two
+    /// brokers would fight over are the machine's, not a path's, so an instance
+    /// is scoped to the uid that runs it however it was pointed at its files.
+    const LOCK_FILE_NAME: &str = "broker.lock";
 
     /// Why the command line was refused.
     ///
@@ -195,8 +199,12 @@ that no other user can write, or the broker refuses to start.";
         };
         let authorizer = SameUidAuthorizer::for_current_process();
         let broker_uid = authorizer.expected_uid();
-        let (socket_path, journal_path) = resolve_paths(options, broker_uid)?;
-        let _single_instance = lock_single_instance(&journal_path)?;
+        let Paths {
+            socket: socket_path,
+            journal: journal_path,
+            lock: lock_path,
+        } = resolve_paths(options, broker_uid)?;
+        let _single_instance = lock_single_instance(&lock_path)?;
 
         let ledger = Arc::new(OwnershipLedger::new());
         let broker = spawn_service(move || {
@@ -217,24 +225,43 @@ that no other user can write, or the broker refuses to start.";
         Ok(())
     }
 
-    /// Resolves the socket and journal locations, in override order.
+    /// Every path a running broker owns.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct Paths {
+        /// Where the IPC endpoint is bound.
+        pub socket: PathBuf,
+        /// Where the audit journal is written.
+        pub journal: PathBuf,
+        /// The file [`lock_single_instance`] locks.
+        pub lock: PathBuf,
+    }
+
+    /// Resolves the socket, journal, and lock locations, in override order.
     ///
     /// An explicit flag wins over the matching environment variable. Anything
-    /// left unset falls back into [`private_directory`] rather than beside the
-    /// inherited working directory, so a privileged daemon never places its IPC
-    /// endpoint or its durable audit journal somewhere it does not own.
+    /// left unset falls back into the broker's private directory rather than
+    /// beside the inherited working directory, so a privileged daemon never
+    /// places its IPC endpoint or its durable audit journal somewhere it does
+    /// not own.
     ///
     /// The environment is read with [`env::var_os`] rather than `env::var`, so a
     /// path that is not UTF-8 relocates the socket or journal as configured
     /// instead of being silently dropped back to the default.
-    fn resolve_paths(options: Options, broker_uid: u32) -> io::Result<(PathBuf, PathBuf)> {
-        resolve_paths_from(options, broker_uid, |name| env::var_os(name))
+    fn resolve_paths(options: Options, broker_uid: u32) -> io::Result<Paths> {
+        let base = runtime_base(env::var_os("XDG_RUNTIME_DIR").as_deref(), broker_uid);
+        resolve_paths_from(options, broker_uid, &base, |name| env::var_os(name))
     }
 
-    /// [`resolve_paths`] against an arbitrary environment lookup.
+    /// [`resolve_paths`] against an arbitrary runtime base and environment.
     ///
     /// Only [`SOCKET_ENV`] and [`JOURNAL_ENV`] are ever consulted; the broker
     /// shares no path variable with the unprivileged gateway or CLI.
+    ///
+    /// The private directory under `base` is created and vetted whatever the
+    /// overrides say, because the single-instance lock lives in it and must not
+    /// move with them: a lock keyed to the journal would let two brokers pointed
+    /// at different journals both start and then share one socket, since only
+    /// the path that was left unset falls back to the default.
     ///
     /// Every resolved path is put through [`vet_resolved_path`], whatever named
     /// it. An environment variable is inherited from whoever started the broker,
@@ -244,8 +271,9 @@ that no other user can write, or the broker refuses to start.";
     fn resolve_paths_from<F>(
         options: Options,
         broker_uid: u32,
+        base: &Path,
         lookup: F,
-    ) -> io::Result<(PathBuf, PathBuf)>
+    ) -> io::Result<Paths>
     where
         F: Fn(&str) -> Option<OsString>,
     {
@@ -257,19 +285,15 @@ that no other user can write, or the broker refuses to start.";
             .journal
             .map(OsString::from)
             .or_else(|| lookup(JOURNAL_ENV));
-        let (socket, journal) = match (socket, journal) {
-            (Some(socket), Some(journal)) => (PathBuf::from(socket), PathBuf::from(journal)),
-            (socket, journal) => {
-                let directory = private_directory(broker_uid)?;
-                (
-                    socket.map_or_else(|| directory.join(DEFAULT_SOCKET_NAME), PathBuf::from),
-                    journal.map_or_else(|| directory.join(DEFAULT_JOURNAL_NAME), PathBuf::from),
-                )
-            }
+        let directory = private_directory_in(base, broker_uid)?;
+        let paths = Paths {
+            socket: socket.map_or_else(|| directory.join(DEFAULT_SOCKET_NAME), PathBuf::from),
+            journal: journal.map_or_else(|| directory.join(DEFAULT_JOURNAL_NAME), PathBuf::from),
+            lock: directory.join(LOCK_FILE_NAME),
         };
-        vet_resolved_path(&socket, broker_uid)?;
-        vet_resolved_path(&journal, broker_uid)?;
-        Ok((socket, journal))
+        vet_resolved_path(&paths.socket, broker_uid)?;
+        vet_resolved_path(&paths.journal, broker_uid)?;
+        Ok(paths)
     }
 
     /// Refuses a resolved socket or journal path the broker must not use.
@@ -331,37 +355,29 @@ that no other user can write, or the broker refuses to start.";
     /// it closes, so a crashed broker leaves nothing to clean up - which is why
     /// the returned file must be held for as long as the broker serves.
     ///
-    /// The lock file sits beside the journal, in a directory
-    /// [`vet_resolved_path`] has already held to owner-only access, so no other
-    /// user can create it first or take it. It scopes an instance to its
-    /// journal: brokers pointed at different journals are different instances,
-    /// which is also what makes a test able to run one.
+    /// The lock file is [`LOCK_FILE_NAME`] in the broker's private directory,
+    /// which [`private_directory_in`] has already held to owner-only access, so
+    /// no other user can create it first or take it. Its location is fixed
+    /// rather than derived from the socket or the journal, so an instance is
+    /// scoped to the uid that runs it: what two brokers contend for is the
+    /// machine's knobs, which no path override makes separate.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::AddrInUse`] when another broker holds the lock,
     /// or an error naming the lock file when it cannot be created or locked.
-    fn lock_single_instance(journal: &Path) -> io::Result<File> {
-        let mut path = journal.as_os_str().to_owned();
-        path.push(LOCK_FILE_SUFFIX);
-        let path = PathBuf::from(path);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(JOURNAL_FILE_MODE)
-            .open(&path)
-            .map_err(|error| named(&path, "opened", &error))?;
-        restrict_to_owner(&path)?;
+    fn lock_single_instance(path: &Path) -> io::Result<File> {
+        let file = create_owner_only(path)?;
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(file),
             Err(errno) if errno == Errno::WOULDBLOCK => Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!(
-                    "{} is held by a running broker; only one may own the journal and its knobs",
+                    "{} is held by a running broker; only one may own this machine's knobs",
                     path.display()
                 ),
             )),
-            Err(errno) => Err(named(&path, "locked", &io::Error::from(errno))),
+            Err(errno) => Err(named(path, "locked", &io::Error::from(errno))),
         }
     }
 
@@ -381,13 +397,7 @@ that no other user can write, or the broker refuses to start.";
     /// Returns an error if the journal cannot be created or if it or an existing
     /// side file cannot be restricted.
     fn restrict_journal(path: &Path) -> io::Result<()> {
-        OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(JOURNAL_FILE_MODE)
-            .open(path)
-            .map_err(|error| named(path, "opened", &error))?;
-        restrict_to_owner(path)?;
+        drop(create_owner_only(path)?);
         for suffix in JOURNAL_SIDE_SUFFIXES {
             let mut side = path.as_os_str().to_owned();
             side.push(suffix);
@@ -398,6 +408,28 @@ that no other user can write, or the broker refuses to start.";
             }
         }
         Ok(())
+    }
+
+    /// Opens `path` at [`JOURNAL_FILE_MODE`], creating it when it is absent.
+    ///
+    /// The requested mode only applies to a file this call creates, and the
+    /// inherited umask strips bits from it even then, so the mode is reapplied
+    /// afterwards. Both files the broker owns outright - the audit journal and
+    /// the single-instance lock - are created through here, so neither can be
+    /// left readable by another user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming `path` if it cannot be opened or restricted.
+    fn create_owner_only(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(JOURNAL_FILE_MODE)
+            .open(path)
+            .map_err(|error| named(path, "opened", &error))?;
+        restrict_to_owner(path)?;
+        Ok(file)
     }
 
     /// Sets `path` to [`JOURNAL_FILE_MODE`], naming it on failure.
@@ -415,17 +447,6 @@ that no other user can write, or the broker refuses to start.";
             error.kind(),
             format!("{} cannot be {action}: {error}", path.display()),
         )
-    }
-
-    /// Returns the broker's private directory, creating it when it is absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the directory or any of its ancestors is unsound;
-    /// see [`private_directory_in`].
-    fn private_directory(broker_uid: u32) -> io::Result<PathBuf> {
-        let base = runtime_base(env::var_os("XDG_RUNTIME_DIR").as_deref(), broker_uid);
-        private_directory_in(&base, broker_uid)
     }
 
     /// Chooses the base directory [`PRIVATE_DIR_NAME`] is created under.
@@ -659,7 +680,7 @@ that no other user can write, or the broker refuses to start.";
 
         use super::{
             ArgError, FALLBACK_RUNTIME_BASE, HELP_FLAGS, Invocation, JOURNAL_ENV,
-            JOURNAL_FILE_MODE, LOCK_FILE_SUFFIX, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME,
+            JOURNAL_FILE_MODE, LOCK_FILE_NAME, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME,
             ROOT_UID, SOCKET_ENV, lock_single_instance, parse_args, private_directory_in,
             resolve_paths_from, restrict_journal, runtime_base,
         };
@@ -802,15 +823,16 @@ that no other user can write, or the broker refuses to start.";
             let base = owner_only_tempdir();
             let uid = own_uid(base.path());
             let seen = RefCell::new(BTreeSet::new());
-            let (socket, journal) = resolve_paths_from(
+            let paths = resolve_paths_from(
                 Options::default(),
                 uid,
+                base.path(),
                 recording_lookup(base.path(), &seen),
             )
-            .expect("both paths come from the environment, so no directory is touched");
+            .expect("both paths come from the environment");
 
-            assert_eq!(socket, base.path().join(SOCKET_ENV));
-            assert_eq!(journal, base.path().join(JOURNAL_ENV));
+            assert_eq!(paths.socket, base.path().join(SOCKET_ENV));
+            assert_eq!(paths.journal, base.path().join(JOURNAL_ENV));
             assert_eq!(JOURNAL_ENV, "FPSMAXXING_BROKER_JOURNAL_PATH");
             assert!(
                 !seen.borrow().contains(GATEWAY_JOURNAL_ENV),
@@ -833,14 +855,73 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some(path_string(&base.path().join("b.sock"))),
                 journal: Some(path_string(&base.path().join("j.sqlite"))),
             };
-            let (socket, journal) =
-                resolve_paths_from(options, uid, recording_lookup(base.path(), &seen))
-                    .expect("explicit flags need no directory");
-            assert_eq!(socket, base.path().join("b.sock"));
-            assert_eq!(journal, base.path().join("j.sqlite"));
+            let paths = resolve_paths_from(
+                options,
+                uid,
+                base.path(),
+                recording_lookup(base.path(), &seen),
+            )
+            .expect("explicit flags name both endpoints");
+            assert_eq!(paths.socket, base.path().join("b.sock"));
+            assert_eq!(paths.journal, base.path().join("j.sqlite"));
             assert!(
                 seen.borrow().is_empty(),
                 "a flag must not consult the environment at all"
+            );
+        }
+
+        #[test]
+        fn the_instance_lock_stays_in_the_private_directory_whatever_the_overrides() {
+            let base = owner_only_tempdir();
+            let uid = own_uid(base.path());
+            let private = base.path().join(PRIVATE_DIR_NAME);
+
+            // Two brokers pointed at different journals are still one instance:
+            // the knobs they would both drive belong to the machine, not to a
+            // path either of them was handed.
+            let mut locks = Vec::new();
+            for journal in ["a.sqlite", "b.sqlite"] {
+                let options = Options {
+                    journal: Some(path_string(&base.path().join(journal))),
+                    ..Options::default()
+                };
+                let paths = resolve_paths_from(options, uid, base.path(), |_| None)
+                    .expect("an owner-only base is sound");
+                assert_eq!(
+                    paths.socket,
+                    private.join("broker.sock"),
+                    "only the path left unset falls back, so both share one socket"
+                );
+                assert_eq!(paths.lock, private.join(LOCK_FILE_NAME));
+                locks.push(paths.lock);
+            }
+
+            let _held = lock_single_instance(&locks[0]).expect("the first broker should be alone");
+            let error = lock_single_instance(&locks[1])
+                .expect_err("a second broker on this machine must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        }
+
+        #[test]
+        fn the_private_directory_is_established_even_when_both_paths_are_overridden() {
+            let base = owner_only_tempdir();
+            let uid = own_uid(base.path());
+            let options = Options {
+                socket: Some(path_string(&base.path().join("b.sock"))),
+                journal: Some(path_string(&base.path().join("j.sqlite"))),
+            };
+            let paths = resolve_paths_from(options, uid, base.path(), |_| None)
+                .expect("an owner-only base is sound");
+
+            let private = base.path().join(PRIVATE_DIR_NAME);
+            assert_eq!(paths.lock, private.join(LOCK_FILE_NAME));
+            let metadata =
+                std::fs::symlink_metadata(&private).expect("the private directory should stat");
+            assert!(metadata.is_dir());
+            assert_eq!(
+                metadata.mode() & 0o777,
+                PRIVATE_DIR_MODE,
+                "the lock must live somewhere no other user can take it first"
             );
         }
 
@@ -852,9 +933,13 @@ that no other user can write, or the broker refuses to start.";
                 journal: Some(path_string(&base.path().join("j.sqlite"))),
                 ..Options::default()
             };
-            let error =
-                resolve_paths_from(options, uid, socket_env_lookup(Path::new("broker.sock")))
-                    .expect_err("a relative override would land beside the inherited cwd");
+            let error = resolve_paths_from(
+                options,
+                uid,
+                base.path(),
+                socket_env_lookup(Path::new("broker.sock")),
+            )
+            .expect_err("a relative override would land beside the inherited cwd");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         }
 
@@ -873,6 +958,7 @@ that no other user can write, or the broker refuses to start.";
             let error = resolve_paths_from(
                 options,
                 uid,
+                outer.path(),
                 socket_env_lookup(&reachable.join("broker.sock")),
             )
             .expect_err("an override under a world-writable parent must be refused");
@@ -884,13 +970,14 @@ that no other user can write, or the broker refuses to start.";
                 journal: Some(path_string(&outer.path().join("j.sqlite"))),
                 ..Options::default()
             };
-            let (socket, _journal) = resolve_paths_from(
+            let paths = resolve_paths_from(
                 options,
                 uid,
+                outer.path(),
                 socket_env_lookup(&reachable.join("broker.sock")),
             )
             .expect("an owner-only parent is sound");
-            assert_eq!(socket, reachable.join("broker.sock"));
+            assert_eq!(paths.socket, reachable.join("broker.sock"));
         }
 
         #[test]
@@ -907,7 +994,7 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some(path_string(&shared.join("broker.sock"))),
                 journal: Some(path_string(&outer.path().join("j.sqlite"))),
             };
-            let error = resolve_paths_from(options, uid, |_| None)
+            let error = resolve_paths_from(options, uid, outer.path(), |_| None)
                 .expect_err("a sticky world-writable parent must be refused");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
@@ -915,7 +1002,7 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some(path_string(&outer.path().join("b.sock"))),
                 journal: Some(path_string(&shared.join("j.sqlite"))),
             };
-            let error = resolve_paths_from(options, uid, |_| None)
+            let error = resolve_paths_from(options, uid, outer.path(), |_| None)
                 .expect_err("the journal is held to the same bar as the socket");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
@@ -928,10 +1015,10 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some(path_string(&private.join("broker.sock"))),
                 journal: Some(path_string(&private.join("j.sqlite"))),
             };
-            let (socket, journal) = resolve_paths_from(options, uid, |_| None)
+            let paths = resolve_paths_from(options, uid, shared.as_path(), |_| None)
                 .expect("an owner-only directory under a sticky ancestor is sound");
-            assert_eq!(socket, private.join("broker.sock"));
-            assert_eq!(journal, private.join("j.sqlite"));
+            assert_eq!(paths.socket, private.join("broker.sock"));
+            assert_eq!(paths.journal, private.join("j.sqlite"));
         }
 
         #[test]
@@ -954,7 +1041,7 @@ that no other user can write, or the broker refuses to start.";
                     journal: Some(path_string(&traversable.join("j.sqlite"))),
                 },
             ] {
-                let error = resolve_paths_from(options, uid, |_| None)
+                let error = resolve_paths_from(options, uid, outer.path(), |_| None)
                     .expect_err("a world-traversable parent must be refused");
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             }
@@ -968,10 +1055,10 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some(path_string(&private.join("broker.sock"))),
                 journal: Some(path_string(&private.join("j.sqlite"))),
             };
-            let (socket, journal) = resolve_paths_from(options, uid, |_| None)
+            let paths = resolve_paths_from(options, uid, traversable.as_path(), |_| None)
                 .expect("an owner-only directory under a traversable ancestor is sound");
-            assert_eq!(socket, private.join("broker.sock"));
-            assert_eq!(journal, private.join("j.sqlite"));
+            assert_eq!(paths.socket, private.join("broker.sock"));
+            assert_eq!(paths.journal, private.join("j.sqlite"));
         }
 
         #[test]
@@ -982,7 +1069,7 @@ that no other user can write, or the broker refuses to start.";
                 socket: Some("broker.sock".to_owned()),
                 journal: Some(path_string(&base.path().join("j.sqlite"))),
             };
-            let error = resolve_paths_from(options, uid, |_| None)
+            let error = resolve_paths_from(options, uid, base.path(), |_| None)
                 .expect_err("a flag must not bypass the vet an override is held to");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         }
@@ -1022,13 +1109,14 @@ that no other user can write, or the broker refuses to start.";
         }
 
         #[test]
-        fn a_second_broker_cannot_take_the_lock_on_a_journal() {
+        fn a_second_broker_cannot_take_the_instance_lock() {
             let base = tempfile::tempdir().expect("temporary directory should exist");
+            let lock = base.path().join(LOCK_FILE_NAME);
             let journal = base.path().join("journal.sqlite");
 
-            let held = lock_single_instance(&journal).expect("the first broker should be alone");
-            let error = lock_single_instance(&journal)
-                .expect_err("a second broker must not run against the same journal");
+            let held = lock_single_instance(&lock).expect("the first broker should be alone");
+            let error = lock_single_instance(&lock)
+                .expect_err("a second broker must not run beside the first");
             assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
             assert!(
                 !journal.exists(),
@@ -1038,18 +1126,15 @@ that no other user can write, or the broker refuses to start.";
             // The kernel releases the lock with the last descriptor for it, so
             // a crashed broker leaves nothing for its restart to clean up.
             drop(held);
-            lock_single_instance(&journal).expect("a released lock should be takeable again");
+            lock_single_instance(&lock).expect("a released lock should be takeable again");
         }
 
         #[test]
-        fn the_instance_lock_is_owner_only_and_beside_the_journal() {
+        fn the_instance_lock_is_owner_only() {
             let base = tempfile::tempdir().expect("temporary directory should exist");
-            let journal = base.path().join("journal.sqlite");
-            let _held = lock_single_instance(&journal).expect("the lock should be taken");
+            let lock = base.path().join(LOCK_FILE_NAME);
+            let _held = lock_single_instance(&lock).expect("the lock should be taken");
 
-            let lock = base
-                .path()
-                .join(format!("journal.sqlite{LOCK_FILE_SUFFIX}"));
             let metadata = std::fs::symlink_metadata(&lock).expect("the lock file should stat");
             assert_eq!(metadata.mode() & 0o777, JOURNAL_FILE_MODE);
         }

@@ -142,15 +142,16 @@ cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal
 
 A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
 The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
-The broker creates it mode `0700`, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
+The broker creates it mode `0700` whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
 A path from a flag or an environment variable is held to the same bar: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
 Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
 That directory is held higher than the ancestors above it, in two ways.
 The sticky bit does not excuse group or world write there: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
 Nor is group or world traversal excused: the socket's own mode cannot be pinned, so a merely traversable directory like `/run` would put every local user in front of it, and it is refused too.
 The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
-Only one broker may run against a journal: it takes an exclusive lock on `<journal>.lock` beside it before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
-The kernel releases that lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
+Only one broker may run per user: it takes an exclusive lock on `<private dir>/broker.lock` before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
+That lock is not derived from `--socket` or `--journal`, so no override buys a second instance - the knobs two brokers would drive belong to the machine, not to the paths they were handed.
+The kernel releases the lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
 
 ## Architecture
 

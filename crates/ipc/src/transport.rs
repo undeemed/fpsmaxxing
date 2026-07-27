@@ -115,9 +115,9 @@ mod unix {
         /// already at `path` is unlinked and rebound - it is the file a crashed
         /// broker leaves behind. Nothing here has to tell that file apart from
         /// a live endpoint, because this bind is not what keeps a second broker
-        /// out: the caller takes an exclusive lock beside its journal before it
-        /// reaches this code (see the broker's single-instance lock), so only
-        /// one process gets here for a given instance. A probe would be the
+        /// out: the caller takes an exclusive lock in its own private directory
+        /// before it reaches this code (see the broker's single-instance lock),
+        /// so only one process gets here per uid. A probe would be the
         /// weaker guard anyway - stat, probe, unlink, and bind are four steps,
         /// and two brokers can both find the same path stale.
         ///
