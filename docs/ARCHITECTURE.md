@@ -42,9 +42,14 @@ What keeps single-owner-per-knob true across processes is an exclusive advisory 
 The bind cannot do that job, because it cannot be made atomic: stat, probe, unlink, and bind are four steps, and two brokers that both found the same socket file stale would leave the first serving an unlinked inode - still answering its connected clients - while the second owned the path, with nothing logged anywhere.
 The kernel releases the lock with the last descriptor for it, so a broker that crashed leaves its successor nothing to clean up, and the socket file it left behind is simply rebound.
 The transport unlinks on drop only the entry it bound itself - matched by device and inode - so an exiting instance can never strand a live successor.
-The lock is placed by uid rather than derived from the socket or the journal, and the private directory holding it is established even when both of those are overridden, so no combination of flags or environment variables buys a second instance.
+The lock is placed by uid rather than derived from the socket or the journal, and the private directory holding it is established even when both of those are overridden, so neither `--socket` nor `--journal` nor the environment variables behind them buy a second instance.
 Keying it to a path would not hold: only the path left unset falls back to the default, so two brokers given different journals would take two locks and then share one socket.
 What they contend for is the machine's knobs, not a file, and a supervisor-level single-instance unit can layer on top later.
+For the privileged deployment the guarantee is unconditional: a root broker ignores `XDG_RUNTIME_DIR`, so its private directory is always the fixed `/run/fpsmaxxing` and there is exactly one lock file to contend for.
+An unprivileged broker keeps that directory wherever the inherited `XDG_RUNTIME_DIR` puts it, so the lock moves with the variable: one user starting two brokers under two different values for it takes two locks, and both start.
+Single-instance is therefore best-effort off the privileged path, which is the dev and test path it serves.
+That concession gives up no boundary.
+A same-uid caller who can vary `XDG_RUNTIME_DIR` is already inside the trust domain the same-uid ACL admits, and could drive the same knobs through the running broker without starting a second one; the shipping broker runs as root, where the variable is refused and the guarantee is airtight.
 The audit journal is different: it holds every `apply-intent` record and outlives the process, so it is created mode `0600` before it is opened, which also restricts the rollback journal and write-ahead log `SQLite` creates beside it.
 The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway and CLI use, so an operator who exported that variable cannot move the privileged audit journal.
 Both are read as raw `OsString` values, so a path that is not UTF-8 relocates the socket or journal as configured rather than being silently dropped back to the default.

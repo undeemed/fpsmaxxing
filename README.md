@@ -131,9 +131,16 @@ cargo run -p fpsmaxxing-broker -- --help
 An explicit path is never created for you, and its directory must already be mode `0700` and owned by the user the broker runs as, so create it first:
 
 ```bash
-sudo install -d -m 700 -o "$(id -un)" /run/fpsmaxxing
-cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal /run/fpsmaxxing/journal.sqlite
+mkdir -p "$HOME/.local/state/fpsmaxxing" && chmod 700 "$HOME/.local/state/fpsmaxxing"
+cargo run -p fpsmaxxing-broker -- \
+  --socket "$HOME/.local/state/fpsmaxxing/broker.sock" \
+  --journal "$HOME/.local/state/fpsmaxxing/journal.sqlite"
 ```
+
+Do not put that directory at `/run/fpsmaxxing`.
+That is the privileged broker's own private directory, and because a broker only accepts a private directory it owns itself, creating it as your user leaves a later root broker refusing to start until it is chowned to root or removed.
+A root broker creates and vets it on its own, as does a systemd unit with `RuntimeDirectory=fpsmaxxing`.
+The broker still establishes its private directory even when both paths are given, because the single-instance lock lives there, so it also needs to be able to create `$XDG_RUNTIME_DIR/fpsmaxxing` - or `/run/fpsmaxxing`, when that variable is unset - on every start.
 
 | Setting | Flag | Environment variable | Default |
 | --- | --- | --- | --- |
@@ -150,7 +157,9 @@ The sticky bit does not excuse group or world write there: sticky stops another 
 Nor is group or world traversal excused: the socket's own mode cannot be pinned, so a merely traversable directory like `/run` would put every local user in front of it, and it is refused too.
 The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
 Only one broker may run per user: it takes an exclusive lock on `<private dir>/broker.lock` before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
-That lock is not derived from `--socket` or `--journal`, so no override buys a second instance - the knobs two brokers would drive belong to the machine, not to the paths they were handed.
+That lock is not derived from `--socket` or `--journal`, so neither of those, nor the environment variables behind them, buys a second instance - the knobs two brokers would drive belong to the machine, not to the paths they were handed.
+`XDG_RUNTIME_DIR` does move it, because it moves the private directory it sits in.
+A root broker ignores that variable, so the privileged broker always locks `/run/fpsmaxxing/broker.lock` and one instance is guaranteed; an unprivileged user who runs two brokers under two different values for it gets two locks and two brokers, which is a dev-path concession rather than a boundary, since a same-uid caller is already admitted by the ACL.
 The kernel releases the lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
 
 ## Architecture

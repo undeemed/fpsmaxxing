@@ -19,7 +19,11 @@
 //! Only one broker may run per uid. An exclusive advisory lock on a fixed file
 //! in that private directory is taken before the journal is opened and before
 //! the socket is bound, so a second process refuses to start rather than
-//! driving the same knobs through an ownership ledger of its own.
+//! driving the same knobs through an ownership ledger of its own. That is
+//! unconditional for a root broker, whose private directory is always
+//! `/run/fpsmaxxing`; an unprivileged one locks wherever the inherited
+//! `XDG_RUNTIME_DIR` puts that directory, so the guard is best-effort on the
+//! dev path it serves.
 //!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
@@ -360,7 +364,10 @@ or the broker refuses to start.";
     /// no other user can create it first or take it. Its location is fixed
     /// rather than derived from the socket or the journal, so an instance is
     /// scoped to the uid that runs it: what two brokers contend for is the
-    /// machine's knobs, which no path override makes separate.
+    /// machine's knobs, which no path override makes separate. The directory
+    /// holding it still follows `XDG_RUNTIME_DIR` for an unprivileged broker,
+    /// so a single instance is guaranteed only for a root broker, which
+    /// [`runtime_base`] refuses that variable for.
     ///
     /// # Errors
     ///

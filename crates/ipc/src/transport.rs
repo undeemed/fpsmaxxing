@@ -117,9 +117,10 @@ mod unix {
         /// a live endpoint, because this bind is not what keeps a second broker
         /// out: the caller takes an exclusive lock in its own private directory
         /// before it reaches this code (see the broker's single-instance lock),
-        /// so only one process gets here per uid. A probe would be the
-        /// weaker guard anyway - stat, probe, unlink, and bind are four steps,
-        /// and two brokers can both find the same path stale.
+        /// so a second instance has already been refused by the time this runs.
+        /// A probe would be the weaker guard anyway - stat, probe, unlink, and
+        /// bind are four steps, and two brokers can both find the same path
+        /// stale.
         ///
         /// A regular file, a directory, or a symlink already at `path` fails
         /// closed with [`io::ErrorKind::AlreadyExists`] rather than being
