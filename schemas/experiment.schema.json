@@ -15,9 +15,9 @@
   "properties": {
     "hypothesis": { "type": "string", "minLength": 1 },
     "target": { "$ref": "#/$defs/change_request" },
-    "warmup_samples": { "type": "integer", "minimum": 0 },
-    "baseline_samples": { "type": "integer", "minimum": 1 },
-    "candidate_samples": { "type": "integer", "minimum": 1 },
+    "warmup_samples": { "type": "integer", "minimum": 0, "maximum": 100000 },
+    "baseline_samples": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "candidate_samples": { "type": "integer", "minimum": 1, "maximum": 100000 },
     "bounds": { "$ref": "#/$defs/decision_bounds" }
   },
   "$defs": {

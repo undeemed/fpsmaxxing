@@ -138,6 +138,14 @@ pub struct DecisionBounds {
     pub max_errors: u64,
 }
 
+/// Inclusive ceiling on every sample count in an [`ExperimentSpec`].
+///
+/// Sample counts arrive over the wire from an LLM-authored spec and size the
+/// measurement buffers a runner allocates, so they are bounded like every other
+/// parameter the broker accepts. The ceiling is mirrored as `maximum` in
+/// `schemas/experiment.schema.json`.
+pub const MAX_SAMPLES: u32 = 100_000;
+
 /// A declarative, typed experiment the runner can execute, journal, and replay.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,11 +154,15 @@ pub struct ExperimentSpec {
     pub hypothesis: String,
     /// Bounded, policy-checkable capability change under test.
     pub target: ChangeRequest,
-    /// Leading measurements discarded from each phase before counting.
+    /// Leading measurements discarded from each phase before counting; at most
+    /// [`MAX_SAMPLES`].
+    #[schemars(range(max = MAX_SAMPLES))]
     pub warmup_samples: u32,
-    /// Counted baseline measurements to record.
+    /// Counted baseline measurements to record; at most [`MAX_SAMPLES`].
+    #[schemars(range(max = MAX_SAMPLES))]
     pub baseline_samples: NonZeroU32,
-    /// Counted candidate measurements to record.
+    /// Counted candidate measurements to record; at most [`MAX_SAMPLES`].
+    #[schemars(range(max = MAX_SAMPLES))]
     pub candidate_samples: NonZeroU32,
     /// Thresholds the evaluator uses to promote or reject.
     pub bounds: DecisionBounds,
@@ -210,7 +222,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
+        CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, MAX_SAMPLES,
         MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict,
         VerdictReason,
     };
@@ -392,44 +404,142 @@ mod tests {
         assert!(serde_json::from_value::<ChangeRequest>(serialized).is_err());
     }
 
+    /// Asserts that two object schemas declare the same fields.
+    fn assert_object_parity(label: &str, generated: &Value, checked_in: &Value) {
+        let generated_properties: BTreeSet<String> = generated["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("generated {label} should declare properties"))
+            .keys()
+            .cloned()
+            .collect();
+        let checked_in_properties: BTreeSet<String> = checked_in["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("checked-in {label} should declare properties"))
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(generated_properties, checked_in_properties, "{label}");
+        assert_eq!(
+            string_set(&generated["required"]),
+            string_set(&checked_in["required"]),
+            "{label}"
+        );
+        assert_eq!(
+            generated["additionalProperties"], checked_in["additionalProperties"],
+            "{label}"
+        );
+    }
+
+    /// Names the `$defs` entries of a generated schema that describe objects.
+    ///
+    /// Enum definitions are skipped: they carry no `properties` and the
+    /// checked-in schemas inline them, so the `*_enum_wire_strings_match_*`
+    /// tests cover their parity instead.
+    fn generated_object_definitions(generated: &Value) -> BTreeSet<String> {
+        generated["$defs"]
+            .as_object()
+            .map(|definitions| {
+                definitions
+                    .iter()
+                    .filter(|(_, definition)| definition.get("properties").is_some())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One generated schema paired with the checked-in file it must mirror.
+    struct SchemaCase {
+        label: &'static str,
+        generated: Value,
+        checked_in: Value,
+        /// Every object definition the generated schema puts in `$defs`, mapped
+        /// to the checked-in `$defs` key that mirrors it. `None` marks a
+        /// definition that a separate checked-in schema file already covers.
+        definitions: &'static [(&'static str, Option<&'static str>)],
+    }
+
+    fn schema_cases() -> Vec<SchemaCase> {
+        vec![
+            SchemaCase {
+                label: "CapabilityDescriptor",
+                generated: serde_json::to_value(schemars::schema_for!(CapabilityDescriptor))
+                    .expect("generated schema should serialize"),
+                checked_in: serde_json::from_str(CAPABILITY_SCHEMA)
+                    .expect("capability schema should parse"),
+                definitions: &[],
+            },
+            SchemaCase {
+                label: "ProviderManifest",
+                generated: serde_json::to_value(schemars::schema_for!(ProviderManifest))
+                    .expect("generated schema should serialize"),
+                checked_in: serde_json::from_str(SIDECAR_SCHEMA)
+                    .expect("sidecar schema should parse"),
+                // capability.schema.json is referenced across files and checked
+                // as its own case.
+                definitions: &[("CapabilityDescriptor", None)],
+            },
+            SchemaCase {
+                label: "ExperimentSpec",
+                generated: serde_json::to_value(schemars::schema_for!(ExperimentSpec))
+                    .expect("generated schema should serialize"),
+                checked_in: serde_json::from_str(EXPERIMENT_SCHEMA)
+                    .expect("experiment schema should parse"),
+                definitions: &[
+                    ("ChangeRequest", Some("change_request")),
+                    ("DecisionBounds", Some("decision_bounds")),
+                ],
+            },
+            SchemaCase {
+                label: "Verdict",
+                generated: serde_json::to_value(schemars::schema_for!(Verdict))
+                    .expect("generated schema should serialize"),
+                checked_in: serde_json::from_str(VERDICT_SCHEMA)
+                    .expect("verdict schema should parse"),
+                definitions: &[("MetricSummary", Some("metric_summary"))],
+            },
+        ]
+    }
+
     #[test]
     fn generated_schemas_match_checked_in_schemas() {
-        let cases = [
-            (
-                schemars::schema_for!(CapabilityDescriptor),
-                serde_json::from_str::<Value>(CAPABILITY_SCHEMA)
-                    .expect("capability schema should parse"),
-            ),
-            (
-                schemars::schema_for!(ProviderManifest),
-                serde_json::from_str::<Value>(SIDECAR_SCHEMA).expect("sidecar schema should parse"),
-            ),
-        ];
+        for case in schema_cases() {
+            assert_object_parity(case.label, &case.generated, &case.checked_in);
 
-        for (generated, checked_in) in cases {
-            let generated =
-                serde_json::to_value(generated).expect("generated schema should serialize");
-            let generated_properties: BTreeSet<String> = generated["properties"]
-                .as_object()
-                .expect("generated schema should declare properties")
-                .keys()
-                .cloned()
-                .collect();
-            let checked_in_properties: BTreeSet<String> = checked_in["properties"]
-                .as_object()
-                .expect("checked-in schema should declare properties")
-                .keys()
-                .cloned()
-                .collect();
-            assert_eq!(generated_properties, checked_in_properties);
+            // Every nested object type must be mapped, so introducing one
+            // fails this test until the checked-in schema gains a matching
+            // definition.
             assert_eq!(
-                string_set(&generated["required"]),
-                string_set(&checked_in["required"])
+                generated_object_definitions(&case.generated),
+                case.definitions
+                    .iter()
+                    .map(|(name, _)| (*name).to_owned())
+                    .collect::<BTreeSet<String>>(),
+                "{} nested object definitions",
+                case.label
             );
+            let checked_in_definitions: BTreeSet<String> = case.checked_in["$defs"]
+                .as_object()
+                .map(|definitions| definitions.keys().cloned().collect())
+                .unwrap_or_default();
             assert_eq!(
-                generated["additionalProperties"],
-                checked_in["additionalProperties"]
+                checked_in_definitions,
+                case.definitions
+                    .iter()
+                    .filter_map(|(_, target)| target.map(ToOwned::to_owned))
+                    .collect::<BTreeSet<String>>(),
+                "{} checked-in $defs",
+                case.label
             );
+
+            for (name, target) in case.definitions {
+                let Some(target) = target else { continue };
+                assert_object_parity(
+                    &format!("{}/$defs/{target}", case.label),
+                    &case.generated["$defs"][name],
+                    &case.checked_in["$defs"][target],
+                );
+            }
         }
     }
 
@@ -486,42 +596,20 @@ mod tests {
     }
 
     #[test]
-    fn experiment_and_verdict_schemas_match_checked_in() {
-        let cases = [
-            (
-                schemars::schema_for!(ExperimentSpec),
-                serde_json::from_str::<Value>(EXPERIMENT_SCHEMA)
-                    .expect("experiment schema should parse"),
-            ),
-            (
-                schemars::schema_for!(Verdict),
-                serde_json::from_str::<Value>(VERDICT_SCHEMA).expect("verdict schema should parse"),
-            ),
-        ];
+    fn sample_counts_are_bounded_like_the_schema() {
+        let schema: Value =
+            serde_json::from_str(EXPERIMENT_SCHEMA).expect("experiment schema should parse");
+        for field in ["warmup_samples", "baseline_samples", "candidate_samples"] {
+            assert_eq!(schema["properties"][field]["maximum"], json!(MAX_SAMPLES));
+        }
 
-        for (generated, checked_in) in cases {
-            let generated =
-                serde_json::to_value(generated).expect("generated schema should serialize");
-            let generated_properties: BTreeSet<String> = generated["properties"]
-                .as_object()
-                .expect("generated schema should declare properties")
-                .keys()
-                .cloned()
-                .collect();
-            let checked_in_properties: BTreeSet<String> = checked_in["properties"]
-                .as_object()
-                .expect("checked-in schema should declare properties")
-                .keys()
-                .cloned()
-                .collect();
-            assert_eq!(generated_properties, checked_in_properties);
+        let generated = serde_json::to_value(schemars::schema_for!(ExperimentSpec))
+            .expect("generated schema should serialize");
+        for field in ["warmup_samples", "baseline_samples", "candidate_samples"] {
             assert_eq!(
-                string_set(&generated["required"]),
-                string_set(&checked_in["required"])
-            );
-            assert_eq!(
-                generated["additionalProperties"],
-                checked_in["additionalProperties"]
+                generated["properties"][field]["maximum"],
+                json!(MAX_SAMPLES),
+                "{field}"
             );
         }
     }

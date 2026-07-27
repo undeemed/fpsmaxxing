@@ -18,5 +18,6 @@ mod runner;
 pub use evaluator::evaluate;
 pub use model::measure;
 pub use runner::{
-    LifecycleOutcome, ReplayOutcome, RunnerError, StoredTrial, TrialRecord, replay_trial, run_trial,
+    LifecycleFailure, LifecycleOutcome, ReplayOutcome, RunnerError, StoredTrial,
+    TRIAL_RECORD_VERSION, TrialRecord, replay_trial, run_trial,
 };

@@ -220,6 +220,31 @@ impl ControlPlane {
         Ok(self.journal.last_insert_rowid())
     }
 
+    /// Replaces the payload of an already-recorded trial.
+    ///
+    /// A runner journals its measured trial ahead of the broker lifecycle so
+    /// the measurements that authorized a promotion survive a lifecycle
+    /// failure, then amends the same row with the outcome it could not know
+    /// yet. The trial's identity, spec, samples, and verdict are fixed at
+    /// insertion; only the outcome fields are filled in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no trial has the identifier, the payload cannot be
+    /// encoded, or the durable journal cannot be written.
+    pub fn amend_trial(&self, id: i64, payload: &impl Serialize) -> Result<(), ControlPlaneError> {
+        let updated = self.journal.execute(
+            "UPDATE experiment_trials SET payload = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(payload)?],
+        )?;
+        if updated == 0 {
+            return Err(ControlPlaneError::Journal(
+                rusqlite::Error::QueryReturnedNoRows,
+            ));
+        }
+        Ok(())
+    }
+
     /// Reads one trial record by identifier for replay and re-evaluation.
     ///
     /// # Errors
@@ -858,6 +883,44 @@ mod tests {
         let read = plane.read_trial(first).expect("trial should read");
         assert_eq!(read["hypothesis"], "higher clocks help");
         assert_eq!(read["decision"], "promote");
+    }
+
+    #[test]
+    fn amending_a_trial_replaces_only_that_payload() {
+        let plane = plane(false);
+        let first = plane
+            .record_trial(&json!({ "decision": "promote", "lifecycle": null }))
+            .expect("first trial should record");
+        let second = plane
+            .record_trial(&json!({ "decision": "reject" }))
+            .expect("second trial should record");
+        plane
+            .amend_trial(
+                first,
+                &json!({ "decision": "promote", "lifecycle": { "verified": true } }),
+            )
+            .expect("trial should amend");
+        assert_eq!(
+            plane.read_trial(first).expect("trial should read")["lifecycle"]["verified"],
+            true
+        );
+        assert_eq!(
+            plane.read_trial(second).expect("trial should read")["decision"],
+            "reject"
+        );
+        assert_eq!(plane.trial_ids().expect("ids should read"), [first, second]);
+    }
+
+    #[test]
+    fn amending_an_unknown_trial_fails_closed() {
+        let plane = plane(false);
+        let error = plane
+            .amend_trial(404, &json!({ "decision": "promote" }))
+            .expect_err("an unrecorded trial cannot be amended");
+        assert!(matches!(
+            error,
+            ControlPlaneError::Journal(rusqlite::Error::QueryReturnedNoRows)
+        ));
     }
 
     #[test]

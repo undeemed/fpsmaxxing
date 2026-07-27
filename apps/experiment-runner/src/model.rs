@@ -40,11 +40,14 @@ const ERROR_ONSET: u64 = 90;
 #[must_use]
 pub fn measure(value: u64, warmup: u32, counted: u32) -> Vec<MetricSample> {
     let setting = knob_to_setting(value);
-    let total = warmup.saturating_add(counted);
-    let mut samples: Vec<MetricSample> = (0..total)
-        .map(|index| sample_at(setting, value, index < warmup))
-        .collect();
-    samples.split_off(warmup as usize)
+    let warmup = u64::from(warmup);
+    // Widening before the sum keeps the count exact for every `u32` pair, and
+    // dropping the warmup prefix as it is produced keeps the allocation at
+    // `counted` however long the prefix is.
+    (0..warmup + u64::from(counted))
+        .map(|index| (index, sample_at(setting, value, index < warmup)))
+        .filter_map(|(index, sample)| (index >= warmup).then_some(sample))
+        .collect()
 }
 
 /// Builds one deterministic sample at a given setting.

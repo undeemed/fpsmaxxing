@@ -3,17 +3,18 @@
 //! These exercise the trial runner and journal-only replay end to end against
 //! the mock provider through the broker: a promoted experiment that runs the
 //! full lifecycle, a rejected experiment that is never applied and leaves the
-//! baseline untouched, and a replay from the durable journal alone - reopened
-//! as a fresh handle - that reproduces the recorded verdict exactly. The final
-//! test states the MVP acceptance criterion directly.
+//! baseline untouched, a promoted experiment whose lifecycle the broker refuses
+//! but whose write-ahead record survives, and a replay from the durable journal
+//! alone - reopened as a fresh handle - that reproduces the recorded verdict
+//! exactly. The final test states the MVP acceptance criterion directly.
 
 use std::num::{NonZeroU32, NonZeroU64};
 
 use fpsmaxxing_contracts::{
     ChangeRequest, Decision, DecisionBounds, ExperimentSpec, VerdictReason,
 };
-use fpsmaxxing_control_plane::ControlPlane;
-use fpsmaxxing_experiment_runner::{evaluate, replay_trial, run_trial};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError};
+use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -21,12 +22,23 @@ use tempfile::NamedTempFile;
 /// Builds a spec that drives the mock knob to `candidate` under the given
 /// improvement threshold and temperature ceiling.
 fn spec_for(candidate: u64, min_fps_improvement: f64, max_temperature_c: f64) -> ExperimentSpec {
+    spec_with_lease(candidate, min_fps_improvement, max_temperature_c, 30)
+}
+
+/// Builds the same spec with an explicit lease, so a test can drive the broker
+/// policy into denying the change the evaluator promoted.
+fn spec_with_lease(
+    candidate: u64,
+    min_fps_improvement: f64,
+    max_temperature_c: f64,
+    lease_seconds: u64,
+) -> ExperimentSpec {
     ExperimentSpec {
         hypothesis: format!("raise mock.value to {candidate}"),
         target: ChangeRequest {
             capability_id: "mock.value".to_owned(),
             parameters: json!({ "value": candidate }),
-            lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
+            lease_seconds: NonZeroU64::new(lease_seconds).expect("lease is non-zero"),
         },
         warmup_samples: 2,
         baseline_samples: NonZeroU32::new(5).expect("baseline count is non-zero"),
@@ -104,6 +116,47 @@ fn a_rejected_experiment_is_never_applied_and_leaves_the_baseline() {
 }
 
 #[test]
+fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // The evaluator promotes on the measurements, but the 400 second lease is
+    // outside the broker's policy envelope, so the lifecycle never runs.
+    let spec = spec_with_lease(40, 5.0, 80.0, 400);
+    let error = run_trial(&mut plane, &spec).expect_err("policy should deny the lease");
+    assert!(matches!(
+        error,
+        RunnerError::ControlPlane(ControlPlaneError::PolicyDenied(_))
+    ));
+
+    // The measurements that authorized the promotion were journaled ahead of
+    // the lifecycle, so the trial is still discoverable and replayable.
+    let ids = plane.trial_ids().expect("trial ids");
+    assert_eq!(ids.len(), 1, "the failed promotion is still journaled");
+    let record: TrialRecord =
+        serde_json::from_value(plane.read_trial(ids[0]).expect("trial should read"))
+            .expect("trial should decode");
+    assert_eq!(record.verdict.decision, Decision::Promote);
+    assert!(
+        record.lifecycle.is_none(),
+        "no lifecycle completed for a denied change"
+    );
+    let failure = record
+        .lifecycle_error
+        .expect("the refused lifecycle is recorded on the trial");
+    assert_eq!(failure.kind, "policy-denied");
+    assert!(failure.error.contains("lease exceeds 300 seconds"));
+
+    let outcome = replay_trial(&plane, ids[0]).expect("replay trial");
+    assert!(outcome.is_consistent());
+    assert_eq!(outcome.recomputed.decision, Decision::Promote);
+
+    // Nothing reached the provider, so the baseline is untouched.
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
 fn a_trial_replays_from_the_journal_alone_with_an_identical_verdict() {
     let journal = NamedTempFile::new().expect("temp journal");
 
@@ -128,6 +181,43 @@ fn a_trial_replays_from_the_journal_alone_with_an_identical_verdict() {
     );
     assert_eq!(outcome.recorded, outcome.recomputed);
     assert_eq!(outcome.recomputed.decision, Decision::Promote);
+}
+
+#[test]
+fn an_out_of_envelope_spec_is_refused_before_any_measurement() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    let mut spec = spec_for(40, 5.0, 80.0);
+    spec.warmup_samples = u32::MAX;
+    let error = run_trial(&mut plane, &spec).expect_err("unbounded counts should be refused");
+    assert!(matches!(error, RunnerError::InvalidSpec(_)));
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused spec journals nothing"
+    );
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
+fn a_trial_record_from_an_unsupported_version_fails_closed() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+
+    // Stand in for a record a future runner wrote: the reader must refuse it
+    // rather than decode it under this version's field meanings.
+    let mut payload = plane.read_trial(trial.id).expect("trial should read");
+    payload["schema_version"] = json!(2);
+    plane
+        .amend_trial(trial.id, &payload)
+        .expect("trial should amend");
+
+    let error = replay_trial(&plane, trial.id).expect_err("a future record should be refused");
+    assert!(matches!(error, RunnerError::UnsupportedRecordVersion(2)));
 }
 
 #[test]
