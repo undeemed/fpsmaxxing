@@ -88,7 +88,8 @@ The repository currently includes:
 - A working stdio MCP gateway that serves the mock path end to end
 - A CLI `doctor` command that reports gateway and journal status
 - An independent watchdog that restores prior state from the journal after a crash or lease expiry, on the Linux-safe mock path
-- Scaffolds for the privileged broker and experiment runner
+- A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone
+- Scaffolds for the privileged broker
 - OSS governance, security policy, issue templates, and CI
 - An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 

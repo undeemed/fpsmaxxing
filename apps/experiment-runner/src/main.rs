@@ -4,8 +4,15 @@
 //! journals it, then replays it from the durable journal alone and confirms the
 //! re-evaluated verdict matches the one recorded at run time. The journal is an
 //! in-memory `SQLite` database, so the demo leaves nothing on disk.
+//!
+//! A replay that diverges from the journal means the record was tampered with
+//! or the immutable evaluator drifted, so the demo exits non-zero rather than
+//! reporting the divergence as a successful run.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    process::ExitCode,
+};
 
 use fpsmaxxing_contracts::{ChangeRequest, DecisionBounds, ExperimentSpec};
 use fpsmaxxing_control_plane::ControlPlane;
@@ -13,7 +20,7 @@ use fpsmaxxing_experiment_runner::{RunnerError, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use serde_json::json;
 
-fn main() -> Result<(), RunnerError> {
+fn main() -> Result<ExitCode, RunnerError> {
     let mut plane = ControlPlane::open(Box::new(MockProvider::new(10)), ":memory:")?;
     let spec = demo_spec();
 
@@ -37,7 +44,14 @@ fn main() -> Result<(), RunnerError> {
         replay.recomputed.decision,
         replay.is_consistent()
     );
-    Ok(())
+    if !replay.is_consistent() {
+        eprintln!(
+            "fpsmaxxing-experiment-runner: replay of trial {} diverged from the journal: recorded {:?}, recomputed {:?}",
+            replay.trial_id, replay.recorded.reason, replay.recomputed.reason
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Builds a spec that raises the mock knob within the safety envelope.

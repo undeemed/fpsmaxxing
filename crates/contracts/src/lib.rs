@@ -142,9 +142,10 @@ pub struct DecisionBounds {
 ///
 /// Sample counts arrive over the wire from an LLM-authored spec and size the
 /// measurement buffers a runner allocates, so they are bounded like every other
-/// parameter the broker accepts. The ceiling is mirrored as `maximum` in
-/// `schemas/experiment.schema.json`.
-pub const MAX_SAMPLES: u32 = 100_000;
+/// parameter the broker accepts. The ceiling also bounds the journaled trial
+/// record, which carries every counted sample in a single row. The ceiling is
+/// mirrored as `maximum` in `schemas/experiment.schema.json`.
+pub const MAX_SAMPLES: u32 = 10_000;
 
 /// A declarative, typed experiment the runner can execute, journal, and replay.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]

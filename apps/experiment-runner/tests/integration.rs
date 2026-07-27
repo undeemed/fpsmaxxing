@@ -202,6 +202,26 @@ fn an_out_of_envelope_spec_is_refused_before_any_measurement() {
 }
 
 #[test]
+fn a_candidate_outside_the_policy_bound_is_refused_before_any_measurement() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // The broker's policy bound is only checked inside the lifecycle, which a
+    // rejected trial never reaches; measuring such a candidate first would
+    // aggregate errors past `u64::MAX`.
+    let error = run_trial(&mut plane, &spec_for(u64::MAX, 5.0, 80.0))
+        .expect_err("an out-of-policy candidate should be refused");
+    assert!(matches!(error, RunnerError::InvalidSpec(_)));
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused spec journals nothing"
+    );
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
 fn a_trial_record_from_an_unsupported_version_fails_closed() {
     let journal = NamedTempFile::new().expect("temp journal");
     let mut plane =
@@ -218,6 +238,18 @@ fn a_trial_record_from_an_unsupported_version_fails_closed() {
 
     let error = replay_trial(&plane, trial.id).expect_err("a future record should be refused");
     assert!(matches!(error, RunnerError::UnsupportedRecordVersion(2)));
+
+    // A future record that also reshaped a field must still report the version
+    // that wrote it, not an opaque decode error about the reshaped field.
+    payload["verdict"] = json!("promote");
+    plane
+        .amend_trial(trial.id, &payload)
+        .expect("trial should amend");
+    let error = replay_trial(&plane, trial.id).expect_err("a future record should be refused");
+    assert!(
+        matches!(error, RunnerError::UnsupportedRecordVersion(2)),
+        "expected a version error, got {error:?}"
+    );
 }
 
 #[test]

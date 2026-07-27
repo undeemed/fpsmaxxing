@@ -26,9 +26,15 @@
 //! full snapshot/preview/apply/verify/rollback lifecycle, while a
 //! [`Reject`](Decision::Reject) never mutates the knob, leaving the baseline
 //! untouched. The recorded [`LifecycleOutcome`] captures what happened.
+//!
+//! Measuring the candidate before it is applied is likewise specific to the
+//! pure stand-in model, whose samples depend only on the knob value. Real
+//! `PresentMon` or hardware telemetry cannot observe a candidate that was never
+//! written, so swapping it in means moving the candidate measurement inside the
+//! apply/lease window and running the evaluator gate after it.
 
 use fpsmaxxing_contracts::{Decision, ExperimentSpec, MAX_SAMPLES, MetricSample, Verdict};
-use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -254,10 +260,19 @@ pub fn run_trial(
 /// record cannot be decoded, or the record was written by an unsupported
 /// [`TRIAL_RECORD_VERSION`].
 pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, RunnerError> {
-    let record: TrialRecord = serde_json::from_value(plane.read_trial(id)?)?;
-    if record.schema_version != TRIAL_RECORD_VERSION {
-        return Err(RunnerError::UnsupportedRecordVersion(record.schema_version));
+    let payload = plane.read_trial(id)?;
+    // The version is read off the raw payload so a record whose fields this
+    // build cannot decode still reports the version that wrote it rather than a
+    // decode error that says nothing about why.
+    let version = payload
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or_default();
+    if version != TRIAL_RECORD_VERSION {
+        return Err(RunnerError::UnsupportedRecordVersion(version));
     }
+    let record: TrialRecord = serde_json::from_value(payload)?;
     let recomputed = evaluate(
         &record.baseline_samples,
         &record.candidate_samples,
@@ -270,12 +285,15 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
     })
 }
 
-/// Rejects a spec whose sample counts are unbounded or self-contradictory.
+/// Rejects a spec whose parameters are unbounded or self-contradictory.
 ///
-/// Sample counts arrive over the wire and size the measurement buffers, so they
-/// are checked against [`MAX_SAMPLES`] before any measurement work runs. A spec
-/// that asks for fewer counted samples than its own bounds require can never
-/// promote, so it is refused up front rather than measured and then rejected.
+/// Everything the measurement phase consumes arrives over the wire, so it is
+/// bounded before any measurement work runs: sample counts size the measurement
+/// buffers and are checked against [`MAX_SAMPLES`], and the candidate knob value
+/// drives the modeled metrics and is checked against [`MAX_MOCK_VALUE`], the
+/// same ceiling the broker policy enforces later in the lifecycle. A spec that
+/// asks for fewer counted samples than its own bounds require can never promote,
+/// so it is refused up front rather than measured and then rejected.
 fn validate(spec: &ExperimentSpec) -> Result<(), RunnerError> {
     let min_samples = spec.bounds.min_samples.get();
     for (label, count) in [
@@ -298,6 +316,12 @@ fn validate(spec: &ExperimentSpec) -> Result<(), RunnerError> {
                 "{label} is {count}, below the {min_samples} the bounds require"
             )));
         }
+    }
+    let value = candidate_value(spec)?;
+    if value > MAX_MOCK_VALUE {
+        return Err(RunnerError::InvalidSpec(format!(
+            "target value is {value}, above the {MAX_MOCK_VALUE} the policy allows"
+        )));
     }
     Ok(())
 }
@@ -328,14 +352,24 @@ mod tests {
     use fpsmaxxing_contracts::{ChangeRequest, DecisionBounds};
     use serde_json::json;
 
-    use super::{ExperimentSpec, MAX_SAMPLES, RunnerError, validate};
+    use super::{ExperimentSpec, MAX_MOCK_VALUE, MAX_SAMPLES, RunnerError, validate};
 
     fn spec(warmup: u32, baseline: u32, candidate: u32, min_samples: u32) -> ExperimentSpec {
+        spec_for_value(warmup, baseline, candidate, min_samples, 40)
+    }
+
+    fn spec_for_value(
+        warmup: u32,
+        baseline: u32,
+        candidate: u32,
+        min_samples: u32,
+        value: u64,
+    ) -> ExperimentSpec {
         ExperimentSpec {
             hypothesis: "raise mock.value".to_owned(),
             target: ChangeRequest {
                 capability_id: "mock.value".to_owned(),
-                parameters: json!({ "value": 40 }),
+                parameters: json!({ "value": value }),
                 lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
             },
             warmup_samples: warmup,
@@ -379,5 +413,22 @@ mod tests {
         // refused rather than measured first.
         assert!(rejection(&spec(2, 2, 5, 3)).contains("baseline_samples"));
         assert!(rejection(&spec(2, 5, 2, 3)).contains("candidate_samples"));
+    }
+
+    #[test]
+    fn rejects_a_candidate_value_above_the_policy_bound() {
+        // The broker only sees the value inside the lifecycle, which a rejected
+        // trial never reaches, so the measurement path bounds it itself.
+        assert!(validate(&spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE)).is_ok());
+        let message = rejection(&spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE + 1));
+        assert!(message.contains("target value"), "{message}");
+        assert!(rejection(&spec_for_value(2, 5, 5, 3, u64::MAX)).contains("target value"));
+    }
+
+    #[test]
+    fn rejects_a_target_without_an_unsigned_value() {
+        let mut spec = spec(2, 5, 5, 3);
+        spec.target.parameters = json!({ "value": "high" });
+        assert!(matches!(validate(&spec), Err(RunnerError::InvalidTarget)));
     }
 }

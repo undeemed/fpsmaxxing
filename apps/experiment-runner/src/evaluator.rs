@@ -77,7 +77,9 @@ pub fn evaluate(
 /// temperature and power fields report the worst (highest) observed value and
 /// errors are summed. Counting the divisor as an `f64` avoids a lossy
 /// integer-to-float cast without changing the result for realistic sample
-/// counts.
+/// counts. Samples may come from a journaled record this build did not write,
+/// so the error total saturates rather than overflowing: a saturated total is
+/// far above any ceiling and still rejects.
 fn summarize(samples: &[MetricSample]) -> MetricSummary {
     let mut sum_fps = 0.0_f64;
     let mut divisor = 0.0_f64;
@@ -89,7 +91,7 @@ fn summarize(samples: &[MetricSample]) -> MetricSummary {
         divisor += 1.0;
         max_temperature_c = max_temperature_c.max(sample.temperature_c);
         max_power_w = max_power_w.max(sample.power_w);
-        total_errors += sample.errors;
+        total_errors = total_errors.saturating_add(sample.errors);
     }
     MetricSummary {
         samples: samples.len() as u64,
@@ -202,6 +204,18 @@ mod tests {
         let verdict = evaluate(&baseline, &candidate, &bounds());
         assert_eq!(verdict.decision, Decision::Promote);
         assert_eq!(verdict.reason, VerdictReason::Promoted);
+    }
+
+    #[test]
+    fn an_error_total_beyond_u64_saturates_and_rejects() {
+        // Journaled samples can come from a record this build did not write, so
+        // aggregation must not overflow on hostile counts.
+        let baseline = samples(100.0, 60.0, 150.0, 0, 3);
+        let candidate = samples(140.0, 70.0, 180.0, u64::MAX, 3);
+        let verdict = evaluate(&baseline, &candidate, &bounds());
+        assert_eq!(verdict.candidate.total_errors, u64::MAX);
+        assert_eq!(verdict.decision, Decision::Reject);
+        assert_eq!(verdict.reason, VerdictReason::ErrorsExceeded);
     }
 
     #[test]

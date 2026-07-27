@@ -9,6 +9,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+/// Inclusive ceiling the bounded alpha policy enforces on `mock.value`.
+///
+/// The broker rejects any change above it. Callers that act on a value before
+/// the lifecycle runs - a runner measuring a candidate, for instance - check it
+/// against this constant so their envelope cannot drift from the policy's.
+pub const MAX_MOCK_VALUE: u64 = 100;
+
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -298,10 +305,10 @@ impl ControlPlane {
             .ok_or_else(|| {
                 ControlPlaneError::PolicyDenied("mock.value requires an unsigned value".to_owned())
             })?;
-        if value > 100 {
-            return Err(ControlPlaneError::PolicyDenied(
-                "mock.value is bounded to 0..=100".to_owned(),
-            ));
+        if value > MAX_MOCK_VALUE {
+            return Err(ControlPlaneError::PolicyDenied(format!(
+                "mock.value is bounded to 0..={MAX_MOCK_VALUE}"
+            )));
         }
         Ok(())
     }
