@@ -12,7 +12,8 @@
 //! broker-only) name a path, the socket and the journal live in an owner-only
 //! directory under `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited
 //! working directory. Wherever a path came from, it is held to the same bar
-//! before it is used: absolute, under a parent chain no other user can write.
+//! before it is used: absolute, directly inside a directory no other user can
+//! reach, under an ancestor chain no other user can write.
 //!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
@@ -73,8 +74,9 @@ Usage: fpsmaxxing-broker [--socket <path>] [--journal <path>]
 A flag wins over its environment variable. Unset, each falls back into an
 owner-only directory under $XDG_RUNTIME_DIR (or /run when it is unset, is not
 absolute, or the broker runs as root). Every path must be absolute and sit in
-an existing directory no other user can write, under a parent chain owned by
-the broker or root, or the broker refuses to start.";
+an existing directory owned by the broker or root that no other user can reach
+(mode 0700), itself under a chain of directories owned by the broker or root
+that no other user can write, or the broker refuses to start.";
 
     /// Environment override for `--socket`.
     const SOCKET_ENV: &str = "FPSMAXXING_BROKER_SOCKET";
@@ -99,6 +101,9 @@ the broker or root, or the broker refuses to start.";
 
     /// Bits that make a directory writable by group or world.
     const OTHER_WRITE_BITS: u32 = 0o022;
+
+    /// Bits that give any user but the owner access to a directory.
+    const OTHER_ACCESS_BITS: u32 = 0o077;
 
     /// The sticky bit: only an entry's owner may rename or remove it.
     const STICKY_BIT: u32 = 0o1000;
@@ -136,6 +141,17 @@ the broker or root, or the broker refuses to start.";
             /// The rejected argument, verbatim.
             argument: String,
         },
+        /// An argument is not valid UTF-8.
+        ///
+        /// A path variable is read as a raw `OsString`, but the command line is
+        /// matched against flag names, so a byte sequence that is not UTF-8 is
+        /// reported as the typed failure it is rather than aborting the process
+        /// mid-parse the way `env::args` would.
+        #[error("argument {argument} is not valid UTF-8")]
+        NotUnicode {
+            /// The rejected argument, with each invalid sequence replaced.
+            argument: String,
+        },
     }
 
     /// Socket and journal locations resolved from the command line.
@@ -157,7 +173,7 @@ the broker or root, or the broker refuses to start.";
     }
 
     pub async fn run() -> Result<(), Box<dyn Error>> {
-        let options = match parse_args(env::args().skip(1))? {
+        let options = match parse_args(env::args_os().skip(1))? {
             Invocation::Help => {
                 println!("{USAGE}");
                 return Ok(());
@@ -251,13 +267,14 @@ the broker or root, or the broker refuses to start.";
     /// vetted - the same vet the default directory gets.
     ///
     /// The directory that directly holds the entry is held to a stricter bar
-    /// than the ancestors above it: no other user may write it, sticky or not.
-    /// Sticky stops another user renaming or removing the broker's socket or
-    /// journal, but not creating that entry first in a shared directory like
-    /// `/tmp` and keeping ownership of the file a privileged broker then writes
-    /// every `apply-intent` record into. Higher up, creating an entry is not
-    /// the threat - swapping a vetted directory is - and sticky does prevent
-    /// that.
+    /// than the ancestors above it: owner access only, sticky or not. Sticky
+    /// stops another user renaming or removing the broker's socket or journal,
+    /// but not creating that entry first in a shared directory like `/tmp` and
+    /// keeping ownership of the file a privileged broker then writes every
+    /// `apply-intent` record into; and a merely traversable directory like
+    /// `/run` puts every local user in front of a socket whose own mode cannot
+    /// be pinned. Higher up, neither is the threat - swapping a vetted
+    /// directory is - and sticky does prevent that.
     ///
     /// # Errors
     ///
@@ -277,7 +294,7 @@ the broker or root, or the broker refuses to start.";
                     ),
                 )
             })?;
-        vet_directory(parent, broker_uid, Sticky::Insufficient)?;
+        vet_directory(parent, broker_uid, Bar::OwnerOnly)?;
         match parent.parent() {
             Some(above) => vet_ancestors(above, broker_uid),
             None => Ok(()),
@@ -304,21 +321,36 @@ the broker or root, or the broker refuses to start.";
             .create(true)
             .write(true)
             .mode(JOURNAL_FILE_MODE)
-            .open(path)?;
-        std::fs::set_permissions(path, Permissions::from_mode(JOURNAL_FILE_MODE))?;
+            .open(path)
+            .map_err(|error| named(path, "opened", &error))?;
+        restrict_to_owner(path)?;
         for suffix in JOURNAL_SIDE_SUFFIXES {
             let mut side = path.as_os_str().to_owned();
             side.push(suffix);
-            match std::fs::set_permissions(
-                Path::new(&side),
-                Permissions::from_mode(JOURNAL_FILE_MODE),
-            ) {
+            match restrict_to_owner(Path::new(&side)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Sets `path` to [`JOURNAL_FILE_MODE`], naming it on failure.
+    fn restrict_to_owner(path: &Path) -> io::Result<()> {
+        std::fs::set_permissions(path, Permissions::from_mode(JOURNAL_FILE_MODE))
+            .map_err(|error| named(path, "restricted", &error))
+    }
+
+    /// Names `path` in `error`, which `std`'s io errors never carry themselves.
+    ///
+    /// The broker takes three configurable paths, so a bare `Permission denied`
+    /// leaves an operator no way to tell which of them the start-up failed on.
+    fn named(path: &Path, action: &str, error: &io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!("{} cannot be {action}: {error}", path.display()),
+        )
     }
 
     /// Returns the broker's private directory, creating it when it is absent.
@@ -373,12 +405,14 @@ the broker or root, or the broker refuses to start.";
         let directory = base.join(PRIVATE_DIR_NAME);
         match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&directory) {
             Ok(()) => {
-                std::fs::set_permissions(&directory, Permissions::from_mode(PRIVATE_DIR_MODE))?;
+                std::fs::set_permissions(&directory, Permissions::from_mode(PRIVATE_DIR_MODE))
+                    .map_err(|error| named(&directory, "restricted", &error))?;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(named(&directory, "created", &error)),
         }
-        let metadata = std::fs::symlink_metadata(&directory)?;
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|error| named(&directory, "inspected", &error))?;
         if metadata.is_dir()
             && metadata.uid() == broker_uid
             && metadata.mode() & 0o777 == PRIVATE_DIR_MODE
@@ -395,23 +429,44 @@ the broker or root, or the broker refuses to start.";
         }
     }
 
-    /// Whether the sticky bit redeems a group- or world-writable directory.
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum Sticky {
-        /// Sticky is enough: only an entry's owner may rename or remove it, so
-        /// the directory below cannot be swapped for one the broker does not
-        /// own. This is how `/tmp` and similar shared roots are protected.
-        Redeems,
-        /// Sticky is not enough: it does not stop another user creating an
-        /// entry the broker is about to create itself, and the creator keeps
-        /// ownership of it.
-        Insufficient,
+    /// How much of a directory's mode the broker insists on.
+    #[derive(Clone, Copy)]
+    enum Bar {
+        /// The bar for a directory that directly holds the socket or the
+        /// journal: no other user may read, write, or traverse it. Traversal is
+        /// what puts a peer in front of the socket, and the socket's own mode
+        /// cannot be pinned, so the directory is the only place to deny it.
+        OwnerOnly,
+        /// The bar for an ancestor: no other user may write it, unless it is
+        /// sticky. The threat an ancestor carries is the swap of the directory
+        /// below it for one the broker does not own, and sticky - only an
+        /// entry's owner may rename or remove it - is exactly what prevents
+        /// that. This is how `/tmp` and similar shared roots are protected.
+        NoForeignWrite,
     }
 
-    /// Refuses a directory another user could tamper with.
+    impl Bar {
+        /// Whether `mode` gives some other user access this bar denies.
+        fn refuses(self, mode: u32) -> bool {
+            match self {
+                Self::OwnerOnly => mode & OTHER_ACCESS_BITS != 0,
+                Self::NoForeignWrite => mode & OTHER_WRITE_BITS != 0 && mode & STICKY_BIT == 0,
+            }
+        }
+
+        /// How the refusal reads to an operator.
+        fn requirement(self) -> &'static str {
+            match self {
+                Self::OwnerOnly => "no other user can reach",
+                Self::NoForeignWrite => "no other user can write",
+            }
+        }
+    }
+
+    /// Refuses a directory another user could tamper with or reach through.
     ///
     /// It must be a real directory - not a symlink - owned by the broker or by
-    /// root, and not writable by group or world unless `sticky` redeems it.
+    /// root, and closed to other users to whatever degree `bar` demands.
     ///
     /// # Errors
     ///
@@ -419,23 +474,17 @@ the broker or root, or the broker refuses to start.";
     /// bar, or the underlying error - named with the directory, since a path
     /// the broker will not create is the likeliest reason it cannot be
     /// inspected - if it cannot be inspected at all.
-    fn vet_directory(directory: &Path, broker_uid: u32, sticky: Sticky) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("{} cannot be inspected: {error}", directory.display()),
-            )
-        })?;
-        let mode = metadata.mode();
+    fn vet_directory(directory: &Path, broker_uid: u32, bar: Bar) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| named(directory, "inspected", &error))?;
         let owned_by_trusted_uid = metadata.uid() == broker_uid || metadata.uid() == ROOT_UID;
-        let redeemed = sticky == Sticky::Redeems && mode & STICKY_BIT != 0;
-        let writable_by_others = mode & OTHER_WRITE_BITS != 0 && !redeemed;
-        if !metadata.is_dir() || !owned_by_trusted_uid || writable_by_others {
+        if !metadata.is_dir() || !owned_by_trusted_uid || bar.refuses(metadata.mode()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{} must be a directory owned by uid {broker_uid} or root that no other user can write",
-                    directory.display()
+                    "{} must be a directory owned by uid {broker_uid} or root that {requirement} it",
+                    directory.display(),
+                    requirement = bar.requirement()
                 ),
             ));
         }
@@ -444,9 +493,8 @@ the broker or root, or the broker refuses to start.";
 
     /// Refuses a base whose own path another user could tamper with.
     ///
-    /// Every component from `base` up to `/` goes through [`vet_directory`],
-    /// where a sticky directory is sound: the threat an ancestor carries is the
-    /// swap of the directory below it, which sticky prevents.
+    /// Every component from `base` up to `/` goes through [`vet_directory`] at
+    /// [`Bar::NoForeignWrite`].
     ///
     /// # Errors
     ///
@@ -454,7 +502,7 @@ the broker or root, or the broker refuses to start.";
     /// fails, or the underlying error if a component cannot be inspected.
     fn vet_ancestors(base: &Path, broker_uid: u32) -> io::Result<()> {
         for ancestor in base.ancestors() {
-            vet_directory(ancestor, broker_uid, Sticky::Redeems)?;
+            vet_directory(ancestor, broker_uid, Bar::NoForeignWrite)?;
         }
         Ok(())
     }
@@ -478,17 +526,29 @@ the broker or root, or the broker refuses to start.";
     /// `--socket --journal /var/j.sqlite` is a mistyped command line rather than
     /// a socket literally named `--journal`. Use `--socket=--journal` to mean it.
     ///
+    /// Arguments arrive as `OsString`, so a byte sequence that is not UTF-8
+    /// becomes [`ArgError::NotUnicode`] rather than the mid-iteration panic
+    /// `env::args` would raise.
+    ///
     /// # Errors
     ///
-    /// Returns [`ArgError`] for an unrecognized argument, a repeated flag, or a
-    /// flag whose value is missing, empty, or another flag.
+    /// Returns [`ArgError`] for an argument that is not UTF-8 or is
+    /// unrecognized, a repeated flag, or a flag whose value is missing, empty,
+    /// or another flag.
     pub fn parse_args<I>(arguments: I) -> Result<Invocation, ArgError>
     where
-        I: IntoIterator<Item = String>,
+        I: IntoIterator<Item = OsString>,
     {
         let mut options = Options::default();
-        let mut arguments = arguments.into_iter();
+        let mut arguments = arguments.into_iter().map(|argument| {
+            argument
+                .into_string()
+                .map_err(|argument| ArgError::NotUnicode {
+                    argument: argument.to_string_lossy().into_owned(),
+                })
+        });
         while let Some(argument) = arguments.next() {
+            let argument = argument?;
             if HELP_FLAGS.contains(&argument.as_str()) {
                 return Ok(Invocation::Help);
             }
@@ -508,6 +568,7 @@ the broker or root, or the broker refuses to start.";
                 Some(value) => value,
                 None => arguments
                     .next()
+                    .transpose()?
                     .filter(|value| !looks_like_flag(value))
                     .ok_or_else(|| ArgError::MissingValue(flag.clone()))?,
             };
@@ -525,6 +586,7 @@ the broker or root, or the broker refuses to start.";
         use std::collections::BTreeSet;
         use std::ffi::{OsStr, OsString};
         use std::io;
+        use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::path::Path;
 
@@ -544,7 +606,7 @@ the broker or root, or the broker refuses to start.";
         const SESSION_UID: u32 = 1000;
 
         fn parse(arguments: &[&str]) -> Result<Invocation, ArgError> {
-            parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
+            parse_args(arguments.iter().map(OsString::from))
         }
 
         /// The [`Options`] a command line that asks for a run resolves to.
@@ -584,6 +646,17 @@ the broker or root, or the broker refuses to start.";
         fn chmod(path: &Path, mode: u32) {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .expect("mode should apply");
+        }
+
+        /// A temporary directory no other user can reach.
+        ///
+        /// `tempfile` honors the inherited umask, which typically leaves the
+        /// directory traversable - the one shape a directory that directly
+        /// holds the socket or the journal may not have.
+        fn owner_only_tempdir() -> tempfile::TempDir {
+            let directory = tempfile::tempdir().expect("temporary directory should exist");
+            chmod(directory.path(), PRIVATE_DIR_MODE);
+            directory
         }
 
         /// A path as the `String` a command-line flag would carry.
@@ -643,8 +716,25 @@ the broker or root, or the broker refuses to start.";
         }
 
         #[test]
+        fn a_non_utf8_argument_is_a_typed_error_not_a_panic() {
+            let invalid = OsString::from_vec(vec![b'/', 0xff, b'x']);
+            for arguments in [
+                vec![invalid.clone()],
+                vec![OsString::from("--socket"), invalid.clone()],
+            ] {
+                assert!(
+                    matches!(
+                        parse_args(arguments).expect_err("a non-UTF-8 argument must be refused"),
+                        ArgError::NotUnicode { .. }
+                    ),
+                    "a privileged daemon must fail with a named argument, not a panic"
+                );
+            }
+        }
+
+        #[test]
         fn the_journal_never_comes_from_the_gateway_environment() {
-            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let base = owner_only_tempdir();
             let uid = own_uid(base.path());
             let seen = RefCell::new(BTreeSet::new());
             let (socket, journal) = resolve_paths_from(
@@ -671,7 +761,7 @@ the broker or root, or the broker refuses to start.";
 
         #[test]
         fn explicit_flags_win_over_the_environment() {
-            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let base = owner_only_tempdir();
             let uid = own_uid(base.path());
             let seen = RefCell::new(BTreeSet::new());
             let options = Options {
@@ -691,7 +781,7 @@ the broker or root, or the broker refuses to start.";
 
         #[test]
         fn a_relative_path_from_the_environment_is_refused() {
-            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let base = owner_only_tempdir();
             let uid = own_uid(base.path());
             let options = Options {
                 journal: Some(path_string(&base.path().join("j.sqlite"))),
@@ -705,7 +795,7 @@ the broker or root, or the broker refuses to start.";
 
         #[test]
         fn a_path_from_the_environment_under_a_writable_parent_is_refused() {
-            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let outer = owner_only_tempdir();
             let uid = own_uid(outer.path());
             let reachable = outer.path().join("reachable");
             std::fs::create_dir(&reachable).expect("directory should create");
@@ -740,7 +830,7 @@ the broker or root, or the broker refuses to start.";
 
         #[test]
         fn a_sticky_directory_may_not_hold_the_socket_or_the_journal() {
-            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let outer = owner_only_tempdir();
             let uid = own_uid(outer.path());
             let shared = outer.path().join("shared");
             std::fs::create_dir(&shared).expect("directory should create");
@@ -780,8 +870,48 @@ the broker or root, or the broker refuses to start.";
         }
 
         #[test]
+        fn a_traversable_directory_may_not_hold_the_socket_or_the_journal() {
+            let outer = owner_only_tempdir();
+            let uid = own_uid(outer.path());
+            // The shape of /run: nobody else may write it, but everybody may
+            // traverse it, and the socket's own mode cannot be pinned.
+            let traversable = outer.path().join("run");
+            std::fs::create_dir(&traversable).expect("directory should create");
+            chmod(&traversable, 0o755);
+
+            for options in [
+                Options {
+                    socket: Some(path_string(&traversable.join("broker.sock"))),
+                    journal: Some(path_string(&outer.path().join("j.sqlite"))),
+                },
+                Options {
+                    socket: Some(path_string(&outer.path().join("b.sock"))),
+                    journal: Some(path_string(&traversable.join("j.sqlite"))),
+                },
+            ] {
+                let error = resolve_paths_from(options, uid, |_| None)
+                    .expect_err("a world-traversable parent must be refused");
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+
+            // Only the owner-only shape the broker's own default already has
+            // is accepted, even though the ancestor above it stays traversable.
+            let private = traversable.join(PRIVATE_DIR_NAME);
+            std::fs::create_dir(&private).expect("directory should create");
+            chmod(&private, PRIVATE_DIR_MODE);
+            let options = Options {
+                socket: Some(path_string(&private.join("broker.sock"))),
+                journal: Some(path_string(&private.join("j.sqlite"))),
+            };
+            let (socket, journal) = resolve_paths_from(options, uid, |_| None)
+                .expect("an owner-only directory under a traversable ancestor is sound");
+            assert_eq!(socket, private.join("broker.sock"));
+            assert_eq!(journal, private.join("j.sqlite"));
+        }
+
+        #[test]
         fn a_flag_path_is_vetted_the_same_way_as_the_environment() {
-            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let base = owner_only_tempdir();
             let uid = own_uid(base.path());
             let options = Options {
                 socket: Some("broker.sock".to_owned()),
