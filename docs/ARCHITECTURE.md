@@ -3,7 +3,8 @@
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
 The current read-only alpha implements the gateway, an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, and a deterministic experiment runner (`apps/experiment-runner`) that gates measured trials through an immutable evaluator, all wired to a single mock provider.
-The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker remains a scaffold.
+The privileged broker exposes that control plane over an authenticated local IPC boundary on the Linux-safe socket path (`apps/broker`, `crates/ipc`), and the independent watchdog restore path is implemented against the journal on the Linux-safe mock path (`apps/watchdog`).
+The gateway does not route through the broker yet - it still opens an in-process control plane of its own - so the two paths run side by side over separate journals.
 
 ## Processes
 
@@ -14,6 +15,11 @@ The unprivileged MCP server translates agent tool calls into typed capability re
 ### Broker
 
 The privileged Windows service accepts authenticated local requests from the gateway, revalidates policy, journals the transaction, and supervises provider sidecars. It exposes no raw command or memory primitive.
+
+`apps/broker` implements this on the Linux-safe path.
+It owns the control plane on a dedicated worker thread and serves exactly two operations - capability discovery and a bounded provider lifecycle - to authenticated local peers over the transport seam in `crates/ipc` (a Unix domain socket now, a Windows named pipe later).
+Three fail-closed checks guard the boundary: peer authentication before any request is read (a Linux `SO_PEERCRED` same-uid ACL, shaped so a Windows SID ACL can satisfy the same trait), a capability-catalog check that rejects raw shell, arbitrary Registry paths, and out-of-catalog ids, and single-owner-per-knob enforcement that refuses a second concurrent owner of a setting.
+Typed request and response messages live in `crates/contracts` with `schemas/*.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
 
 ### Watchdog
 

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/broker-request.schema.json",
+  "title": "FPSMaxxing broker request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["op"],
+  "properties": {
+    "op": { "enum": ["discover", "run-lifecycle"] },
+    "owner": { "type": "string", "minLength": 1 },
+    "change": { "$ref": "#/$defs/ChangeRequest" }
+  },
+  "$defs": {
+    "ChangeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "parameters", "lease_seconds"],
+      "properties": {
+        "capability_id": { "type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$" },
+        "parameters": { "type": "object" },
+        "lease_seconds": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

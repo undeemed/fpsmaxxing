@@ -1,5 +1,7 @@
 //! Versioned data contracts shared by `FPSMaxxing` applications and sidecars.
 
+pub mod ipc;
+
 use std::num::{NonZeroU32, NonZeroU64};
 
 use schemars::JsonSchema;

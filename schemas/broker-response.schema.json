@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/broker-response.schema.json",
+  "title": "FPSMaxxing broker response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome"],
+  "properties": {
+    "outcome": { "enum": ["capabilities", "lifecycle", "error"] },
+    "capabilities": { "$ref": "sidecar.schema.json" },
+    "lifecycle": { "$ref": "#/$defs/LifecycleReport" },
+    "error": { "$ref": "#/$defs/BrokerErrorBody" }
+  },
+  "$defs": {
+    "LifecycleReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "preview", "verified", "rolled_back"],
+      "properties": {
+        "provider_id": { "type": "string" },
+        "preview": { "type": "string" },
+        "verified": { "type": "boolean" },
+        "rolled_back": { "type": "boolean" }
+      }
+    },
+    "BrokerErrorBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unauthenticated",
+            "malformed",
+            "unknown-capability",
+            "policy-denied",
+            "owner-conflict",
+            "lifecycle-failed",
+            "internal"
+          ]
+        },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

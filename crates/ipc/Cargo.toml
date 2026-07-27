@@ -1,5 +1,5 @@
 [package]
-name = "fpsmaxxing-broker"
+name = "fpsmaxxing-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,15 +9,12 @@ publish = false
 
 [dependencies]
 fpsmaxxing-contracts.workspace = true
-fpsmaxxing-control-plane = { path = "../../crates/control-plane" }
-fpsmaxxing-ipc = { path = "../../crates/ipc" }
-fpsmaxxing-mock-provider = { path = "../../sidecars/mock-provider" }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util"] }
 
 [dev-dependencies]
-rusqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net"] }
 tempfile = "3"
 
 [lints]
