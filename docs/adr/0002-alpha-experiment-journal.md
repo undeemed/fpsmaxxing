@@ -24,8 +24,11 @@ The write-ahead apply intent makes a crash between mutation and journaling disti
 A per-stage two-phase protocol would duplicate that machinery for the mock-only alpha before the broker owns the transaction log.
 Trial records carry a `schema_version` so a future field addition is a version bump a reader can refuse rather than a silent misread of journaled history.
 The version gate only catches a writer that bumps it, so the record types also reject unknown fields: a row carrying a field this build does not know, under a version it does, means a divergent writer or a rewritten row and fails the replay rather than decoding with that field dropped.
-Replay re-runs the full run-time gate over the journaled spec as well - capability, sample counts, decision bounds, and candidate value - and cross-checks the record's redundant fields against that spec, because a coherently rewritten row re-evaluates to the verdict it carries and so is invisible to a verdict comparison alone.
+Replay re-runs the policy gate over the journaled spec as well - capability, sample counts, decision bounds, and candidate value - and cross-checks the record's redundant fields against that spec, because a rewritten row re-evaluates to the verdict it carries and so is invisible to a verdict comparison alone.
 A row whose thresholds were widened, whose target was pointed at a capability the measurement model never described, or whose samples contradict the counts its spec declared is reported as outside policy even when the recomputed verdict matches.
+That detection is structural only: replay checks the spec, the capability, the declared sample counts, the candidate value, and the baseline ceiling, but does not re-derive the recorded samples, so a rewrite of the measurements together with the verdict they imply passes both checks.
+Detecting a coherent rewrite of that kind requires anchoring each row outside itself - a signed or hash-chained journal - which is deliberately out of scope for the alpha.
+Replay reads the journaled capability against the constant the measurement model describes rather than the attached provider's manifest, so an archived journal audits the same way under any provider instead of raising a false tamper alarm.
 
 ## Consequences
 

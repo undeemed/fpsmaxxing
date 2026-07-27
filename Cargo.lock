@@ -116,6 +116,7 @@ dependencies = [
  "fpsmaxxing-contracts",
  "fpsmaxxing-control-plane",
  "fpsmaxxing-mock-provider",
+ "fpsmaxxing-provider-sdk",
  "serde",
  "serde_json",
  "tempfile",

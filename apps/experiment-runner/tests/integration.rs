@@ -11,11 +11,13 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use fpsmaxxing_contracts::{
-    ChangeRequest, Decision, DecisionBounds, ExperimentSpec, VerdictReason,
+    CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, Persistence,
+    ProviderManifest, RiskClass, StateSnapshot, VerdictReason,
 };
 use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, MAX_MOCK_VALUE};
 use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
+use fpsmaxxing_provider_sdk::{Provider, ProviderError};
 use serde_json::json;
 use tempfile::NamedTempFile;
 
@@ -50,6 +52,54 @@ fn spec_with_lease(
             max_power_w: 200.0,
             max_errors: 0,
         },
+    }
+}
+
+/// A provider that advertises a knob no journaled trial ever targeted, standing
+/// in for auditing an archived journal on a machine whose hardware has changed.
+struct ForeignProvider;
+
+impl Provider for ForeignProvider {
+    fn manifest(&self) -> ProviderManifest {
+        ProviderManifest {
+            id: "foreign".to_owned(),
+            protocol_version: NonZeroU32::MIN,
+            targets: vec![std::env::consts::OS.to_owned()],
+            capabilities: vec![CapabilityDescriptor {
+                id: "foreign.knob".to_owned(),
+                description: "A knob the measurement model never described".to_owned(),
+                risk: RiskClass::Reversible,
+                persistence: Persistence::Leased,
+                input_schema: json!({ "type": "object" }),
+            }],
+        }
+    }
+
+    fn snapshot(&self) -> Result<StateSnapshot, ProviderError> {
+        Ok(StateSnapshot {
+            provider_id: "foreign".to_owned(),
+            state: json!({ "knob": 0 }),
+        })
+    }
+
+    fn preview(&self, _request: &ChangeRequest) -> Result<String, ProviderError> {
+        Err(ProviderError::UnsupportedCapability(
+            "foreign.knob".to_owned(),
+        ))
+    }
+
+    fn apply(&mut self, _request: &ChangeRequest) -> Result<(), ProviderError> {
+        Err(ProviderError::UnsupportedCapability(
+            "foreign.knob".to_owned(),
+        ))
+    }
+
+    fn verify(&self, _request: &ChangeRequest) -> Result<bool, ProviderError> {
+        Ok(false)
+    }
+
+    fn rollback(&mut self, _snapshot: &StateSnapshot) -> Result<(), ProviderError> {
+        Ok(())
     }
 }
 
@@ -334,9 +384,16 @@ fn a_replay_reports_bounds_outside_the_policy_envelope() {
         "a temperature ceiling of 200 C is outside the policy envelope"
     );
 
+    // The auditor is told which gate tripped, not merely that one did.
+    let reason = outcome
+        .policy_reason
+        .expect("an illegal row carries a reason");
+    assert!(reason.contains("max_temperature_c"), "{reason}");
+
     // The trial as it was actually run stays legal.
     let outcome = replay_trial(&plane, trial.id).expect("replay trial");
     assert!(outcome.is_consistent() && outcome.policy_legal);
+    assert!(outcome.policy_reason.is_none());
 }
 
 #[test]
@@ -352,35 +409,55 @@ fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
     // run-time gate over the journaled spec instead, and cross-checks the
     // record against the spec it carries.
     let refused = [
-        ("a capability the model never described", {
-            let mut payload = recorded.clone();
-            payload["spec"]["target"]["capability_id"] = json!("gpu.core-clock-offset");
-            payload
-        }),
-        ("a candidate value above the policy ceiling", {
-            let mut payload = recorded.clone();
-            payload["spec"]["target"]["parameters"]["value"] = json!(MAX_MOCK_VALUE + 1);
-            payload["candidate_value"] = json!(MAX_MOCK_VALUE + 1);
-            payload
-        }),
-        ("a candidate value contradicting its own spec", {
-            let mut payload = recorded.clone();
-            payload["candidate_value"] = json!(41);
-            payload
-        }),
-        ("a baseline outside the policy envelope", {
-            let mut payload = recorded.clone();
-            payload["baseline_value"] = json!(MAX_MOCK_VALUE + 1);
-            payload
-        }),
-        ("fewer samples than the spec declared", {
-            let mut payload = recorded.clone();
-            payload["spec"]["candidate_samples"] = json!(4);
-            payload
-        }),
+        (
+            "a capability the model never described",
+            "unknown capability",
+            {
+                let mut payload = recorded.clone();
+                payload["spec"]["target"]["capability_id"] = json!("gpu.core-clock-offset");
+                payload
+            },
+        ),
+        (
+            "a candidate value above the policy ceiling",
+            "target value",
+            {
+                let mut payload = recorded.clone();
+                payload["spec"]["target"]["parameters"]["value"] = json!(MAX_MOCK_VALUE + 1);
+                payload["candidate_value"] = json!(MAX_MOCK_VALUE + 1);
+                payload
+            },
+        ),
+        (
+            "a candidate value contradicting its own spec",
+            "candidate_value",
+            {
+                let mut payload = recorded.clone();
+                payload["candidate_value"] = json!(41);
+                payload
+            },
+        ),
+        (
+            "a baseline outside the policy envelope",
+            "snapshot value",
+            {
+                let mut payload = recorded.clone();
+                payload["baseline_value"] = json!(MAX_MOCK_VALUE + 1);
+                payload
+            },
+        ),
+        (
+            "fewer samples than the spec declared",
+            "candidate_samples",
+            {
+                let mut payload = recorded.clone();
+                payload["spec"]["candidate_samples"] = json!(4);
+                payload
+            },
+        ),
     ];
 
-    for (rewrite, payload) in refused {
+    for (rewrite, expected_reason, payload) in refused {
         let tampered = plane
             .record_trial(&payload)
             .expect("a rewritten record should append");
@@ -390,11 +467,61 @@ fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
             "{rewrite} still reproduces the recorded verdict"
         );
         assert!(!outcome.policy_legal, "{rewrite} must replay as illegal");
+
+        // The reported reason names the gate that tripped, so an auditor is not
+        // left to re-derive which field was rewritten.
+        let reason = outcome
+            .policy_reason
+            .unwrap_or_else(|| panic!("{rewrite} must carry a reason"));
+        assert!(
+            reason.contains(expected_reason),
+            "{rewrite}: expected {expected_reason:?} in {reason:?}"
+        );
     }
 
     // The trial as it was actually run stays legal.
     let outcome = replay_trial(&plane, trial.id).expect("replay trial");
     assert!(outcome.is_consistent() && outcome.policy_legal);
+    assert!(outcome.policy_reason.is_none());
+}
+
+#[test]
+fn a_replay_does_not_depend_on_the_attached_provider() {
+    let journal = NamedTempFile::new().expect("temp journal");
+
+    let trial_id = {
+        let mut plane =
+            ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+        run_trial(&mut plane, &spec_for(40, 5.0, 80.0))
+            .expect("run trial")
+            .id
+    };
+
+    // The trial journal is a durable file that outlives the process that wrote
+    // it. Holding a historical row to what the provider attached now advertises
+    // would report every archived trial as tampered with, so replay checks the
+    // journaled capability against the one the measurement model describes.
+    let archived = ControlPlane::open(Box::new(ForeignProvider), journal.path()).expect("reopen");
+    let outcome = replay_trial(&archived, trial_id).expect("replay trial");
+
+    assert!(outcome.is_consistent());
+    assert!(
+        outcome.policy_legal,
+        "an untampered row must stay legal under any provider: {:?}",
+        outcome.policy_reason
+    );
+
+    // The run-time gate still refuses a trial that provider cannot serve.
+    let mut archived = archived;
+    let error =
+        run_trial(&mut archived, &spec_for(40, 5.0, 80.0)).expect_err("unknown hardware fails");
+    assert!(
+        matches!(
+            error,
+            RunnerError::ControlPlane(ControlPlaneError::UnknownCapability(_))
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

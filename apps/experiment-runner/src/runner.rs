@@ -71,6 +71,9 @@ pub enum RunnerError {
     /// The provider is sitting at a value outside the policy envelope.
     #[error("provider snapshot value is {0}, above the {MAX_MOCK_VALUE} the policy allows")]
     BaselineOutOfPolicy(u64),
+    /// A journaled trial record disagrees with the spec it carries.
+    #[error("journaled trial contradicts its own spec: {0}")]
+    InconsistentRecord(String),
     /// A journaled trial record was written by an unsupported record version.
     #[error("journaled trial uses unsupported record version {0}")]
     UnsupportedRecordVersion(u32),
@@ -179,7 +182,7 @@ pub struct StoredTrial {
 /// A replay is a tamper-detection read, so the outcome must be inspected:
 /// [`is_consistent`](Self::is_consistent) reports whether the recomputation
 /// agrees with the journal, and `policy_legal` reports whether the record is one
-/// the run-time gates would still accept.
+/// the policy gate would still accept.
 #[derive(Clone, Debug)]
 #[must_use]
 pub struct ReplayOutcome {
@@ -189,9 +192,14 @@ pub struct ReplayOutcome {
     pub recorded: Verdict,
     /// The verdict recomputed from the journaled samples and bounds.
     pub recomputed: Verdict,
-    /// Whether the journaled record passes every run-time gate and agrees with
-    /// the spec it carries; see [`replay_trial`].
+    /// Whether the journaled record passes the policy gate and agrees with the
+    /// spec it carries; see [`replay_trial`].
     pub policy_legal: bool,
+    /// Which gate the record tripped, absent when `policy_legal` holds.
+    ///
+    /// The gate produces a precise message naming the offending field, so a
+    /// flagged trial is diagnosable without re-deriving the cause by hand.
+    pub policy_reason: Option<String>,
 }
 
 impl ReplayOutcome {
@@ -282,10 +290,10 @@ pub fn run_trial(
 /// and recomputed verdicts for comparison. It consults no chat history and
 /// re-runs no workload.
 ///
-/// The journaled record is re-checked against the run-time gates as well, so a
-/// row that was rewritten after the fact is reported as `policy_legal = false`
-/// even when re-evaluating it reproduces the recorded verdict; see
-/// [`is_within_policy`].
+/// The journaled record is re-checked against the policy gate as well, so a row
+/// that was rewritten after the fact is reported as `policy_legal = false`, with
+/// the gate it tripped in `policy_reason`, even when re-evaluating it reproduces
+/// the recorded verdict; see [`check_policy`].
 ///
 /// # Errors
 ///
@@ -311,41 +319,104 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
         &record.candidate_samples,
         &record.spec.bounds,
     );
-    let policy_legal = is_within_policy(plane.capabilities(), &record);
+    let rejection = check_policy(&record).err();
     Ok(ReplayOutcome {
         trial_id: id,
         recorded: record.verdict,
         recomputed,
-        policy_legal,
+        policy_legal: rejection.is_none(),
+        policy_reason: rejection.map(|error| error.to_string()),
     })
 }
 
-/// Whether a journaled record is one the run-time gates would still accept.
+/// Checks a journaled record against the gate that admitted it.
 ///
-/// Replay is the tamper-detection read, so it re-runs the whole of [`validate`]
-/// over the journaled spec rather than only its bounds: a row whose capability,
-/// sample counts, decision bounds, or candidate value were rewritten is reported
-/// as illegal even though re-evaluating it reproduces the recorded verdict.
+/// Replay is the tamper-detection read, so it re-runs the whole of
+/// [`validate_spec`] over the journaled spec rather than only its bounds: a row
+/// whose capability, sample counts, decision bounds, or candidate value were
+/// rewritten is reported as illegal even though re-evaluating it reproduces the
+/// recorded verdict.
+///
+/// The attached provider's manifest is deliberately not consulted. A trial
+/// journal outlives the process that wrote it, so requiring the provider running
+/// now to still advertise the journaled capability would flag every archived row
+/// as tampered with. The capability is instead held to the constant the
+/// measurement model describes, which is the term that decided the run-time
+/// rejection anyway.
 ///
 /// The record's redundant self-describing fields are cross-checked against that
 /// spec as well. [`run_trial`] always journals the value it validated, exactly
 /// the sample counts the spec asked for, and a baseline inside the same
 /// [`MAX_MOCK_VALUE`] ceiling, so a record contradicting its own spec was not
-/// written by this runner - which comparing verdicts alone cannot detect,
-/// because samples and verdict can be rewritten together.
-fn is_within_policy(manifest: &ProviderManifest, record: &TrialRecord) -> bool {
-    let Ok(candidate_value) = validate(manifest, &record.spec) else {
-        return false;
-    };
-    candidate_value == record.candidate_value
-        && record.baseline_value <= MAX_MOCK_VALUE
-        && holds_declared_count(&record.baseline_samples, record.spec.baseline_samples)
-        && holds_declared_count(&record.candidate_samples, record.spec.candidate_samples)
+/// written by this runner.
+///
+/// Detection stops at that structural layer. The recorded samples are not
+/// re-derived, so a rewrite of the measurements together with the verdict they
+/// imply passes both this check and the verdict comparison; catching that needs
+/// each row anchored outside itself - a signed or hash-chained journal - which
+/// the alpha deliberately does not do.
+///
+/// # Errors
+///
+/// Returns the gate the record tripped, naming the offending field.
+fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
+    let candidate_value = validate_spec(&record.spec)?;
+    if candidate_value != record.candidate_value {
+        return Err(RunnerError::InconsistentRecord(format!(
+            "candidate_value is {}, but its spec asks for {candidate_value}",
+            record.candidate_value
+        )));
+    }
+    if record.baseline_value > MAX_MOCK_VALUE {
+        return Err(RunnerError::BaselineOutOfPolicy(record.baseline_value));
+    }
+    for (label, samples, declared) in [
+        (
+            "baseline_samples",
+            &record.baseline_samples,
+            record.spec.baseline_samples,
+        ),
+        (
+            "candidate_samples",
+            &record.candidate_samples,
+            record.spec.candidate_samples,
+        ),
+    ] {
+        if !holds_declared_count(samples, declared) {
+            return Err(RunnerError::InconsistentRecord(format!(
+                "{label} holds {} samples, but its spec declares {}",
+                samples.len(),
+                declared.get()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a recorded measurement set holds exactly the count its spec declared.
 fn holds_declared_count(samples: &[MetricSample], declared: NonZeroU32) -> bool {
     u32::try_from(samples.len()).is_ok_and(|counted| counted == declared.get())
+}
+
+/// Rejects a spec the attached provider cannot serve, then applies
+/// [`validate_spec`] and returns the validated candidate knob value.
+///
+/// The provider check belongs to the run-time path alone: a trial is about to
+/// drive a lifecycle against whatever provider is attached now, so a target that
+/// provider does not advertise must fail closed here. The broker refuses it too,
+/// but only inside the lifecycle, which a rejected trial never reaches - and by
+/// then a measurement would already have been journaled as an authoritative
+/// trial. Replay has no lifecycle to run and so applies [`validate_spec`] on its
+/// own; see [`check_policy`].
+fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, RunnerError> {
+    if !manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.id == spec.target.capability_id)
+    {
+        return Err(ControlPlaneError::UnknownCapability(spec.target.capability_id.clone()).into());
+    }
+    validate_spec(spec)
 }
 
 /// Rejects a spec whose parameters are unbounded or self-contradictory and
@@ -354,31 +425,26 @@ fn holds_declared_count(samples: &[MetricSample], declared: NonZeroU32) -> bool 
 /// Everything the measurement phase and the decision gate consume arrives over
 /// the wire, so all of it is bounded before any measurement work runs: the
 /// target must name the single capability the measurement model describes
-/// ([`MODELED_CAPABILITY_ID`](model::MODELED_CAPABILITY_ID)) and the accepted
-/// provider must advertise it, sample counts size the measurement buffers and
-/// are checked against [`MAX_SAMPLES`], the decision bounds are intersected with
-/// the policy envelope by [`validate_bounds`], and the candidate knob value
-/// drives the modeled metrics and is checked against [`MAX_MOCK_VALUE`], the
-/// same ceiling the broker policy enforces later in the lifecycle and the same
-/// one [`baseline_value`] holds the provider to. A spec that asks for fewer
-/// counted samples than its own bounds require can never promote, so it is
-/// refused up front rather than measured and then rejected. The validated value
-/// is returned so the measurement uses exactly what was bounded here.
+/// ([`MODELED_CAPABILITY_ID`](model::MODELED_CAPABILITY_ID)), sample counts size
+/// the measurement buffers and are checked against [`MAX_SAMPLES`], the decision
+/// bounds are intersected with the policy envelope by [`validate_bounds`], and
+/// the candidate knob value drives the modeled metrics and is checked against
+/// [`MAX_MOCK_VALUE`], the same ceiling the broker policy enforces later in the
+/// lifecycle and the same one [`baseline_value`] holds the provider to. A spec
+/// that asks for fewer counted samples than its own bounds require can never
+/// promote, so it is refused up front rather than measured and then rejected.
+/// The validated value is returned so the measurement uses exactly what was
+/// bounded here.
 ///
-/// The capability check is what keeps unknown hardware failing closed, and it
-/// is the model rather than the registry that decides what is known: the
+/// The capability check is what keeps unknown hardware failing closed, and it is
+/// the model rather than the registry that decides what is known: the
 /// measurement path is hard-wired to the mock knob, so advertising a second
-/// capability must not make it measurable. The broker refuses an unadvertised
-/// capability too, but only inside the lifecycle, which a rejected trial never
-/// reaches - and by then a measurement the model never described would already
-/// have been journaled as an authoritative trial.
-fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, RunnerError> {
-    let modeled = spec.target.capability_id == model::MODELED_CAPABILITY_ID;
-    let advertised = manifest
-        .capabilities
-        .iter()
-        .any(|capability| capability.id == spec.target.capability_id);
-    if !modeled || !advertised {
+/// capability must not make it measurable.
+///
+/// Nothing here reads process state, so [`replay_trial`] can re-run the whole of
+/// it over a journaled spec.
+fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
+    if spec.target.capability_id != model::MODELED_CAPABILITY_ID {
         return Err(ControlPlaneError::UnknownCapability(spec.target.capability_id.clone()).into());
     }
     validate_bounds(&spec.bounds)?;

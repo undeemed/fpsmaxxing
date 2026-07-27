@@ -16,6 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+fpsmaxxing-provider-sdk.workspace = true
 tempfile = "3"
 
 [lints]

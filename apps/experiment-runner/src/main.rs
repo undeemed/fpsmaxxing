@@ -6,10 +6,11 @@
 //! in-memory `SQLite` database, so the demo leaves nothing on disk.
 //!
 //! A replay that diverges from the journal means the record was tampered with
-//! or the immutable evaluator drifted, and a replay whose journaled bounds sit
-//! outside the policy envelope means the verdict was decided under thresholds
-//! policy never allowed. The demo exits non-zero on either rather than
-//! reporting it as a successful run.
+//! or the immutable evaluator drifted, and a replay the policy gate refuses -
+//! its capability, sample counts, decision bounds, candidate value, baseline
+//! ceiling, or the agreement between the record and the spec it carries - means
+//! the journaled row is not one this runner would have written. The demo exits
+//! non-zero on either rather than reporting it as a successful run.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -56,8 +57,9 @@ fn main() -> Result<ExitCode, RunnerError> {
     }
     if !replay.policy_legal {
         eprintln!(
-            "fpsmaxxing-experiment-runner: trial {} was decided under bounds outside the policy envelope",
-            replay.trial_id
+            "fpsmaxxing-experiment-runner: trial {} does not pass the policy gate replay re-applies: {}",
+            replay.trial_id,
+            replay.policy_reason.as_deref().unwrap_or("no reason given")
         );
         return Ok(ExitCode::FAILURE);
     }
