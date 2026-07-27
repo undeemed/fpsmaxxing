@@ -10,27 +10,29 @@ FPSMaxxing is an open-source Rust control plane for using an AI coding agent or 
 
 ## The closed loop
 
-FPSMaxxing is a closed feedback loop that tunes system and hardware performance through bounded, reversible experiments.
+FPSMaxxing is designed as a closed feedback loop that tunes system and hardware performance through bounded, reversible experiments.
 
 ```mermaid
 flowchart LR
     M["Measure<br/>FPS, latency,<br/>frametimes, thermals"]
     P["Policy engine<br/>decide bounded<br/>adjustment"]
     B["Broker<br/>apply via typed capability<br/>snapshot + TTL lease"]
-    W["Watchdog<br/>revert on regression<br/>or safety violation"]
     E["Evaluator<br/>keep or roll back"]
+    W["Watchdog<br/>out-of-band guard"]
     M --> P
     P --> B
-    B --> W
-    W --> E
+    B --> E
     E -->|iterate| M
+    B -.->|lease deadline| W
+    M -.->|regression or<br/>safety violation| W
+    W -.->|revert to snapshot| M
 ```
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
-The **privileged broker** applies that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-An **independent watchdog** owns the lease deadline and can restore the snapshot without the gateway, agent, or experiment runner whenever a regression or safety violation appears.
-The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides whether to keep the change or roll it back before the next iteration begins.
+The **privileged broker** is designed to apply that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+An **independent watchdog** will own the lease deadline and restore the snapshot without the gateway, agent, or experiment runner whenever a regression or safety violation appears.
+In the target design the loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides whether to keep the change or roll it back before the next iteration begins.
 
 ## Why FPSMaxxing?
 
