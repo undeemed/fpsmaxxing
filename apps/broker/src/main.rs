@@ -7,9 +7,11 @@
 //! Only the Unix domain socket transport is implemented; the Windows named-pipe
 //! transport is deliberately out of scope, so the binary refuses to run there.
 //!
-//! Unless `--socket`/`--journal` or their environment overrides name a path, the
-//! socket and the journal live in an owner-only directory under
-//! `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited working directory.
+//! Unless `--socket`/`--journal` or their environment overrides
+//! (`FPSMAXXING_BROKER_SOCKET` and `FPSMAXXING_BROKER_JOURNAL_PATH`, both
+//! broker-only) name a path, the socket and the journal live in an owner-only
+//! directory under `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited
+//! working directory.
 //!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
@@ -35,9 +37,10 @@ fn main() {
 mod unix {
     use std::env;
     use std::error::Error;
-    use std::fs::DirBuilder;
+    use std::ffi::OsStr;
+    use std::fs::{DirBuilder, Permissions};
     use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -50,14 +53,35 @@ mod unix {
     /// Flags this binary accepts, in `--help` order.
     const FLAGS: [&str; 2] = ["--socket", "--journal"];
 
+    /// Environment override for `--socket`.
+    const SOCKET_ENV: &str = "FPSMAXXING_BROKER_SOCKET";
+
+    /// Environment override for `--journal`.
+    ///
+    /// Deliberately distinct from the `FPSMAXXING_JOURNAL_PATH` the unprivileged
+    /// gateway and CLI read. Sharing that variable would let an operator who
+    /// exported it for the CLI silently move the privileged broker's audit
+    /// journal out of its owner-only directory and into a file the gateway is
+    /// writing concurrently.
+    const JOURNAL_ENV: &str = "FPSMAXXING_BROKER_JOURNAL_PATH";
+
     /// Directory the broker keeps its socket and journal in by default.
     const PRIVATE_DIR_NAME: &str = "fpsmaxxing";
 
-    /// Where [`PRIVATE_DIR_NAME`] lives when `XDG_RUNTIME_DIR` is unset.
+    /// Where [`PRIVATE_DIR_NAME`] lives when `XDG_RUNTIME_DIR` is not usable.
     const FALLBACK_RUNTIME_BASE: &str = "/run";
 
     /// The only mode the broker's private directory may have: owner access only.
     const PRIVATE_DIR_MODE: u32 = 0o700;
+
+    /// Bits that make a directory writable by group or world.
+    const OTHER_WRITE_BITS: u32 = 0o022;
+
+    /// The sticky bit: only an entry's owner may rename or remove it.
+    const STICKY_BIT: u32 = 0o1000;
+
+    /// The superuser, trusted to own any ancestor of the private directory.
+    const ROOT_UID: u32 = 0;
 
     /// Socket file name inside the broker's private directory.
     const DEFAULT_SOCKET_NAME: &str = "broker.sock";
@@ -126,12 +150,23 @@ mod unix {
     /// inherited working directory, so a privileged daemon never places its IPC
     /// endpoint or its durable audit journal somewhere it does not own.
     fn resolve_paths(options: Options, broker_uid: u32) -> io::Result<(PathBuf, PathBuf)> {
-        let socket = options
-            .socket
-            .or_else(|| env::var("FPSMAXXING_BROKER_SOCKET").ok());
-        let journal = options
-            .journal
-            .or_else(|| env::var("FPSMAXXING_JOURNAL_PATH").ok());
+        resolve_paths_from(options, broker_uid, |name| env::var(name).ok())
+    }
+
+    /// [`resolve_paths`] against an arbitrary environment lookup.
+    ///
+    /// Only [`SOCKET_ENV`] and [`JOURNAL_ENV`] are ever consulted; the broker
+    /// shares no path variable with the unprivileged gateway or CLI.
+    fn resolve_paths_from<F>(
+        options: Options,
+        broker_uid: u32,
+        lookup: F,
+    ) -> io::Result<(PathBuf, PathBuf)>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let socket = options.socket.or_else(|| lookup(SOCKET_ENV));
+        let journal = options.journal.or_else(|| lookup(JOURNAL_ENV));
         match (socket, journal) {
             (Some(socket), Some(journal)) => Ok((PathBuf::from(socket), PathBuf::from(journal))),
             (socket, journal) => {
@@ -148,25 +183,56 @@ mod unix {
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory cannot be created, is not a directory,
-    /// is not owned by `broker_uid`, or is not mode [`PRIVATE_DIR_MODE`] - a
-    /// parent another user may write is what makes the socket path raceable at
-    /// bind time and the journal readable, so an unsound one fails closed.
+    /// Returns an error if the directory or any of its ancestors is unsound;
+    /// see [`private_directory_in`].
     fn private_directory(broker_uid: u32) -> io::Result<PathBuf> {
-        let base = env::var_os("XDG_RUNTIME_DIR")
-            .map_or_else(|| PathBuf::from(FALLBACK_RUNTIME_BASE), PathBuf::from);
+        let base = runtime_base(env::var_os("XDG_RUNTIME_DIR").as_deref(), broker_uid);
         private_directory_in(&base, broker_uid)
+    }
+
+    /// Chooses the base directory [`PRIVATE_DIR_NAME`] is created under.
+    ///
+    /// `XDG_RUNTIME_DIR` is a session variable the broker inherits from whoever
+    /// started it, so it is honored only when it names an absolute path and only
+    /// for an unprivileged broker. A broker running as root ignores it outright:
+    /// root has no per-session runtime directory, and following an inherited one
+    /// would let the caller choose where a root-owned socket and audit journal
+    /// are created.
+    fn runtime_base(xdg_runtime_dir: Option<&OsStr>, broker_uid: u32) -> PathBuf {
+        if broker_uid == ROOT_UID {
+            return PathBuf::from(FALLBACK_RUNTIME_BASE);
+        }
+        xdg_runtime_dir
+            .map(PathBuf::from)
+            .filter(|base| base.is_absolute())
+            .unwrap_or_else(|| PathBuf::from(FALLBACK_RUNTIME_BASE))
     }
 
     /// Creates and vets [`PRIVATE_DIR_NAME`] under `base`.
     ///
+    /// `base` and every ancestor above it are vetted first, because a parent
+    /// another user may write is what makes the socket path raceable at bind
+    /// time and the journal readable: such a user could swap a vetted directory
+    /// for a symlink before the bind and steer a privileged broker's socket and
+    /// journal to a path of their choosing.
+    ///
     /// A directory the broker created is vetted too: the inherited umask can
-    /// strip bits from the requested mode, and the entry may already have been
-    /// something else.
+    /// strip bits from the requested mode - which is why the mode is reapplied
+    /// after a successful create - and the entry may already have been something
+    /// else.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, or if it is not a
+    /// directory owned by `broker_uid` with mode [`PRIVATE_DIR_MODE`], or if
+    /// [`vet_ancestors`] refuses the path it sits in.
     fn private_directory_in(base: &Path, broker_uid: u32) -> io::Result<PathBuf> {
+        vet_ancestors(base, broker_uid)?;
         let directory = base.join(PRIVATE_DIR_NAME);
         match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&directory) {
-            Ok(()) => {}
+            Ok(()) => {
+                std::fs::set_permissions(&directory, Permissions::from_mode(PRIVATE_DIR_MODE))?;
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
@@ -185,6 +251,38 @@ mod unix {
                 ),
             ))
         }
+    }
+
+    /// Refuses a base whose own path another user could tamper with.
+    ///
+    /// Every component from `base` up to `/` must be a real directory - not a
+    /// symlink - owned by the broker or by root, and must not be writable by
+    /// group or world unless it is sticky. Sticky is the one sound exception:
+    /// on such a directory only an entry's owner may rename or remove it, which
+    /// is exactly the swap this vet exists to prevent, and it is how `/tmp` and
+    /// similar shared roots are already protected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::PermissionDenied`] for the first component that
+    /// fails, or the underlying error if a component cannot be inspected.
+    fn vet_ancestors(base: &Path, broker_uid: u32) -> io::Result<()> {
+        for ancestor in base.ancestors() {
+            let metadata = std::fs::symlink_metadata(ancestor)?;
+            let mode = metadata.mode();
+            let owned_by_trusted_uid = metadata.uid() == broker_uid || metadata.uid() == ROOT_UID;
+            let writable_by_others = mode & OTHER_WRITE_BITS != 0 && mode & STICKY_BIT == 0;
+            if !metadata.is_dir() || !owned_by_trusted_uid || writable_by_others {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} must be a directory owned by uid {broker_uid} or root that no other user can write",
+                        ancestor.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Parses `--flag value` and `--flag=value` pairs, rejecting anything else.
@@ -233,16 +331,35 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
+        use std::cell::RefCell;
+        use std::collections::BTreeSet;
+        use std::ffi::OsStr;
         use std::io;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
 
         use super::{
-            ArgError, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, parse_args, private_directory_in,
+            ArgError, FALLBACK_RUNTIME_BASE, JOURNAL_ENV, Options, PRIVATE_DIR_MODE,
+            PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV, parse_args, private_directory_in,
+            resolve_paths_from, runtime_base,
         };
+
+        /// The variable the unprivileged gateway and CLI use for their journal.
+        const GATEWAY_JOURNAL_ENV: &str = "FPSMAXXING_JOURNAL_PATH";
+
+        /// An unprivileged uid, so `XDG_RUNTIME_DIR` is eligible at all.
+        const SESSION_UID: u32 = 1000;
 
         fn parse(arguments: &[&str]) -> Result<Options, ArgError> {
             parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
+        }
+
+        /// A lookup that answers every name and records which were asked for.
+        fn recording_lookup(seen: &RefCell<BTreeSet<String>>) -> impl Fn(&str) -> Option<String> {
+            move |name| {
+                seen.borrow_mut().insert(name.to_owned());
+                Some(format!("/from-env/{name}"))
+            }
         }
 
         /// The uid the test process creates files as, read from one it created.
@@ -309,6 +426,112 @@ mod unix {
                     .expect_err("a repeated flag must be refused"),
                 ArgError::Repeated(_)
             ));
+        }
+
+        #[test]
+        fn the_journal_never_comes_from_the_gateway_environment() {
+            let seen = RefCell::new(BTreeSet::new());
+            let (socket, journal) =
+                resolve_paths_from(Options::default(), SESSION_UID, recording_lookup(&seen))
+                    .expect("both paths come from the environment, so no directory is touched");
+
+            assert_eq!(socket, PathBuf::from(format!("/from-env/{SOCKET_ENV}")));
+            assert_eq!(journal, PathBuf::from(format!("/from-env/{JOURNAL_ENV}")));
+            assert_eq!(JOURNAL_ENV, "FPSMAXXING_BROKER_JOURNAL_PATH");
+            assert!(
+                !seen.borrow().contains(GATEWAY_JOURNAL_ENV),
+                "the privileged broker must not read the gateway's journal variable"
+            );
+            assert_eq!(
+                *seen.borrow(),
+                [SOCKET_ENV.to_owned(), JOURNAL_ENV.to_owned()]
+                    .into_iter()
+                    .collect()
+            );
+        }
+
+        #[test]
+        fn explicit_flags_win_over_the_environment() {
+            let seen = RefCell::new(BTreeSet::new());
+            let options = Options {
+                socket: Some("/run/b.sock".to_owned()),
+                journal: Some("/var/j.sqlite".to_owned()),
+            };
+            let (socket, journal) =
+                resolve_paths_from(options, SESSION_UID, recording_lookup(&seen))
+                    .expect("explicit flags need no directory");
+            assert_eq!(socket, PathBuf::from("/run/b.sock"));
+            assert_eq!(journal, PathBuf::from("/var/j.sqlite"));
+            assert!(
+                seen.borrow().is_empty(),
+                "a flag must not consult the environment at all"
+            );
+        }
+
+        #[test]
+        fn an_unusable_runtime_directory_falls_back_to_run() {
+            let fallback = Path::new(FALLBACK_RUNTIME_BASE);
+            assert_eq!(runtime_base(None, SESSION_UID), fallback);
+            assert_eq!(runtime_base(Some(OsStr::new("")), SESSION_UID), fallback);
+            assert_eq!(
+                runtime_base(Some(OsStr::new("run/user/1000")), SESSION_UID),
+                fallback,
+                "a relative runtime directory would resolve against the inherited cwd"
+            );
+            assert_eq!(
+                runtime_base(Some(OsStr::new("/run/user/1000")), SESSION_UID),
+                Path::new("/run/user/1000")
+            );
+        }
+
+        #[test]
+        fn a_privileged_broker_ignores_the_inherited_runtime_directory() {
+            assert_eq!(
+                runtime_base(Some(OsStr::new("/tmp/attacker-owned")), ROOT_UID),
+                Path::new(FALLBACK_RUNTIME_BASE),
+                "root must not follow a runtime directory its caller chose"
+            );
+        }
+
+        #[test]
+        fn a_base_under_a_writable_ancestor_is_refused() {
+            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(outer.path());
+            let base = outer.path().join("base");
+            std::fs::create_dir(&base).expect("base should create");
+            chmod(&base, PRIVATE_DIR_MODE);
+
+            // The base itself is sound; the directory holding it is not, so
+            // another user could swap the base for a symlink after the vet.
+            chmod(outer.path(), 0o777);
+            let error = private_directory_in(&base, uid)
+                .expect_err("a world-writable ancestor must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                !base.join(PRIVATE_DIR_NAME).exists(),
+                "nothing may be created under a refused ancestor"
+            );
+
+            // Restoring the ancestor, and making it sticky instead, both pass.
+            chmod(outer.path(), 0o755);
+            private_directory_in(&base, uid).expect("a sound ancestor chain is accepted");
+            chmod(outer.path(), 0o1777);
+            private_directory_in(&base, uid).expect("a sticky ancestor cannot be swapped");
+        }
+
+        #[test]
+        fn a_symlinked_base_is_refused() {
+            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(outer.path());
+            let target = outer.path().join("target");
+            std::fs::create_dir(&target).expect("target should create");
+            chmod(&target, PRIVATE_DIR_MODE);
+            let base = outer.path().join("base");
+            std::os::unix::fs::symlink(&target, &base).expect("symlink should create");
+
+            let error =
+                private_directory_in(&base, uid).expect_err("a symlinked base must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         }
 
         #[test]

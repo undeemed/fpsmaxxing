@@ -74,56 +74,65 @@ pub enum BrokerOutcome {
 }
 
 /// A response returned by the broker.
+///
+/// The `outcome` discriminator and the payload it names are one value, so a tag
+/// without its payload - or a tag paired with another variant's payload - is not
+/// representable and does not deserialize. A consumer therefore never has to
+/// unwrap a payload the protocol promises is present, and a malformed or
+/// version-skewed peer is refused at decode time rather than panicking a caller.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrokerResponse {
-    /// Which payload field is populated.
-    pub outcome: BrokerOutcome,
-    /// Present when `outcome` is `capabilities`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<ProviderManifest>,
-    /// Present when `outcome` is `lifecycle`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<LifecycleReport>,
-    /// Present when `outcome` is `error`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<BrokerErrorBody>,
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BrokerResponse {
+    /// The typed, policy-approved capability catalog.
+    Capabilities {
+        /// The catalog the broker advertises.
+        capabilities: ProviderManifest,
+    },
+    /// A completed provider lifecycle.
+    Lifecycle {
+        /// The auditable result of the lifecycle.
+        lifecycle: LifecycleReport,
+    },
+    /// A typed denial or failure.
+    Error {
+        /// Why the request was denied or failed.
+        error: BrokerErrorBody,
+    },
 }
 
 impl BrokerResponse {
     /// Builds a capability-catalog response.
     #[must_use]
-    pub fn capabilities(manifest: ProviderManifest) -> Self {
-        Self {
-            outcome: BrokerOutcome::Capabilities,
-            capabilities: Some(manifest),
-            lifecycle: None,
-            error: None,
+    pub const fn capabilities(manifest: ProviderManifest) -> Self {
+        Self::Capabilities {
+            capabilities: manifest,
         }
     }
 
     /// Builds a completed-lifecycle response.
     #[must_use]
-    pub fn lifecycle(report: LifecycleReport) -> Self {
-        Self {
-            outcome: BrokerOutcome::Lifecycle,
-            capabilities: None,
-            lifecycle: Some(report),
-            error: None,
-        }
+    pub const fn lifecycle(report: LifecycleReport) -> Self {
+        Self::Lifecycle { lifecycle: report }
     }
 
     /// Builds a typed error response.
     #[must_use]
     pub fn error(kind: BrokerErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            outcome: BrokerOutcome::Error,
-            capabilities: None,
-            lifecycle: None,
-            error: Some(BrokerErrorBody {
+        Self::Error {
+            error: BrokerErrorBody {
                 kind,
                 message: message.into(),
-            }),
+            },
+        }
+    }
+
+    /// Returns which payload this response carries.
+    #[must_use]
+    pub const fn outcome(&self) -> BrokerOutcome {
+        match self {
+            Self::Capabilities { .. } => BrokerOutcome::Capabilities,
+            Self::Lifecycle { .. } => BrokerOutcome::Lifecycle,
+            Self::Error { .. } => BrokerOutcome::Error,
         }
     }
 }
@@ -186,48 +195,43 @@ mod tests {
         LifecycleReport,
     };
     use crate::ChangeRequest;
+    use crate::test_support::{assert_same_shape, properties, string_set, wire_string};
 
     const REQUEST_SCHEMA: &str = include_str!("../../../schemas/broker-request.schema.json");
     const RESPONSE_SCHEMA: &str = include_str!("../../../schemas/broker-response.schema.json");
 
-    fn wire_string(value: impl serde::Serialize) -> String {
-        serde_json::to_value(value)
-            .expect("serialization should succeed")
-            .as_str()
-            .expect("enums should serialize to strings")
-            .to_owned()
+    fn request_schema() -> Value {
+        serde_json::from_str(REQUEST_SCHEMA).expect("request schema should parse")
     }
 
-    fn string_set(values: &Value) -> BTreeSet<String> {
-        values
+    fn response_schema() -> Value {
+        serde_json::from_str(RESPONSE_SCHEMA).expect("response schema should parse")
+    }
+
+    /// Indexes a tagged-union schema's `oneOf` branches by their `outcome` tag.
+    fn branches_by_tag(schema: &Value) -> BTreeSet<String> {
+        schema["oneOf"]
             .as_array()
-            .expect("schema field should be an array")
+            .expect("a tagged union should declare oneOf")
             .iter()
-            .map(|value| {
-                value
+            .map(|branch| {
+                branch["properties"]["outcome"]["const"]
                     .as_str()
-                    .expect("schema entries should be strings")
+                    .expect("every branch should pin its outcome tag")
                     .to_owned()
             })
             .collect()
     }
 
-    fn generated_properties(schema: &schemars::Schema) -> BTreeSet<String> {
-        serde_json::to_value(schema).expect("schema should serialize")["properties"]
-            .as_object()
-            .expect("schema should declare properties")
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    fn schema_properties(schema: &Value) -> BTreeSet<String> {
-        schema["properties"]
-            .as_object()
-            .expect("schema should declare properties")
-            .keys()
-            .cloned()
-            .collect()
+    /// Returns the `oneOf` branch a tagged-union schema gives to `tag`.
+    fn branch(schema: &Value, tag: &str) -> Value {
+        schema["oneOf"]
+            .as_array()
+            .expect("a tagged union should declare oneOf")
+            .iter()
+            .find(|branch| branch["properties"]["outcome"]["const"] == json!(tag))
+            .unwrap_or_else(|| panic!("the schema should declare a {tag} branch"))
+            .clone()
     }
 
     fn sample_change() -> ChangeRequest {
@@ -235,6 +239,15 @@ mod tests {
             capability_id: "mock.value".to_owned(),
             parameters: json!({ "value": 42 }),
             lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
+        }
+    }
+
+    fn sample_report() -> LifecycleReport {
+        LifecycleReport {
+            provider_id: "mock".to_owned(),
+            preview: "set mock.value from 0 to 42".to_owned(),
+            verified: true,
+            rolled_back: true,
         }
     }
 
@@ -265,19 +278,16 @@ mod tests {
         );
         assert_eq!(wire_string(BrokerErrorKind::Internal), "internal");
 
-        let request: Value =
-            serde_json::from_str(REQUEST_SCHEMA).expect("request schema should parse");
         assert_eq!(
-            string_set(&request["properties"]["op"]["enum"]),
+            string_set(&request_schema()["properties"]["op"]["enum"]),
             [BrokerOp::Discover, BrokerOp::RunLifecycle]
                 .map(wire_string)
                 .into_iter()
                 .collect()
         );
-        let response: Value =
-            serde_json::from_str(RESPONSE_SCHEMA).expect("response schema should parse");
+        let response = response_schema();
         assert_eq!(
-            string_set(&response["properties"]["outcome"]["enum"]),
+            branches_by_tag(&response),
             [
                 BrokerOutcome::Capabilities,
                 BrokerOutcome::Lifecycle,
@@ -306,30 +316,76 @@ mod tests {
 
     #[test]
     fn request_fields_match_schema() {
-        let schema: Value =
-            serde_json::from_str(REQUEST_SCHEMA).expect("request schema should parse");
-        let generated = schemars::schema_for!(BrokerRequest);
-        assert_eq!(generated_properties(&generated), schema_properties(&schema));
-        assert_eq!(
-            string_set(&serde_json::to_value(&generated).expect("schema serializes")["required"]),
-            string_set(&schema["required"])
-        );
+        let schema = request_schema();
+        assert_same_shape(&schemars::schema_for!(BrokerRequest), &schema);
         assert_eq!(schema["required"], json!(["op"]));
         assert_eq!(schema["additionalProperties"], json!(false));
     }
 
     #[test]
-    fn response_fields_match_schema() {
-        let schema: Value =
-            serde_json::from_str(RESPONSE_SCHEMA).expect("response schema should parse");
-        let generated = schemars::schema_for!(BrokerResponse);
-        assert_eq!(generated_properties(&generated), schema_properties(&schema));
-        assert_eq!(
-            string_set(&serde_json::to_value(&generated).expect("schema serializes")["required"]),
-            string_set(&schema["required"])
+    fn response_variants_match_schema() {
+        let schema = response_schema();
+        let generated = serde_json::to_value(schemars::schema_for!(BrokerResponse))
+            .expect("generated schema should serialize");
+        assert_eq!(branches_by_tag(&generated), branches_by_tag(&schema));
+        for tag in branches_by_tag(&schema) {
+            let generated = branch(&generated, &tag);
+            let checked_in = branch(&schema, &tag);
+            assert_eq!(properties(&generated), properties(&checked_in), "{tag}");
+            assert_eq!(
+                string_set(&generated["required"]),
+                string_set(&checked_in["required"]),
+                "{tag}"
+            );
+            assert_eq!(checked_in["additionalProperties"], json!(false), "{tag}");
+            assert!(
+                string_set(&checked_in["required"]).contains("outcome"),
+                "{tag} must require its own tag"
+            );
+        }
+    }
+
+    #[test]
+    fn change_request_fields_match_request_schema_defs() {
+        assert_same_shape(
+            &schemars::schema_for!(ChangeRequest),
+            &request_schema()["$defs"]["ChangeRequest"],
         );
-        assert_eq!(schema["required"], json!(["outcome"]));
-        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn lifecycle_report_fields_match_response_schema_defs() {
+        assert_same_shape(
+            &schemars::schema_for!(LifecycleReport),
+            &response_schema()["$defs"]["LifecycleReport"],
+        );
+    }
+
+    #[test]
+    fn error_body_fields_match_response_schema_defs() {
+        assert_same_shape(
+            &schemars::schema_for!(BrokerErrorBody),
+            &response_schema()["$defs"]["BrokerErrorBody"],
+        );
+    }
+
+    #[test]
+    fn change_request_parameters_are_an_object_in_both() {
+        assert_eq!(
+            request_schema()["$defs"]["ChangeRequest"]["properties"]["parameters"]["type"],
+            json!("object")
+        );
+        let generated = serde_json::to_value(schemars::schema_for!(ChangeRequest))
+            .expect("generated schema should serialize");
+        assert_eq!(
+            generated["properties"]["parameters"]["type"],
+            json!("object")
+        );
+
+        let mut serialized =
+            serde_json::to_value(sample_change()).expect("change should serialize");
+        serialized["parameters"] = json!("value=42");
+        assert!(serde_json::from_value::<ChangeRequest>(serialized).is_err());
     }
 
     #[test]
@@ -349,6 +405,30 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_without_its_payload_is_not_representable() {
+        for tag in ["capabilities", "lifecycle", "error"] {
+            assert!(
+                serde_json::from_value::<BrokerResponse>(json!({ "outcome": tag })).is_err(),
+                "{tag} must not deserialize without its payload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mismatched_tag_and_payload_is_not_representable() {
+        let report = serde_json::to_value(sample_report()).expect("report should serialize");
+        for tag in ["capabilities", "error"] {
+            assert!(
+                serde_json::from_value::<BrokerResponse>(
+                    json!({ "outcome": tag, "lifecycle": report })
+                )
+                .is_err(),
+                "{tag} must not deserialize carrying a lifecycle report"
+            );
+        }
+    }
+
+    #[test]
     fn requests_round_trip() {
         for request in [
             BrokerRequest::discover(),
@@ -363,18 +443,16 @@ mod tests {
 
     #[test]
     fn responses_round_trip() {
-        let report = LifecycleReport {
-            provider_id: "mock".to_owned(),
-            preview: "set mock.value from 0 to 42".to_owned(),
-            verified: true,
-            rolled_back: true,
-        };
         let responses = [
-            BrokerResponse::lifecycle(report),
+            BrokerResponse::lifecycle(sample_report()),
             BrokerResponse::error(BrokerErrorKind::OwnerConflict, "held by owner-a"),
         ];
         for response in responses {
             let serialized = serde_json::to_value(&response).expect("response should serialize");
+            assert_eq!(
+                serialized["outcome"],
+                json!(wire_string(response.outcome()))
+            );
             let deserialized: BrokerResponse =
                 serde_json::from_value(serialized).expect("response should deserialize");
             assert_eq!(response, deserialized);

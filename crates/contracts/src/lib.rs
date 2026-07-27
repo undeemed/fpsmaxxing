@@ -1,11 +1,13 @@
 //! Versioned data contracts shared by `FPSMaxxing` applications and sidecars.
 
 pub mod ipc;
+#[cfg(test)]
+mod test_support;
 
 use std::num::{NonZeroU32, NonZeroU64};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// The safety classification attached to a capability or requested change.
@@ -84,12 +86,31 @@ pub const MAX_LEASE_SECONDS: u64 = 300;
 pub struct ChangeRequest {
     /// Capability being invoked.
     pub capability_id: String,
-    /// Capability-specific parameters.
+    /// Capability-specific parameters; always a JSON object.
+    #[serde(deserialize_with = "object_parameters")]
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub parameters: Value,
     /// Automatic rollback deadline in seconds; every mutation carries a
     /// non-zero TTL lease, at most [`MAX_LEASE_SECONDS`].
     #[schemars(range(max = MAX_LEASE_SECONDS))]
     pub lease_seconds: NonZeroU64,
+}
+
+/// Accepts only a JSON object for [`ChangeRequest::parameters`].
+///
+/// Capability parameters are always named, and the checked-in schemas type the
+/// field as an object. Without this the Rust type would accept a bare scalar or
+/// array that every schema validator on the same wire would reject.
+fn object_parameters<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let parameters = Value::deserialize(deserializer)?;
+    if parameters.is_object() {
+        Ok(parameters)
+    } else {
+        Err(serde::de::Error::custom("parameters must be a JSON object"))
+    }
 }
 
 /// Opaque provider state captured before a change.
@@ -302,34 +323,13 @@ mod tests {
         MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict,
         VerdictReason,
     };
+    use crate::test_support::{properties, serialized_fields, string_set, wire_string};
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
     const SIDECAR_SCHEMA: &str = include_str!("../../../schemas/sidecar.schema.json");
     const EXPERIMENT_SCHEMA: &str = include_str!("../../../schemas/experiment.schema.json");
     const VERDICT_SCHEMA: &str = include_str!("../../../schemas/verdict.schema.json");
     const METRIC_SAMPLE_SCHEMA: &str = include_str!("../../../schemas/metric-sample.schema.json");
-
-    fn wire_string(value: impl serde::Serialize) -> String {
-        serde_json::to_value(value)
-            .expect("serialization should succeed")
-            .as_str()
-            .expect("enums should serialize to strings")
-            .to_owned()
-    }
-
-    fn string_set(values: &Value) -> BTreeSet<String> {
-        values
-            .as_array()
-            .expect("schema field should be an array")
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .expect("schema entries should be strings")
-                    .to_owned()
-            })
-            .collect()
-    }
 
     fn sample_capability() -> CapabilityDescriptor {
         CapabilityDescriptor {
@@ -396,22 +396,8 @@ mod tests {
     fn capability_fields_match_capability_schema() {
         let schema: Value =
             serde_json::from_str(CAPABILITY_SCHEMA).expect("capability schema should parse");
-        let serialized =
-            serde_json::to_value(sample_capability()).expect("capability should serialize");
-        let fields: BTreeSet<String> = serialized
-            .as_object()
-            .expect("capability should serialize to an object")
-            .keys()
-            .cloned()
-            .collect();
-
-        let properties: BTreeSet<String> = schema["properties"]
-            .as_object()
-            .expect("schema should declare properties")
-            .keys()
-            .cloned()
-            .collect();
-        assert_eq!(fields, properties);
+        let fields = serialized_fields(sample_capability());
+        assert_eq!(fields, properties(&schema));
         assert_eq!(fields, string_set(&schema["required"]));
         assert_eq!(schema["additionalProperties"], json!(false));
     }
@@ -420,22 +406,8 @@ mod tests {
     fn manifest_fields_match_sidecar_schema() {
         let schema: Value =
             serde_json::from_str(SIDECAR_SCHEMA).expect("sidecar schema should parse");
-        let serialized =
-            serde_json::to_value(sample_manifest()).expect("manifest should serialize");
-        let fields: BTreeSet<String> = serialized
-            .as_object()
-            .expect("manifest should serialize to an object")
-            .keys()
-            .cloned()
-            .collect();
-
-        let properties: BTreeSet<String> = schema["properties"]
-            .as_object()
-            .expect("schema should declare properties")
-            .keys()
-            .cloned()
-            .collect();
-        assert_eq!(fields, properties);
+        let fields = serialized_fields(sample_manifest());
+        assert_eq!(fields, properties(&schema));
         assert_eq!(fields, string_set(&schema["required"]));
         assert_eq!(schema["additionalProperties"], json!(false));
     }
@@ -499,6 +471,21 @@ mod tests {
             generated["$defs"]["ChangeRequest"]["properties"]["lease_seconds"]["maximum"],
             json!(MAX_LEASE_SECONDS)
         );
+    }
+
+    #[test]
+    fn non_object_parameters_are_rejected_like_the_schema() {
+        for parameters in [json!("value=1"), json!(1), json!([1]), json!(null)] {
+            let serialized = json!({
+                "capability_id": "mock.value",
+                "parameters": parameters,
+                "lease_seconds": 1
+            });
+            assert!(
+                serde_json::from_value::<ChangeRequest>(serialized).is_err(),
+                "{parameters} must not deserialize as capability parameters"
+            );
+        }
     }
 
     /// Asserts that two object schemas declare the same fields.

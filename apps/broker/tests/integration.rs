@@ -138,11 +138,17 @@ fn journal_stages(journal: &Path) -> Vec<String> {
 }
 
 fn expect_error(response: &BrokerResponse) -> BrokerErrorKind {
-    response
-        .error
-        .as_ref()
-        .expect("response should carry a typed error")
-        .kind
+    match response {
+        BrokerResponse::Error { error } => error.kind,
+        other => panic!("expected a typed error, got {other:?}"),
+    }
+}
+
+fn expect_capabilities(response: BrokerResponse) -> ProviderManifest {
+    match response {
+        BrokerResponse::Capabilities { capabilities } => capabilities,
+        other => panic!("expected the capability catalog, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -156,22 +162,18 @@ async fn client_runs_a_journaled_lifecycle_over_the_socket() {
         .request(&BrokerRequest::discover())
         .await
         .expect("discover should respond");
-    assert_eq!(discover.outcome, BrokerOutcome::Capabilities);
-    let manifest = discover
-        .capabilities
-        .expect("capabilities should be present");
+    let manifest = expect_capabilities(discover);
     assert!(manifest.capabilities.iter().any(|c| c.id == "mock.value"));
 
     let lifecycle = client
         .request(&BrokerRequest::run_lifecycle("gateway", change(42)))
         .await
         .expect("lifecycle should respond");
-    assert_eq!(lifecycle.outcome, BrokerOutcome::Lifecycle);
-    let report = lifecycle
-        .lifecycle
-        .expect("lifecycle report should be present");
-    assert_eq!(report.provider_id, "mock");
-    assert!(report.verified && report.rolled_back);
+    let BrokerResponse::Lifecycle { lifecycle } = lifecycle else {
+        panic!("a completed lifecycle should answer with its report");
+    };
+    assert_eq!(lifecycle.provider_id, "mock");
+    assert!(lifecycle.verified && lifecycle.rolled_back);
 
     assert_eq!(
         journal_stages(&broker.journal),
@@ -230,7 +232,7 @@ async fn second_owner_of_a_held_knob_is_refused() {
         .request(&BrokerRequest::run_lifecycle("owner-b", change(7)))
         .await
         .expect("released knob should respond");
-    assert_eq!(granted.outcome, BrokerOutcome::Lifecycle);
+    assert_eq!(granted.outcome(), BrokerOutcome::Lifecycle);
 }
 
 #[tokio::test]
@@ -260,7 +262,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .expect("a response should read")
         .expect("the connection should survive one bad frame");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(response.outcome, BrokerOutcome::Capabilities);
+    assert_eq!(response.outcome(), BrokerOutcome::Capabilities);
 
     // An oversized declared length is refused without allocation.
     let mut stream = UnixStream::connect(&broker.socket)
@@ -301,7 +303,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .expect("a response should read")
         .expect("the connection should survive an empty frame");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(response.outcome, BrokerOutcome::Capabilities);
+    assert_eq!(response.outcome(), BrokerOutcome::Capabilities);
 
     // A brand-new client still works, proving the broker never crashed.
     let mut client = BrokerClient::connect(&broker.socket)
@@ -311,7 +313,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .request(&BrokerRequest::discover())
         .await
         .expect("discover should respond");
-    assert_eq!(discover.outcome, BrokerOutcome::Capabilities);
+    assert_eq!(discover.outcome(), BrokerOutcome::Capabilities);
 }
 
 #[tokio::test]
@@ -332,7 +334,7 @@ async fn concurrent_connections_are_capped_and_the_slot_is_returned() {
         .request(&BrokerRequest::discover())
         .await
         .expect("an in-cap client should be served");
-    assert_eq!(served.outcome, BrokerOutcome::Capabilities);
+    assert_eq!(served.outcome(), BrokerOutcome::Capabilities);
 
     // The kernel completes this connect, but the broker must not serve it yet.
     // The request is written once so the retry below cannot desynchronize it.
@@ -358,7 +360,7 @@ async fn concurrent_connections_are_capped_and_the_slot_is_returned() {
         .expect("a response should read")
         .expect("the queued peer should be served");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(response.outcome, BrokerOutcome::Capabilities);
+    assert_eq!(response.outcome(), BrokerOutcome::Capabilities);
 }
 
 #[tokio::test]

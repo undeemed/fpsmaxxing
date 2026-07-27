@@ -62,8 +62,41 @@ pub const MAX_CONNECTIONS: usize = 32;
 /// connection slot in `write_all` forever.
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a peer refused by the ACL has to take its rejection frame.
+///
+/// A refused peer has not authenticated, so it must not inherit
+/// [`CONNECTION_IDLE_TIMEOUT`]: one that never reads would otherwise hold its
+/// connection slot for the whole idle budget, and a loop of them could exhaust
+/// [`MAX_CONNECTIONS`] before any peer has authenticated. A local peer that is
+/// reading takes a rejection frame from the socket buffer immediately, so this
+/// is generous for the legitimate case and cheap for the hostile one.
+pub const REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Pause after a per-connection accept failure, so a repeated one cannot spin.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Longest run of client-supplied text echoed back in an error message.
+///
+/// Text the client chose is bounded only by [`fpsmaxxing_ipc::MAX_FRAME_BYTES`]
+/// on the way in. Echoed verbatim it would push the response past that same
+/// limit, `write_frame` would refuse it, and the peer would get a dropped
+/// connection instead of the typed error this boundary promises.
+const MAX_ECHOED_BYTES: usize = 120;
+
+/// Shortens client-supplied text to [`MAX_ECHOED_BYTES`] for an error message.
+///
+/// Every message built from something the client sent goes through this, so no
+/// single echo site has to remember the frame limit.
+fn echoed(text: &str) -> String {
+    if text.len() <= MAX_ECHOED_BYTES {
+        return text.to_owned();
+    }
+    let cut = (0..=MAX_ECHOED_BYTES)
+        .rev()
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or_default();
+    format!("{}...", &text[..cut])
+}
 
 /// The request handler at the trusted end of the IPC boundary.
 ///
@@ -133,13 +166,19 @@ impl BrokerService {
         if !self.catalog.contains(&change.capability_id) {
             return BrokerResponse::error(
                 BrokerErrorKind::UnknownCapability,
-                format!("capability {} is not in the catalog", change.capability_id),
+                format!(
+                    "capability {} is not in the catalog",
+                    echoed(&change.capability_id)
+                ),
             );
         }
         let _guard = match self.ledger.acquire(&change.capability_id, &owner) {
             Ok(guard) => guard,
             Err(conflict) => {
-                return BrokerResponse::error(BrokerErrorKind::OwnerConflict, conflict.to_string());
+                return BrokerResponse::error(
+                    BrokerErrorKind::OwnerConflict,
+                    echoed(&conflict.to_string()),
+                );
             }
         };
         let outcome = self.plane.borrow_mut().run_lifecycle(&change);
@@ -161,18 +200,20 @@ impl BrokerService {
 /// disagree about whether a variant is client-caused when a new one is added.
 ///
 /// Only the two client-caused variants describe the caller's own request, so
-/// only they are forwarded verbatim. Every other variant wraps a `SQLite`,
-/// serialization, or provider error whose `Display` can carry journal paths and
-/// other host detail, which [`fpsmaxxing_contracts::ipc::BrokerErrorBody`]
-/// promises never to expose: those are reduced to the stable machine-readable
-/// stage kind and the full error is traced locally instead.
+/// only they are forwarded, and then only through [`echoed`] because they can
+/// quote the request back. Every other variant wraps a `SQLite`, serialization,
+/// or provider error whose `Display` can carry journal paths and other host
+/// detail, which [`fpsmaxxing_contracts::ipc::BrokerErrorBody`] promises never
+/// to expose: those are reduced to the stable machine-readable stage kind and
+/// the full error is traced locally instead.
 fn wire_error(error: &ControlPlaneError) -> BrokerResponse {
     match error {
-        ControlPlaneError::UnknownCapability(_) => {
-            BrokerResponse::error(BrokerErrorKind::UnknownCapability, error.to_string())
-        }
+        ControlPlaneError::UnknownCapability(_) => BrokerResponse::error(
+            BrokerErrorKind::UnknownCapability,
+            echoed(&error.to_string()),
+        ),
         ControlPlaneError::PolicyDenied(_) => {
-            BrokerResponse::error(BrokerErrorKind::PolicyDenied, error.to_string())
+            BrokerResponse::error(BrokerErrorKind::PolicyDenied, echoed(&error.to_string()))
         }
         _ => {
             eprintln!("fpsmaxxing-broker: lifecycle failed: {error}");
@@ -356,6 +397,10 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
 
 /// Authenticates one peer, then serves its framed requests until it goes away.
 ///
+/// A peer that fails the ACL is answered with a typed rejection under the short
+/// [`REJECTION_WRITE_TIMEOUT`] and then dropped, so an unauthenticated caller
+/// cannot hold a connection slot for the full [`CONNECTION_IDLE_TIMEOUT`].
+///
 /// The verified [`fpsmaxxing_ipc::PeerIdentity`] is used for the ACL check and
 /// then dropped. Under the interim same-uid ACL every authorized peer is the
 /// same identity, so journaling the peer uid and pid against each lifecycle, and
@@ -373,7 +418,7 @@ where
     let Accepted { mut stream, peer } = accepted;
     if let Err(error) = authorizer.authorize(&peer) {
         let response = BrokerResponse::error(BrokerErrorKind::Unauthenticated, error.to_string());
-        let _ = write_response(&mut stream, &response).await;
+        let _ = write_response_within(&mut stream, &response, REJECTION_WRITE_TIMEOUT).await;
         return Ok(());
     }
     loop {
@@ -406,7 +451,7 @@ where
             Ok(request) => broker.dispatch(request).await,
             Err(error) => BrokerResponse::error(
                 BrokerErrorKind::Malformed,
-                format!("invalid request: {error}"),
+                format!("invalid request: {}", echoed(&error.to_string())),
             ),
         };
         write_response(&mut stream, &response).await?;
@@ -423,13 +468,25 @@ async fn write_response<W>(writer: &mut W, response: &BrokerResponse) -> Result<
 where
     W: AsyncWrite + Unpin,
 {
+    write_response_within(writer, response, CONNECTION_IDLE_TIMEOUT).await
+}
+
+/// Writes one response, giving the peer `deadline` to take it.
+async fn write_response_within<W>(
+    writer: &mut W,
+    response: &BrokerResponse,
+    deadline: Duration,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
     let bytes = serde_json::to_vec(response).map_err(io::Error::other)?;
-    tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, write_frame(writer, &bytes))
+    tokio::time::timeout(deadline, write_frame(writer, &bytes))
         .await
         .map_err(|_| {
             FrameError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "peer did not accept the response within the idle timeout",
+                "peer did not accept the response within its write deadline",
             ))
         })?
 }
@@ -445,7 +502,9 @@ mod tests {
     use fpsmaxxing_contracts::ipc::{BrokerErrorKind, BrokerOutcome, BrokerRequest};
     use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, StateSnapshot};
     use fpsmaxxing_control_plane::ControlPlane;
-    use fpsmaxxing_ipc::{Accepted, FrameError, PeerAuthorizer, PeerIdentity, SameUidAuthorizer};
+    use fpsmaxxing_ipc::{
+        Accepted, FrameError, MAX_FRAME_BYTES, PeerAuthorizer, PeerIdentity, SameUidAuthorizer,
+    };
     use fpsmaxxing_mock_provider::MockProvider;
     use fpsmaxxing_provider_sdk::{Provider, ProviderError};
     use serde_json::json;
@@ -453,7 +512,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        BrokerHandle, BrokerService, CONNECTION_IDLE_TIMEOUT, OwnershipLedger, handle_connection,
+        BrokerHandle, BrokerResponse, BrokerService, CONNECTION_IDLE_TIMEOUT, MAX_ECHOED_BYTES,
+        OwnershipLedger, REJECTION_WRITE_TIMEOUT, echoed, handle_connection,
     };
 
     /// Host detail a provider error might carry; it must not reach the wire.
@@ -506,23 +566,31 @@ mod tests {
         }
     }
 
-    fn error_kind(response: &fpsmaxxing_contracts::ipc::BrokerResponse) -> BrokerErrorKind {
-        response
-            .error
-            .as_ref()
-            .expect("response should carry an error")
-            .kind
+    fn error_body(response: &BrokerResponse) -> &fpsmaxxing_contracts::ipc::BrokerErrorBody {
+        match response {
+            BrokerResponse::Error { error } => error,
+            other => panic!("expected a typed error, got {other:?}"),
+        }
+    }
+
+    fn error_kind(response: &BrokerResponse) -> BrokerErrorKind {
+        error_body(response).kind
     }
 
     #[test]
     fn discover_returns_the_catalog() {
         let (service, _ledger) = service();
         let response = service.handle(BrokerRequest::discover());
-        assert_eq!(response.outcome, BrokerOutcome::Capabilities);
-        let manifest = response
-            .capabilities
-            .expect("capabilities should be present");
-        assert!(manifest.capabilities.iter().any(|c| c.id == "mock.value"));
+        assert_eq!(response.outcome(), BrokerOutcome::Capabilities);
+        let BrokerResponse::Capabilities { capabilities } = response else {
+            panic!("discover should answer with the catalog");
+        };
+        assert!(
+            capabilities
+                .capabilities
+                .iter()
+                .any(|c| c.id == "mock.value")
+        );
     }
 
     #[test]
@@ -532,11 +600,11 @@ mod tests {
             "gateway",
             change("mock.value", 42, 30),
         ));
-        assert_eq!(response.outcome, BrokerOutcome::Lifecycle);
-        let report = response
-            .lifecycle
-            .expect("lifecycle report should be present");
-        assert!(report.verified && report.rolled_back);
+        assert_eq!(response.outcome(), BrokerOutcome::Lifecycle);
+        let BrokerResponse::Lifecycle { lifecycle } = response else {
+            panic!("a completed lifecycle should answer with its report");
+        };
+        assert!(lifecycle.verified && lifecycle.rolled_back);
     }
 
     #[test]
@@ -577,12 +645,8 @@ mod tests {
             change("mock.value", 101, 30),
         ));
         assert_eq!(error_kind(&response), BrokerErrorKind::PolicyDenied);
-        let message = &response
-            .error
-            .expect("response should carry an error")
-            .message;
         assert_eq!(
-            message,
+            error_body(&response).message,
             "policy denied request: mock.value is bounded to 0..=100"
         );
     }
@@ -595,15 +659,58 @@ mod tests {
             change("mock.value", 42, 30),
         ));
         assert_eq!(error_kind(&response), BrokerErrorKind::LifecycleFailed);
-        let message = response
-            .error
-            .expect("response should carry an error")
-            .message;
+        let message = &error_body(&response).message;
         assert!(
             !message.contains(HOST_DETAIL),
             "host detail leaked to the client: {message}"
         );
         assert_eq!(message, "lifecycle failed: provider");
+    }
+
+    #[test]
+    fn an_oversized_capability_id_is_answered_within_the_frame_limit() {
+        let (service, _ledger) = service();
+        let oversized = "z".repeat(MAX_FRAME_BYTES as usize);
+        let response = service.handle(BrokerRequest::run_lifecycle(
+            "gateway",
+            change(&oversized, 1, 30),
+        ));
+        assert_eq!(error_kind(&response), BrokerErrorKind::UnknownCapability);
+        let encoded = serde_json::to_vec(&response).expect("response should encode");
+        assert!(
+            u32::try_from(encoded.len()).is_ok_and(|length| length <= MAX_FRAME_BYTES),
+            "an echoed capability id must not push the response past the frame limit"
+        );
+    }
+
+    #[test]
+    fn an_oversized_owner_label_cannot_bloat_a_conflict_message() {
+        let (service, ledger) = service();
+        let oversized = "owner-".repeat(MAX_FRAME_BYTES as usize / 6);
+        let _guard = ledger
+            .acquire("mock.value", &oversized)
+            .expect("the first owner should hold the knob");
+        let response = service.handle(BrokerRequest::run_lifecycle(
+            "owner-b",
+            change("mock.value", 42, 30),
+        ));
+        assert_eq!(error_kind(&response), BrokerErrorKind::OwnerConflict);
+        assert!(error_body(&response).message.len() <= MAX_ECHOED_BYTES + 3);
+    }
+
+    #[test]
+    fn echoing_truncates_on_a_character_boundary() {
+        assert_eq!(echoed("short"), "short");
+        // Three-byte characters: the cap does not land on a boundary, so a
+        // by-byte cut would panic or emit invalid UTF-8.
+        let text = "\u{3053}".repeat(MAX_ECHOED_BYTES);
+        let shortened = echoed(&text);
+        let kept = shortened
+            .strip_suffix("...")
+            .expect("a shortened echo should be marked");
+        assert!(kept.len() <= MAX_ECHOED_BYTES);
+        assert!(text.starts_with(kept));
+        assert!(kept.chars().all(|character| character == '\u{3053}'));
     }
 
     #[test]
@@ -701,6 +808,39 @@ mod tests {
         assert!(
             started.elapsed() >= CONNECTION_IDLE_TIMEOUT,
             "the connection ended before the idle timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_peer_that_never_reads_cannot_pin_its_connection_slot() {
+        // The peer fails the ACL, so no request is ever read and the only thing
+        // left to block on is the rejection write it refuses to take.
+        let (jobs, _worker) = mpsc::channel(1);
+        let accepted = Accepted {
+            stream: StalledPeer {
+                request: Vec::new(),
+                sent: 0,
+            },
+            peer: PeerIdentity {
+                uid: TEST_UID,
+                pid: None,
+            },
+        };
+        let authorizer: Arc<dyn PeerAuthorizer> = Arc::new(SameUidAuthorizer::new(TEST_UID + 1));
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            CONNECTION_IDLE_TIMEOUT,
+            handle_connection(accepted, BrokerHandle { jobs }, authorizer),
+        )
+        .await
+        .expect("a refused peer must not hold its slot for the idle timeout")
+        .expect("a refused peer ends its own connection, not the broker");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= REJECTION_WRITE_TIMEOUT && elapsed < CONNECTION_IDLE_TIMEOUT,
+            "an unauthenticated peer held its slot for {elapsed:?}"
         );
     }
 }

@@ -47,30 +47,29 @@ mod unix {
     use std::io;
     use std::os::unix::fs::FileTypeExt;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, PoisonError};
 
-    use rustix::fs::Mode;
     use tokio::net::{UnixListener, UnixStream};
 
     use super::{Accepted, LocalTransport};
     use crate::auth::PeerIdentity;
-
-    /// Umask held across the bind so the socket is created owner-accessible only.
-    ///
-    /// Masking these bits out of the `0o777` a bind requests leaves mode `0o600`.
-    const SOCKET_UMASK: Mode = Mode::XUSR.union(Mode::RWXG).union(Mode::RWXO);
-
-    /// Serializes the process-global umask window that [`bind_owner_only`] opens.
-    ///
-    /// Two concurrent binds would otherwise interleave their save and restore and
-    /// leave the whole process masked at [`SOCKET_UMASK`].
-    static BIND_UMASK: Mutex<()> = Mutex::new(());
 
     /// A Unix domain socket implementation of [`LocalTransport`].
     ///
     /// The socket file is removed when the transport is dropped so a restarted
     /// broker can rebind cleanly. Only an entry that is still a socket is
     /// unlinked, so whatever else may have taken the path survives.
+    ///
+    /// Confidentiality is not this type's job. The bind does not touch the
+    /// socket file's mode, because the only ways to pin one are a by-name
+    /// `chmod` - which follows symlinks, so a peer able to write the parent
+    /// directory could redirect it onto an unrelated file - and a window in the
+    /// process-global umask, which silently strips bits from every other
+    /// thread's file and directory creation for its duration. `fchmod` is not an
+    /// alternative: it reaches the sockfs inode, not the bound path. Two checks
+    /// carry that weight instead: the caller places the socket in a directory
+    /// only its owner may traverse (see the broker's private directory), and the
+    /// [`crate::PeerAuthorizer`] gate authenticates every peer from
+    /// `SO_PEERCRED` before a request is read.
     #[derive(Debug)]
     pub struct UnixSocketTransport {
         listener: UnixListener,
@@ -85,10 +84,6 @@ mod unix {
         /// [`io::ErrorKind::AlreadyExists`] rather than being deleted, so a
         /// mistyped `--socket` on a privileged broker cannot destroy an
         /// unrelated file.
-        ///
-        /// The socket is created mode `0o600` so the filesystem denies other
-        /// users a `connect()` regardless of the inherited umask; the
-        /// peer-credential ACL remains the authoritative check.
         ///
         /// # Errors
         ///
@@ -107,7 +102,7 @@ mod unix {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            let listener = bind_owner_only(&path)?;
+            let listener = UnixListener::bind(&path)?;
             Ok(Self { listener, path })
         }
 
@@ -116,22 +111,6 @@ mod unix {
         pub fn path(&self) -> &Path {
             &self.path
         }
-    }
-
-    /// Binds a listener whose socket file is created owner-accessible only.
-    ///
-    /// The mode is masked in at creation rather than applied afterwards. A
-    /// by-name `chmod` follows symlinks, so a peer able to write the parent
-    /// directory could swap the fresh socket for a link and make a privileged
-    /// broker restrict an unrelated file, and until it landed the socket would
-    /// still carry the inherited umask. `fchmod` on the listener is not an
-    /// alternative: it reaches the sockfs inode, not the bound path.
-    fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
-        let _serialized = BIND_UMASK.lock().unwrap_or_else(PoisonError::into_inner);
-        let restore = rustix::process::umask(SOCKET_UMASK);
-        let listener = UnixListener::bind(path);
-        rustix::process::umask(restore);
-        listener
     }
 
     impl LocalTransport for UnixSocketTransport {
@@ -161,23 +140,32 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use std::io;
-        use std::os::unix::fs::PermissionsExt;
 
-        use super::UnixSocketTransport;
+        use tokio::net::UnixStream;
 
-        /// The mode the socket must carry from the moment it exists.
-        const OWNER_ONLY: u32 = 0o600;
+        use super::{LocalTransport, UnixSocketTransport};
 
         #[tokio::test]
-        async fn bind_restricts_the_socket_to_its_owner() {
+        async fn a_bound_socket_accepts_a_local_peer() {
             let dir = tempfile::tempdir().expect("temporary directory should exist");
             let path = dir.path().join("broker.sock");
             let transport = UnixSocketTransport::bind(&path).expect("socket should bind");
-            let mode = std::fs::metadata(transport.path())
-                .expect("socket metadata should read")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, OWNER_ONLY);
+            assert_eq!(transport.path(), path);
+
+            let connect = tokio::spawn(async move { UnixStream::connect(&path).await });
+            let accepted = transport
+                .accept()
+                .await
+                .expect("the peer should be accepted");
+            connect
+                .await
+                .expect("the connecting task should finish")
+                .expect("the peer should connect");
+            assert_eq!(
+                accepted.peer.uid,
+                rustix::process::geteuid().as_raw(),
+                "a local peer's credentials should be resolved at accept time"
+            );
         }
 
         #[tokio::test]

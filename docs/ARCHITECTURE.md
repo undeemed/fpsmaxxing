@@ -20,6 +20,8 @@ The privileged Windows service accepts authenticated local requests from the gat
 It owns the control plane on a dedicated worker thread and serves exactly two operations - capability discovery and a bounded provider lifecycle - to authenticated local peers over the transport seam in `crates/ipc` (a Unix domain socket now, a Windows named pipe later).
 Three fail-closed checks guard the boundary: peer authentication before any request is read (a Linux `SO_PEERCRED` same-uid ACL, shaped so a Windows SID ACL can satisfy the same trait), a capability-catalog check that rejects raw shell, arbitrary Registry paths, and out-of-catalog ids, and single-owner-per-knob enforcement that refuses a second concurrent owner of a setting.
 Typed request and response messages live in `crates/contracts` with `schemas/*.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
+A response is a tagged union of its outcome and that outcome's payload, so a tag without its payload never crosses the boundary and no consumer has to unwrap one.
+Any text a client chose is truncated before it is quoted back in an error message, so a rejected request is always answered with a typed error rather than a response too large for the frame limit.
 
 The same-uid ACL is the deliberate interim policy for the current single-user, Linux-safe mock path, where the broker and its only client run as the same desktop user.
 It is not the shipping policy for the privilege split described above: once the broker runs as a service account, an unprivileged gateway would be refused by construction.
@@ -27,10 +29,19 @@ The real privilege-split ACL arrives with the Windows named-pipe SID implementat
 The trusted uid is read from the broker's own effective credentials rather than from the socket file's owner, so replacing the socket path cannot redirect the ACL.
 In this interim every authorized peer is the same identity, so journaling the verified peer uid and pid against each lifecycle, and authenticating the client-supplied owner label against them, only carry their weight once split-privilege ACLs arrive; both are tracked as follow-up work `fpsm-broker-splitacl`.
 Unless an explicit path is given, the broker keeps its socket and its journal in an owner-only directory under `$XDG_RUNTIME_DIR` (or `/run`) rather than beside the inherited working directory, so no other user can race the socket path or read the audit journal.
+`XDG_RUNTIME_DIR` is inherited from whoever started the broker, so it is honored only when it is absolute and only for an unprivileged broker; a broker running as root always uses `/run`.
+That directory and every directory above it must be owned by the broker or root and unwritable by anyone else, or the broker fails closed: a writable parent is what would let another user swap a vetted directory for a symlink between the check and the bind.
+The socket file's own mode is not pinned, because the only ways to do so are a symlink-following `chmod` or a window in the process-global umask; confidentiality rests on the private directory and the `SO_PEERCRED` gate instead.
+The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway and CLI use, so an operator who exported that variable cannot move the privileged audit journal.
 
 The broker fails fast rather than degrading.
 Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.
 Deploy it under a supervisor that restarts on failure, and let the watchdog own recovery of any state left behind.
+
+#### Deferred broker work
+
+- `fpsm-broker-splitacl`: the real split-privilege ACL, replacing the interim same-uid policy described above, plus journaling the verified peer uid and pid against each lifecycle and authenticating the client-supplied owner label against them.
+- Client reconnect on `Closed`: the broker closes a connection idle for 30 seconds, and `BrokerClient` holds one long-lived stream with no keepalive or reconnect, so a caller whose requests are further apart than that gets `ClientError::Closed`. Whether the client reconnects transparently, the server distinguishes a healthy idle peer from a stalled one, or callers connect per request is undecided.
 
 ### Watchdog
 
