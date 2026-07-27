@@ -35,12 +35,10 @@
 //! apply/lease window and running the evaluator gate after it.
 
 use fpsmaxxing_contracts::{
-    Decision, DecisionBounds, ExperimentSpec, MAX_SAMPLES, MetricSample, Verdict,
+    Decision, DecisionBounds, ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
+    MAX_DECISION_TEMPERATURE_C, MAX_SAMPLES, MetricSample, ProviderManifest, Verdict,
 };
-use fpsmaxxing_control_plane::{
-    ControlPlane, ControlPlaneError, LifecycleResult, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
-    MAX_DECISION_TEMPERATURE_C, MAX_MOCK_VALUE,
-};
+use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -81,6 +79,7 @@ pub enum RunnerError {
 /// [`LifecycleResult`] is serialize-only; this record round-trips so a promoted
 /// trial's lifecycle outcome can be read back during replay and audit.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleOutcome {
     /// Provider that owned the change.
     pub provider_id: String,
@@ -109,6 +108,7 @@ impl From<&LifecycleResult> for LifecycleOutcome {
 /// `failed` record, so a promotion the broker refused is auditable from the
 /// trial row alone.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleFailure {
     /// Stable machine-readable error kind reported by the broker.
     pub kind: String,
@@ -136,6 +136,7 @@ impl From<&ControlPlaneError> for LifecycleFailure {
 /// has finished. On a [`Reject`](Decision::Reject) both are absent: no
 /// lifecycle ran.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrialRecord {
     /// Version of the record format; see [`TRIAL_RECORD_VERSION`].
     pub schema_version: u32,
@@ -169,7 +170,13 @@ pub struct StoredTrial {
 }
 
 /// The result of re-evaluating a journaled trial.
+///
+/// A replay is a tamper-detection read, so the outcome must be inspected:
+/// [`is_consistent`](Self::is_consistent) reports whether the recomputation
+/// agrees with the journal, and `policy_legal` reports whether the bounds the
+/// journaled verdict was decided under are still inside the policy envelope.
 #[derive(Clone, Debug)]
+#[must_use]
 pub struct ReplayOutcome {
     /// The trial-journal identifier that was replayed.
     pub trial_id: i64,
@@ -177,6 +184,8 @@ pub struct ReplayOutcome {
     pub recorded: Verdict,
     /// The verdict recomputed from the journaled samples and bounds.
     pub recomputed: Verdict,
+    /// Whether the journaled decision bounds are inside the policy envelope.
+    pub policy_legal: bool,
 }
 
 impl ReplayOutcome {
@@ -199,7 +208,8 @@ impl ReplayOutcome {
 ///
 /// # Errors
 ///
-/// Returns an error if the spec is outside the bounded envelope, if the spec
+/// Returns an error if the spec is outside the bounded envelope, if its target
+/// names a capability the accepted provider does not advertise, if the spec
 /// target or provider snapshot lacks an unsigned mock value, or if the broker
 /// or durable journal rejects an operation. A lifecycle error is returned only
 /// after the trial record carrying it has been journaled; if that write also
@@ -209,7 +219,7 @@ pub fn run_trial(
     plane: &mut ControlPlane,
     spec: &ExperimentSpec,
 ) -> Result<StoredTrial, RunnerError> {
-    let candidate_value = validate(spec)?;
+    let candidate_value = validate(plane.capabilities(), spec)?;
     let baseline_value = baseline_value(plane)?;
     let baseline_samples = model::measure(
         baseline_value,
@@ -265,6 +275,11 @@ pub fn run_trial(
 /// and recomputed verdicts for comparison. It consults no chat history and
 /// re-runs no workload.
 ///
+/// The journaled bounds are re-checked against the policy envelope as well, so
+/// a row whose thresholds were widened after the fact is reported as
+/// `policy_legal = false` even when re-evaluating under those same widened
+/// thresholds reproduces the recorded verdict.
+///
 /// # Errors
 ///
 /// Returns an error if the trial cannot be read from the durable journal, its
@@ -293,6 +308,7 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
         trial_id: id,
         recorded: record.verdict,
         recomputed,
+        policy_legal: validate_bounds(&record.spec.bounds).is_ok(),
     })
 }
 
@@ -300,22 +316,36 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// returns the validated candidate knob value.
 ///
 /// Everything the measurement phase and the decision gate consume arrives over
-/// the wire, so all of it is bounded before any measurement work runs: sample
-/// counts size the measurement buffers and are checked against [`MAX_SAMPLES`],
-/// the decision bounds are intersected with the policy envelope by
-/// [`validate_bounds`], and the candidate knob value drives the modeled metrics
-/// and is checked against [`MAX_MOCK_VALUE`], the same ceiling the broker policy
-/// enforces later in the lifecycle. A spec that asks for fewer counted samples
-/// than its own bounds require can never promote, so it is refused up front
-/// rather than measured and then rejected. The validated value is returned so
-/// the measurement uses exactly what was bounded here.
-fn validate(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
+/// the wire, so all of it is bounded before any measurement work runs: the
+/// target must name a capability the accepted provider actually advertises,
+/// sample counts size the measurement buffers and are checked against
+/// [`MAX_SAMPLES`], the decision bounds are intersected with the policy envelope
+/// by [`validate_bounds`], and the candidate knob value drives the modeled
+/// metrics and is checked against [`MAX_MOCK_VALUE`], the same ceiling the
+/// broker policy enforces later in the lifecycle. A spec that asks for fewer
+/// counted samples than its own bounds require can never promote, so it is
+/// refused up front rather than measured and then rejected. The validated value
+/// is returned so the measurement uses exactly what was bounded here.
+///
+/// The capability check is what keeps unknown hardware failing closed. The
+/// broker refuses an unadvertised capability too, but only inside the
+/// lifecycle, which a rejected trial never reaches - and by then a measurement
+/// the model never described would already have been journaled as an
+/// authoritative trial.
+fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, RunnerError> {
+    if !manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.id == spec.target.capability_id)
+    {
+        return Err(ControlPlaneError::UnknownCapability(spec.target.capability_id.clone()).into());
+    }
+    validate_bounds(&spec.bounds)?;
     let min_samples = spec.bounds.min_samples.get();
     for (label, count) in [
         ("warmup_samples", spec.warmup_samples),
         ("baseline_samples", spec.baseline_samples.get()),
         ("candidate_samples", spec.candidate_samples.get()),
-        ("min_samples", min_samples),
     ] {
         if count > MAX_SAMPLES {
             return Err(RunnerError::InvalidSpec(format!(
@@ -333,7 +363,6 @@ fn validate(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
             )));
         }
     }
-    validate_bounds(&spec.bounds)?;
     let value = candidate_value(spec)?;
     if value > MAX_MOCK_VALUE {
         return Err(RunnerError::InvalidSpec(format!(
@@ -349,11 +378,22 @@ fn validate(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
 /// could otherwise disarm the gate it is supposed to pass by declaring a
 /// ceiling nothing can exceed. Each threshold is intersected with the
 /// policy-owned envelope: a spec may tighten a bound but never loosen it past
-/// [`MAX_DECISION_TEMPERATURE_C`], [`MAX_DECISION_POWER_W`], or
-/// [`MAX_DECISION_ERRORS`], and a required improvement must be a finite,
-/// non-negative gain. Non-finite thresholds are refused outright, because a
-/// `NaN` compares false against every ceiling and would silently pass the gate.
+/// [`MAX_DECISION_TEMPERATURE_C`], [`MAX_DECISION_POWER_W`],
+/// [`MAX_DECISION_ERRORS`], or [`MAX_SAMPLES`], and a required improvement must
+/// be a finite, non-negative gain. Non-finite thresholds are refused outright,
+/// because a `NaN` compares false against every ceiling and would silently pass
+/// the gate.
+///
+/// This covers every field of [`DecisionBounds`], so [`replay_trial`] can re-run
+/// it over a journaled spec to decide whether a recorded verdict was reached
+/// under thresholds the policy ever allowed.
 fn validate_bounds(bounds: &DecisionBounds) -> Result<(), RunnerError> {
+    let min_samples = bounds.min_samples.get();
+    if min_samples > MAX_SAMPLES {
+        return Err(RunnerError::InvalidSpec(format!(
+            "min_samples is {min_samples}, above the {MAX_SAMPLES} ceiling"
+        )));
+    }
     for (label, bound, ceiling) in [
         (
             "max_temperature_c",
@@ -406,13 +446,32 @@ fn candidate_value(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use fpsmaxxing_contracts::{ChangeRequest, DecisionBounds};
+    use fpsmaxxing_contracts::{
+        CapabilityDescriptor, ChangeRequest, DecisionBounds, Persistence, RiskClass,
+    };
+    use fpsmaxxing_control_plane::ControlPlaneError;
     use serde_json::json;
 
     use super::{
         ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
-        MAX_MOCK_VALUE, MAX_SAMPLES, RunnerError, validate,
+        MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest, RunnerError, validate,
     };
+
+    /// A manifest advertising only the knob the measurement model describes.
+    fn manifest() -> ProviderManifest {
+        ProviderManifest {
+            id: "mock".to_owned(),
+            protocol_version: NonZeroU32::MIN,
+            targets: vec![std::env::consts::OS.to_owned()],
+            capabilities: vec![CapabilityDescriptor {
+                id: "mock.value".to_owned(),
+                description: "Sets an in-memory value".to_owned(),
+                risk: RiskClass::Reversible,
+                persistence: Persistence::Leased,
+                input_schema: json!({ "type": "object" }),
+            }],
+        }
+    }
 
     fn spec(warmup: u32, baseline: u32, candidate: u32, min_samples: u32) -> ExperimentSpec {
         spec_for_value(warmup, baseline, candidate, min_samples, 40)
@@ -446,7 +505,7 @@ mod tests {
     }
 
     fn rejection(spec: &ExperimentSpec) -> String {
-        match validate(spec) {
+        match validate(&manifest(), spec) {
             Err(RunnerError::InvalidSpec(message)) => message,
             other => panic!("spec should be rejected, got {other:?}"),
         }
@@ -455,10 +514,10 @@ mod tests {
     #[test]
     fn accepts_a_spec_inside_the_envelope() {
         assert_eq!(
-            validate(&spec(2, 5, 5, 3)).expect("spec is in envelope"),
+            validate(&manifest(), &spec(2, 5, 5, 3)).expect("spec is in envelope"),
             40
         );
-        assert!(validate(&spec(MAX_SAMPLES, MAX_SAMPLES, MAX_SAMPLES, 3)).is_ok());
+        assert!(validate(&manifest(), &spec(MAX_SAMPLES, MAX_SAMPLES, MAX_SAMPLES, 3)).is_ok());
     }
 
     #[test]
@@ -503,7 +562,7 @@ mod tests {
         tightest.bounds.max_power_w = MAX_DECISION_POWER_W;
         tightest.bounds.max_errors = MAX_DECISION_ERRORS;
         tightest.bounds.min_fps_improvement = 0.0;
-        assert!(validate(&tightest).is_ok());
+        assert!(validate(&manifest(), &tightest).is_ok());
     }
 
     #[test]
@@ -527,16 +586,37 @@ mod tests {
     fn rejects_a_candidate_value_above_the_policy_bound() {
         // The broker only sees the value inside the lifecycle, which a rejected
         // trial never reaches, so the measurement path bounds it itself.
-        assert!(validate(&spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE)).is_ok());
+        assert!(validate(&manifest(), &spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE)).is_ok());
         let message = rejection(&spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE + 1));
         assert!(message.contains("target value"), "{message}");
         assert!(rejection(&spec_for_value(2, 5, 5, 3, u64::MAX)).contains("target value"));
     }
 
     #[test]
+    fn rejects_a_capability_the_provider_does_not_advertise() {
+        // The measurement model only describes the mock knob, so a target the
+        // registry never accepted must fail closed before anything is measured
+        // or journaled - not later, inside the lifecycle.
+        let mut foreign = spec(2, 5, 5, 3);
+        foreign.target.capability_id = "gpu.core-clock-offset".to_owned();
+        let error = validate(&manifest(), &foreign).expect_err("unknown hardware fails closed");
+        assert!(
+            matches!(
+                &error,
+                RunnerError::ControlPlane(ControlPlaneError::UnknownCapability(id))
+                    if id == "gpu.core-clock-offset"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn rejects_a_target_without_an_unsigned_value() {
         let mut spec = spec(2, 5, 5, 3);
         spec.target.parameters = json!({ "value": "high" });
-        assert!(matches!(validate(&spec), Err(RunnerError::InvalidTarget)));
+        assert!(matches!(
+            validate(&manifest(), &spec),
+            Err(RunnerError::InvalidTarget)
+        ));
     }
 }

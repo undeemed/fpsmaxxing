@@ -281,6 +281,109 @@ fn a_trial_record_from_an_unsupported_version_fails_closed() {
 }
 
 #[test]
+fn a_trial_record_carrying_unknown_fields_fails_closed() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+
+    // A field this build does not know about, under a version it does, means a
+    // divergent writer or a rewritten row. Dropping it silently would let the
+    // replay call the record consistent, so decoding refuses it instead.
+    let mut payload = plane.read_trial(trial.id).expect("trial should read");
+    payload["unexpected"] = json!(true);
+    let tampered = plane
+        .record_trial(&payload)
+        .expect("the extended record should append");
+    let error = replay_trial(&plane, tampered).expect_err("an unknown field should be refused");
+    assert!(matches!(error, RunnerError::Decode(_)), "{error:?}");
+
+    let mut payload = plane.read_trial(trial.id).expect("trial should read");
+    payload["verdict"]["unexpected"] = json!(true);
+    let tampered = plane
+        .record_trial(&payload)
+        .expect("the extended record should append");
+    let error = replay_trial(&plane, tampered).expect_err("an unknown field should be refused");
+    assert!(matches!(error, RunnerError::Decode(_)), "{error:?}");
+}
+
+#[test]
+fn a_replay_reports_bounds_outside_the_policy_envelope() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+
+    // Stand in for a row whose thresholds were widened after the fact. Both the
+    // recorded and the recomputed verdict promote under those widened bounds,
+    // so comparing verdicts alone cannot catch it - the replay re-checks the
+    // journaled bounds against the policy envelope instead.
+    let mut payload = plane.read_trial(trial.id).expect("trial should read");
+    payload["spec"]["bounds"]["max_temperature_c"] = json!(200.0);
+    let widened = plane
+        .record_trial(&payload)
+        .expect("a widened record should append");
+
+    let outcome = replay_trial(&plane, widened).expect("replay trial");
+    assert!(
+        outcome.is_consistent(),
+        "the widened bounds still reproduce the recorded verdict"
+    );
+    assert!(
+        !outcome.policy_legal,
+        "a temperature ceiling of 200 C is outside the policy envelope"
+    );
+
+    // The trial as it was actually run stays legal.
+    let outcome = replay_trial(&plane, trial.id).expect("replay trial");
+    assert!(outcome.is_consistent() && outcome.policy_legal);
+}
+
+#[test]
+fn replaying_a_trial_that_was_never_recorded_fails_closed() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let plane = ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // An absent row is a consistency signal about recorded history, so it is
+    // reported apart from a journal that could not be read at all.
+    let error = replay_trial(&plane, 404).expect_err("an unrecorded trial cannot be replayed");
+    assert!(
+        matches!(
+            error,
+            RunnerError::ControlPlane(ControlPlaneError::UnknownTrial(404))
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_trial_targeting_an_unadvertised_capability_is_refused() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // The measurement model only describes the mock knob. Without this gate the
+    // trial would be measured, evaluated, and journaled as authoritative before
+    // the broker refused the same capability inside the lifecycle.
+    let mut spec = spec_for(40, 5.0, 80.0);
+    spec.target.capability_id = "gpu.core-clock-offset".to_owned();
+    let error = run_trial(&mut plane, &spec).expect_err("unknown hardware should fail closed");
+    assert!(
+        matches!(
+            error,
+            RunnerError::ControlPlane(ControlPlaneError::UnknownCapability(_))
+        ),
+        "{error:?}"
+    );
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused spec journals nothing"
+    );
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
 fn mvp_one_measured_experiment_is_promoted_or_rejected_by_the_evaluator() {
     let journal = NamedTempFile::new().expect("temp journal");
     let mut plane =

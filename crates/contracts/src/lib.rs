@@ -121,20 +121,59 @@ pub struct MetricSummary {
     pub total_errors: u64,
 }
 
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's temperature
+/// bound, in degrees Celsius.
+///
+/// The thresholds an immutable evaluator applies arrive in an LLM-authored
+/// experiment spec, so a spec could otherwise disarm its own safety gate by
+/// declaring an unreachable ceiling. Policy owns the hard envelope: a spec may
+/// tighten these bounds but never loosen them. This value sits below the
+/// throttle point of the consumer hardware the alpha targets. It is mirrored as
+/// `maximum` on `max_temperature_c` in `schemas/experiment.schema.json`.
+pub const MAX_DECISION_TEMPERATURE_C: f64 = 90.0;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's power
+/// bound, in watts.
+///
+/// See [`MAX_DECISION_TEMPERATURE_C`] for why the envelope is policy-owned.
+pub const MAX_DECISION_POWER_W: f64 = 250.0;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a trial's error
+/// budget.
+///
+/// A correctness fault is never an acceptable cost of a performance gain on
+/// this path, so the alpha promotes nothing that reported one; a spec may
+/// restate this ceiling but not raise it. See [`MAX_DECISION_TEMPERATURE_C`]
+/// for why the envelope is policy-owned.
+pub const MAX_DECISION_ERRORS: u64 = 0;
+
 /// Fixed thresholds the immutable evaluator applies to a trial.
+///
+/// Every threshold is bounded by the policy envelope a spec may tighten but
+/// never loosen; the same bounds are mirrored in
+/// `schemas/experiment.schema.json` and re-checked at run time by the runner.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionBounds {
     /// Minimum samples required in each of the baseline and candidate sets
-    /// before a promotion can be considered.
+    /// before a promotion can be considered; at most [`MAX_SAMPLES`].
+    #[schemars(range(max = MAX_SAMPLES))]
     pub min_samples: NonZeroU32,
-    /// Minimum mean-FPS gain the candidate must show over the baseline.
+    /// Minimum mean-FPS gain the candidate must show over the baseline; a
+    /// non-negative gain.
+    #[schemars(range(min = 0.0))]
     pub min_fps_improvement: f64,
-    /// Inclusive ceiling for candidate temperature in degrees Celsius.
+    /// Inclusive ceiling for candidate temperature in degrees Celsius; above 0
+    /// and at most [`MAX_DECISION_TEMPERATURE_C`].
+    #[schemars(range(max = MAX_DECISION_TEMPERATURE_C), extend("exclusiveMinimum" = 0.0))]
     pub max_temperature_c: f64,
-    /// Inclusive ceiling for candidate power draw in watts.
+    /// Inclusive ceiling for candidate power draw in watts; above 0 and at most
+    /// [`MAX_DECISION_POWER_W`].
+    #[schemars(range(max = MAX_DECISION_POWER_W), extend("exclusiveMinimum" = 0.0))]
     pub max_power_w: f64,
-    /// Inclusive ceiling for candidate correctness errors.
+    /// Inclusive ceiling for candidate correctness errors; at most
+    /// [`MAX_DECISION_ERRORS`].
+    #[schemars(range(max = MAX_DECISION_ERRORS))]
     pub max_errors: u64,
 }
 
@@ -223,7 +262,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, MAX_SAMPLES,
+        CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
+        MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C, MAX_SAMPLES,
         MetricSample, MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest,
         RiskClass, Verdict, VerdictReason,
     };
@@ -620,6 +660,39 @@ mod tests {
                 generated["properties"][field]["maximum"],
                 json!(MAX_SAMPLES),
                 "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_bounds_are_bounded_like_the_schema() {
+        // The evaluator's thresholds arrive in the spec, so the policy envelope
+        // is declared once in this crate and mirrored by both schemas.
+        let checked_in: Value =
+            serde_json::from_str(EXPERIMENT_SCHEMA).expect("experiment schema should parse");
+        let generated = serde_json::to_value(schemars::schema_for!(ExperimentSpec))
+            .expect("generated schema should serialize");
+        let envelope = [
+            ("min_samples", "maximum", json!(MAX_SAMPLES)),
+            ("min_fps_improvement", "minimum", json!(0.0)),
+            ("max_temperature_c", "exclusiveMinimum", json!(0.0)),
+            (
+                "max_temperature_c",
+                "maximum",
+                json!(MAX_DECISION_TEMPERATURE_C),
+            ),
+            ("max_power_w", "exclusiveMinimum", json!(0.0)),
+            ("max_power_w", "maximum", json!(MAX_DECISION_POWER_W)),
+            ("max_errors", "maximum", json!(MAX_DECISION_ERRORS)),
+        ];
+        for (field, keyword, expected) in envelope {
+            assert_eq!(
+                checked_in["$defs"]["decision_bounds"]["properties"][field][keyword], expected,
+                "checked-in decision_bounds.{field}.{keyword}"
+            );
+            assert_eq!(
+                generated["$defs"]["DecisionBounds"]["properties"][field][keyword], expected,
+                "generated DecisionBounds.{field}.{keyword}"
             );
         }
     }

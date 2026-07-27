@@ -4,7 +4,7 @@ use std::{num::NonZeroU64, path::Path, time::Duration};
 
 use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, RiskClass, StateSnapshot};
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -15,31 +15,6 @@ use thiserror::Error;
 /// so the experiment runner, which acts on a candidate value before the
 /// lifecycle runs, can refuse the same values this policy would.
 pub const MAX_MOCK_VALUE: u64 = 100;
-
-/// Inclusive ceiling the bounded alpha policy enforces on a trial's temperature
-/// bound, in degrees Celsius.
-///
-/// The thresholds an immutable evaluator applies arrive in an LLM-authored
-/// experiment spec, so a spec could otherwise disarm its own safety gate by
-/// declaring an unreachable ceiling. Policy owns the hard envelope: a spec may
-/// tighten these bounds but never loosen them. This value sits below the
-/// throttle point of the consumer hardware the alpha targets.
-pub const MAX_DECISION_TEMPERATURE_C: f64 = 90.0;
-
-/// Inclusive ceiling the bounded alpha policy enforces on a trial's power
-/// bound, in watts.
-///
-/// See [`MAX_DECISION_TEMPERATURE_C`] for why the envelope is policy-owned.
-pub const MAX_DECISION_POWER_W: f64 = 250.0;
-
-/// Inclusive ceiling the bounded alpha policy enforces on a trial's error
-/// budget.
-///
-/// A correctness fault is never an acceptable cost of a performance gain on
-/// this path, so the alpha promotes nothing that reported one; a spec may
-/// restate this ceiling but not raise it. See [`MAX_DECISION_TEMPERATURE_C`]
-/// for why the envelope is policy-owned.
-pub const MAX_DECISION_ERRORS: u64 = 0;
 
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
@@ -59,6 +34,13 @@ pub enum ControlPlaneError {
     /// The post-rollback probe did not match the captured snapshot.
     #[error("rollback verification failed")]
     RollbackVerificationFailed,
+    /// No trial has been recorded under the requested identifier.
+    ///
+    /// This is distinct from [`Journal`](Self::Journal): the trial journal is
+    /// append-only, so a missing identifier is a consistency signal about
+    /// recorded history rather than a transient storage fault.
+    #[error("unknown trial: {0}")]
+    UnknownTrial(i64),
     /// The durable journal could not be read or written.
     #[error(transparent)]
     Journal(#[from] rusqlite::Error),
@@ -77,6 +59,7 @@ impl ControlPlaneError {
             Self::Provider(_) => "provider",
             Self::VerificationFailed => "verification-failed",
             Self::RollbackVerificationFailed => "rollback-verification-failed",
+            Self::UnknownTrial(_) => "unknown-trial",
             Self::Journal(_) => "journal",
             Self::Serialization(_) => "serialization",
         }
@@ -260,14 +243,19 @@ impl ControlPlane {
     ///
     /// # Errors
     ///
-    /// Returns an error if no trial has the identifier, or the durable journal
+    /// Returns [`UnknownTrial`](ControlPlaneError::UnknownTrial) if no trial has
+    /// the identifier, keeping an absent record distinct from a journal that
     /// cannot be read or decoded.
     pub fn read_trial(&self, id: i64) -> Result<Value, ControlPlaneError> {
-        let payload: String = self.journal.query_row(
-            "SELECT payload FROM experiment_trials WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
+        let payload: String = self
+            .journal
+            .query_row(
+                "SELECT payload FROM experiment_trials WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ControlPlaneError::UnknownTrial(id))?;
         Ok(serde_json::from_str(&payload)?)
     }
 
@@ -920,14 +908,14 @@ mod tests {
 
     #[test]
     fn reading_an_unknown_trial_fails_closed() {
+        // An identifier that was never recorded is a consistency signal, so it
+        // is reported apart from a journal that could not be read at all.
         let plane = plane(false);
         let error = plane
             .read_trial(404)
             .expect_err("an unrecorded trial cannot be read");
-        assert!(matches!(
-            error,
-            ControlPlaneError::Journal(rusqlite::Error::QueryReturnedNoRows)
-        ));
+        assert!(matches!(error, ControlPlaneError::UnknownTrial(404)));
+        assert_eq!(error.kind(), "unknown-trial");
     }
 
     #[test]

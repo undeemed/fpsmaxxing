@@ -23,6 +23,8 @@ Crash safety for the window between a mutation and that record stays with the li
 The write-ahead apply intent makes a crash between mutation and journaling distinguishable from an apply that never started, and the terminal record guarantees that a surviving process never leaves an experiment with only partial stage rows.
 A per-stage two-phase protocol would duplicate that machinery for the mock-only alpha before the broker owns the transaction log.
 Trial records carry a `schema_version` so a future field addition is a version bump a reader can refuse rather than a silent misread of journaled history.
+The version gate only catches a writer that bumps it, so the record types also reject unknown fields: a row carrying a field this build does not know, under a version it does, means a divergent writer or a rewritten row and fails the replay rather than decoding with that field dropped.
+Replay re-checks the journaled decision bounds against the policy envelope as well, because a row whose thresholds were widened after the fact re-evaluates to the same verdict under those same widened thresholds and so is invisible to a verdict comparison alone.
 
 ## Consequences
 

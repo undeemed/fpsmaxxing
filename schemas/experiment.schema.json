@@ -42,11 +42,19 @@
         "max_errors"
       ],
       "properties": {
-        "min_samples": { "type": "integer", "minimum": 1 },
-        "min_fps_improvement": { "type": "number" },
-        "max_temperature_c": { "type": "number" },
-        "max_power_w": { "type": "number" },
-        "max_errors": { "type": "integer", "minimum": 0 }
+        "min_samples": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "min_fps_improvement": { "type": "number", "minimum": 0.0 },
+        "max_temperature_c": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 90.0
+        },
+        "max_power_w": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 250.0
+        },
+        "max_errors": { "type": "integer", "minimum": 0, "maximum": 0 }
       }
     }
   }
