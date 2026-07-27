@@ -465,6 +465,31 @@ fn a_candidate_outside_the_policy_bound_is_refused_before_any_measurement() {
 }
 
 #[test]
+fn target_parameters_the_model_does_not_take_are_refused_before_any_measurement() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // The measurement path reads only the knob value out of the target's
+    // free-form parameter object. An unread key would be written verbatim into
+    // both the trial row and the lifecycle journal's write-ahead apply intent,
+    // so the spec author would choose how large those durable rows are.
+    let mut spec = spec_for(40, 5.0, 80.0);
+    spec.target.parameters = json!({ "value": 40, "pad": "x".repeat(4096) });
+    let error = run_trial(&mut plane, &spec).expect_err("an unread parameter should be refused");
+    let RunnerError::InvalidSpec(message) = &error else {
+        panic!("an unbounded parameter object is refused as an invalid spec, got {error:?}");
+    };
+    assert!(message.contains("pad"), "{message}");
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused spec journals nothing"
+    );
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
 fn a_lease_outside_the_policy_bound_is_refused_before_any_measurement() {
     let journal = NamedTempFile::new().expect("temp journal");
     let mut plane =
@@ -673,6 +698,11 @@ fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
         ("a lease above the policy ceiling", "lease_seconds", {
             let mut payload = recorded.clone();
             payload["spec"]["target"]["lease_seconds"] = json!(MAX_LEASE_SECONDS + 1);
+            payload
+        }),
+        ("a parameter the model does not take", "pad", {
+            let mut payload = recorded.clone();
+            payload["spec"]["target"]["parameters"]["pad"] = json!("x".repeat(4096));
             payload
         }),
         ("a hypothesis above the policy ceiling", "hypothesis", {

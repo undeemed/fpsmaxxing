@@ -21,6 +21,13 @@ use fpsmaxxing_contracts::MetricSample;
 /// about it. The runner refuses such a target rather than measuring it.
 pub(crate) const MODELED_CAPABILITY_ID: &str = "mock.value";
 
+/// The change-request parameters [`MODELED_CAPABILITY_ID`] takes.
+///
+/// [`measure`] reads the knob value and nothing else, so a target carrying any
+/// other key is asking for a change this model does not describe. The runner
+/// refuses it rather than passing it through unread.
+pub(crate) const MODELED_PARAMETERS: [&str; 1] = ["value"];
+
 /// Frames per second reported while warming up, before steady state.
 const COLD_FPS: f64 = 60.0;
 /// Steady-state frames per second at the lowest knob value.

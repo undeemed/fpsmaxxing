@@ -7,14 +7,17 @@
 //!
 //! A replay that diverges from the journal means the record was tampered with
 //! or the immutable evaluator drifted, and a replay the policy gate refuses -
-//! its capability, hypothesis length, sample counts, decision bounds, candidate
-//! value, TTL lease, baseline ceiling, the lifecycle fields its decision
-//! implies, or the agreement between the record and the spec it carries - means
-//! the journaled row is not one this runner would write under the policy in
-//! force now. A lifecycle that fails after the trial was measured is the third
-//! failure: the trial is journaled anyway and the error names the row, or says
-//! why the row was lost, which the demo reports. It exits non-zero on any of
-//! the three rather than reporting a successful run.
+//! its capability, hypothesis length, sample counts, decision bounds, target
+//! parameters, candidate value, TTL lease, baseline ceiling, the lifecycle
+//! fields its decision implies, or the agreement between the record and the
+//! spec it carries - means the journaled row is not one this runner would write
+//! under the policy in force now. The remaining two failures are the trial's
+//! own: a lifecycle that fails after the trial was measured, which is journaled
+//! anyway so the error names the row or says why the row was lost, and a
+//! journal that refuses the record of a trial that already ran, which reports
+//! whether the promotion had reached the provider before its record was lost.
+//! The demo reports each of the four rather than reporting a successful run,
+//! and exits non-zero.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -49,6 +52,23 @@ fn main() -> Result<ExitCode, RunnerError> {
                     eprintln!("  the trial recording it could not be journaled: {error}");
                 }
                 (None, None) => eprintln!("  the trial recording it could not be journaled"),
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(error @ RunnerError::TrialNotJournaled { .. }) => {
+            // The trial row is the only auditable statement that a promotion
+            // reached the provider, so the crafted message - which says whether
+            // one did - is what the demo reports for a lost record.
+            eprintln!("fpsmaxxing-experiment-runner: {error}");
+            if let RunnerError::TrialNotJournaled {
+                lifecycle: Some(lifecycle),
+                ..
+            } = &error
+            {
+                eprintln!(
+                    "  the lost record would have held: provider {}, verified = {}, rolled_back = {}",
+                    lifecycle.provider_id, lifecycle.verified, lifecycle.rolled_back
+                );
             }
             return Ok(ExitCode::FAILURE);
         }

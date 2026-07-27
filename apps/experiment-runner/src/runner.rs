@@ -414,9 +414,9 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 ///
 /// Replay is the tamper-detection read, so it re-runs the whole of
 /// [`validate_spec`] over the journaled spec rather than only its bounds: a row
-/// whose capability, hypothesis length, sample counts, decision bounds,
-/// candidate value, or TTL lease were rewritten is reported as illegal even
-/// though re-evaluating it reproduces the recorded verdict.
+/// whose capability, hypothesis length, sample counts, decision bounds, target
+/// parameters, candidate value, or TTL lease were rewritten is reported as
+/// illegal even though re-evaluating it reproduces the recorded verdict.
 ///
 /// The gate applied is the current one, so tightening a policy constant flags
 /// every archived row recorded under the looser ceiling. That is the intended
@@ -451,9 +451,18 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// every other checked field has a second term to disagree with, while the
 /// hypothesis is free text with no redundant copy in the record. So a rewrite of
 /// the measurements together with the verdict they imply, or of the hypothesis
-/// text within its bounds, passes both this check and the verdict comparison;
-/// catching that needs each row anchored outside itself - a signed or
-/// hash-chained journal - which the alpha deliberately does not do.
+/// text within its bounds, passes both this check and the verdict comparison.
+///
+/// Re-deriving the samples is possible in this alpha and deliberately not done.
+/// [`model::measure`] is pure in the knob value and the two counts, all three of
+/// which the record already carries, so the recorded sets could simply be
+/// regenerated and compared. That check cannot survive the real telemetry it
+/// stands in for: `PresentMon` samples are not reproducible, which is precisely
+/// why they are journaled verbatim, so a gate built on reproducibility would
+/// have to be deleted the moment the model is replaced - and an archive audited
+/// under it would then have no gate at all. Measurement-content integrity
+/// instead needs each row anchored outside itself - a signed or hash-chained
+/// journal - which is deferred rather than approximated here.
 ///
 /// # Errors
 ///
@@ -578,18 +587,21 @@ fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, R
 /// the candidate knob value drives the modeled metrics and is checked against
 /// [`MAX_MOCK_VALUE`], the same ceiling the broker policy enforces later in the
 /// lifecycle and the same one [`baseline_value`] holds the provider to. The
-/// target's TTL lease is bounded here too, against the broker's own
-/// [`MAX_LEASE_SECONDS`]: it is the last broker-enforced field on the change
-/// request, and a spec the lifecycle can only ever deny must not be measured
-/// and journaled as an authoritative trial first. A spec that asks for fewer
-/// counted samples than its own bounds require can never promote either, so it
-/// is refused up front rather than measured and then rejected. The hypothesis is
-/// the one field neither phase consumes, but it is written verbatim into a
-/// single durable trial row, so it is held to both ends of the range the spec
-/// schema publishes - [`MAX_HYPOTHESIS_CHARS`] so the row is not sized by
-/// whatever the author sent, and [`MIN_HYPOTHESIS_CHARS`] so a promotion cannot
-/// be journaled with no statement of what it was for. The validated value is
-/// returned so the measurement uses exactly what was bounded here.
+/// object that value arrives in is free-form on the wire, so
+/// [`validate_parameters`] holds it to the keys the modeled capability takes
+/// rather than letting an unread one through. The target's TTL lease is bounded
+/// here too, against the broker's own [`MAX_LEASE_SECONDS`]: it is the last
+/// broker-enforced field on the change request, and a spec the lifecycle can
+/// only ever deny must not be measured and journaled as an authoritative trial
+/// first. A spec that asks for fewer counted samples than its own bounds
+/// require can never promote either, so it is refused up front rather than
+/// measured and then rejected. The hypothesis is the one field neither phase
+/// consumes, but it is written verbatim into a single durable trial row, so it
+/// is held to both ends of the range the spec schema publishes -
+/// [`MAX_HYPOTHESIS_CHARS`] so the row is not sized by whatever the author sent,
+/// and [`MIN_HYPOTHESIS_CHARS`] so a promotion cannot be journaled with no
+/// statement of what it was for. The validated value is returned so the
+/// measurement uses exactly what was bounded here.
 ///
 /// The capability check is what keeps unknown hardware failing closed, and it is
 /// the model rather than the registry that decides what is known: the
@@ -636,6 +648,7 @@ fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
             )));
         }
     }
+    validate_parameters(&spec.target.parameters)?;
     let value = candidate_value(spec)?;
     if value > MAX_MOCK_VALUE {
         return Err(RunnerError::InvalidSpec(format!(
@@ -649,6 +662,32 @@ fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
         )));
     }
     Ok(value)
+}
+
+/// Rejects target parameters the modeled capability does not take.
+///
+/// The change request's parameter object is free-form on the wire, and the
+/// measurement path reads exactly one key out of it, so every other key would be
+/// carried unread into two durable rows: the trial record itself and the
+/// lifecycle journal's write-ahead apply intent, which holds the whole request.
+/// A spec author would then choose how large those rows are. Holding the object
+/// to [`MODELED_PARAMETERS`](model::MODELED_PARAMETERS) bounds it by the same
+/// term that decides whether the capability is measurable at all, so the
+/// unbounded field is refused rather than sized.
+///
+/// A parameter object that is not an object carries no value either, so it is
+/// reported as the missing target value it is.
+fn validate_parameters(parameters: &Value) -> Result<(), RunnerError> {
+    let fields = parameters.as_object().ok_or(RunnerError::InvalidTarget)?;
+    for key in fields.keys() {
+        if !model::MODELED_PARAMETERS.contains(&key.as_str()) {
+            return Err(RunnerError::InvalidSpec(format!(
+                "target parameter {key:?} is not one {} takes",
+                model::MODELED_CAPABILITY_ID
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Rejects decision bounds that are looser than the policy envelope.
@@ -982,6 +1021,25 @@ mod tests {
         spec.target.parameters = json!({ "value": "high" });
         assert!(matches!(
             validate(&manifest(), &spec),
+            Err(RunnerError::InvalidTarget)
+        ));
+    }
+
+    #[test]
+    fn rejects_target_parameters_the_model_does_not_take() {
+        // The measurement path reads one key out of a free-form object, so any
+        // other key is carried unread into the trial row and the lifecycle
+        // journal's apply intent, sizing both by whatever the author sent.
+        let mut padded = spec(2, 5, 5, 3);
+        padded.target.parameters = json!({ "value": 40, "pad": "\u{e9}".repeat(4096) });
+        let message = rejection(&padded);
+        assert!(message.contains("pad"), "{message}");
+
+        // A parameter object that is not an object carries no value either.
+        let mut malformed = spec(2, 5, 5, 3);
+        malformed.target.parameters = json!([{ "value": 40 }]);
+        assert!(matches!(
+            validate(&manifest(), &malformed),
             Err(RunnerError::InvalidTarget)
         ));
     }
