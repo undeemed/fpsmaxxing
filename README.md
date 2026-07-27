@@ -24,8 +24,7 @@ flowchart LR
     B --> E
     E -->|keep, iterate| M
     E -.->|roll back<br/>regression| B
-    B -.->|lease/TTL expiry or<br/>safety violation| W
-    W -.->|revert to snapshot| B
+    W -.->|lease/TTL expiry or safety violation:<br/>revert to snapshot| B
 ```
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
