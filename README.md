@@ -18,21 +18,21 @@ flowchart LR
     P["Policy engine<br/>decide bounded<br/>adjustment"]
     B["Broker<br/>apply via typed capability<br/>snapshot + TTL lease"]
     E["Evaluator<br/>keep or roll back"]
-    W["Watchdog<br/>out-of-band guard"]
+    W["Watchdog<br/>out-of-band guard<br/>lease/TTL + safety"]
     M --> P
     P --> B
     B --> E
-    E -->|iterate| M
-    B -.->|lease deadline| W
-    M -.->|regression or<br/>safety violation| W
-    W -.->|revert to snapshot| M
+    E -->|keep, iterate| M
+    E -.->|roll back<br/>regression| B
+    B -.->|lease/TTL expiry or<br/>safety violation| W
+    W -.->|revert to snapshot| B
 ```
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
 The **privileged broker** is designed to apply that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-An **independent watchdog** will own the lease deadline and restore the snapshot without the gateway, agent, or experiment runner whenever a regression or safety violation appears.
-In the target design the loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides whether to keep the change or roll it back before the next iteration begins.
+An **independent watchdog** will own the lease deadline and restore the snapshot through the broker, without the gateway, agent, or experiment runner, whenever a lease expires or a safety violation appears.
+In the target design the loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those measurements whether to keep the change or roll back a regression before the next iteration begins.
 
 ## Why FPSMaxxing?
 
