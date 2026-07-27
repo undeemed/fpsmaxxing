@@ -123,7 +123,8 @@ It owns the control plane and serves capability discovery and the bounded provid
 
 ```bash
 cargo run -p fpsmaxxing-broker
-cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal /var/lib/fpsmaxxing/journal.sqlite
+cargo run -p fpsmaxxing-broker -- --help
+cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal /run/fpsmaxxing/journal.sqlite
 ```
 
 | Setting | Flag | Environment variable | Default |
@@ -134,6 +135,9 @@ cargo run -p fpsmaxxing-broker -- --socket /run/fpsmaxxing/broker.sock --journal
 A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
 The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
 The broker creates it mode `0700`, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
+A path from a flag or an environment variable is held to the same bar: it must be absolute, and every directory above it is vetted the same way, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
+Give the journal a directory of its own at mode `0700` - the default private directory already is one.
+The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
 
 ## Architecture
 

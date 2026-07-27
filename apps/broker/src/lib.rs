@@ -75,6 +75,14 @@ pub const REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Pause after a per-connection accept failure, so a repeated one cannot spin.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// What a peer refused by the ACL is told, in place of why.
+///
+/// [`fpsmaxxing_ipc::AuthError`] names both the peer's uid and the broker's own,
+/// and the caller it would reach has not authenticated, so its `Display` must
+/// not cross the boundary: that is the same rule [`wire_error`] applies to host
+/// detail below. The uid pair is traced locally instead.
+const UNAUTHORIZED_MESSAGE: &str = "peer is not authorized";
+
 /// Longest run of client-supplied text echoed back in an error message.
 ///
 /// Text the client chose is bounded only by [`fpsmaxxing_ipc::MAX_FRAME_BYTES`]
@@ -399,7 +407,8 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
 ///
 /// A peer that fails the ACL is answered with a typed rejection under the short
 /// [`REJECTION_WRITE_TIMEOUT`] and then dropped, so an unauthenticated caller
-/// cannot hold a connection slot for the full [`CONNECTION_IDLE_TIMEOUT`].
+/// cannot hold a connection slot for the full [`CONNECTION_IDLE_TIMEOUT`]. The
+/// rejection carries [`UNAUTHORIZED_MESSAGE`] and nothing about why.
 ///
 /// The verified [`fpsmaxxing_ipc::PeerIdentity`] is used for the ACL check and
 /// then dropped. Under the interim same-uid ACL every authorized peer is the
@@ -417,7 +426,9 @@ where
 {
     let Accepted { mut stream, peer } = accepted;
     if let Err(error) = authorizer.authorize(&peer) {
-        let response = BrokerResponse::error(BrokerErrorKind::Unauthenticated, error.to_string());
+        eprintln!("fpsmaxxing-broker: refused a peer: {error}");
+        let response =
+            BrokerResponse::error(BrokerErrorKind::Unauthenticated, UNAUTHORIZED_MESSAGE);
         let _ = write_response_within(&mut stream, &response, REJECTION_WRITE_TIMEOUT).await;
         return Ok(());
     }

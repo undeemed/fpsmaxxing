@@ -14,12 +14,15 @@
 
 use std::io;
 use std::num::NonZeroU64;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fpsmaxxing_broker::{BrokerService, MAX_CONNECTIONS, OwnershipLedger, serve, spawn_service};
-use fpsmaxxing_contracts::ipc::{BrokerErrorKind, BrokerOutcome, BrokerRequest, BrokerResponse};
+use fpsmaxxing_contracts::ipc::{
+    BrokerErrorBody, BrokerErrorKind, BrokerOutcome, BrokerRequest, BrokerResponse,
+};
 use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, StateSnapshot};
 use fpsmaxxing_control_plane::ControlPlane;
 use fpsmaxxing_ipc::{
@@ -137,9 +140,9 @@ fn journal_stages(journal: &Path) -> Vec<String> {
         .expect("rows should read")
 }
 
-fn expect_error(response: &BrokerResponse) -> BrokerErrorKind {
+fn expect_error(response: &BrokerResponse) -> &BrokerErrorBody {
     match response {
-        BrokerResponse::Error { error } => error.kind,
+        BrokerResponse::Error { error } => error,
         other => panic!("expected a typed error, got {other:?}"),
     }
 }
@@ -203,7 +206,23 @@ async fn foreign_peer_is_refused() {
         .expect("a rejection frame should read")
         .expect("the broker should proactively reject");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(expect_error(&response), BrokerErrorKind::Unauthenticated);
+    let error = expect_error(&response);
+    assert_eq!(error.kind, BrokerErrorKind::Unauthenticated);
+
+    // The caller has not authenticated, so it learns that it was refused and
+    // nothing else: neither its own uid nor the broker's may cross. The socket
+    // the broker bound reports the uid it runs as, which is also this peer's.
+    let broker_uid = std::fs::symlink_metadata(&broker.socket)
+        .expect("the bound socket should stat")
+        .uid();
+    assert_eq!(error.message, "peer is not authorized");
+    for uid in [u32::MAX, broker_uid] {
+        assert!(
+            !error.message.contains(&uid.to_string()),
+            "a uid reached an unauthenticated peer: {}",
+            error.message
+        );
+    }
 
     // No lifecycle ever reached the journal.
     assert!(journal_stages(&broker.journal).is_empty());
@@ -224,7 +243,7 @@ async fn second_owner_of_a_held_knob_is_refused() {
         .request(&BrokerRequest::run_lifecycle("owner-b", change(42)))
         .await
         .expect("conflict should respond");
-    assert_eq!(expect_error(&denied), BrokerErrorKind::OwnerConflict);
+    assert_eq!(expect_error(&denied).kind, BrokerErrorKind::OwnerConflict);
 
     // Releasing the knob lets the next owner through over the same connection.
     drop(guard);
@@ -251,7 +270,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .expect("a response should read")
         .expect("the broker should answer");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(expect_error(&response), BrokerErrorKind::Malformed);
+    assert_eq!(expect_error(&response).kind, BrokerErrorKind::Malformed);
 
     let discover = serde_json::to_vec(&BrokerRequest::discover()).expect("discover should encode");
     write_frame(&mut stream, &discover)
@@ -278,7 +297,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .expect("a response should read")
         .expect("the broker should answer");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(expect_error(&response), BrokerErrorKind::Malformed);
+    assert_eq!(expect_error(&response).kind, BrokerErrorKind::Malformed);
 
     // A zero-length frame is answered and the same connection keeps serving.
     let mut stream = UnixStream::connect(&broker.socket)
@@ -294,7 +313,7 @@ async fn malformed_frames_are_rejected_without_crashing_the_broker() {
         .expect("a response should read")
         .expect("the broker should answer an empty frame");
     let response: BrokerResponse = serde_json::from_slice(&frame).expect("response should be JSON");
-    assert_eq!(expect_error(&response), BrokerErrorKind::Malformed);
+    assert_eq!(expect_error(&response).kind, BrokerErrorKind::Malformed);
     write_frame(&mut stream, &discover)
         .await
         .expect("discover should send");
@@ -376,7 +395,7 @@ async fn a_dead_control_plane_worker_shuts_the_broker_down() {
         .request(&BrokerRequest::run_lifecycle("gateway", change(42)))
         .await
         .expect("the faulted request should still be answered");
-    assert_eq!(expect_error(&faulted), BrokerErrorKind::Internal);
+    assert_eq!(expect_error(&faulted).kind, BrokerErrorKind::Internal);
 
     // The broker must not stay up without a control plane: serve reports the
     // loss so the process exits and a supervisor restarts it.

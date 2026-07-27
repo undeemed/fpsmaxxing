@@ -11,7 +11,8 @@
 //! (`FPSMAXXING_BROKER_SOCKET` and `FPSMAXXING_BROKER_JOURNAL_PATH`, both
 //! broker-only) name a path, the socket and the journal live in an owner-only
 //! directory under `$XDG_RUNTIME_DIR` (or `/run`), never beside the inherited
-//! working directory.
+//! working directory. Wherever a path came from, it is held to the same bar
+//! before it is used: absolute, under a parent chain no other user can write.
 //!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
@@ -37,10 +38,10 @@ fn main() {
 mod unix {
     use std::env;
     use std::error::Error;
-    use std::ffi::OsStr;
-    use std::fs::{DirBuilder, Permissions};
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{DirBuilder, OpenOptions, Permissions};
     use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -50,8 +51,27 @@ mod unix {
     use fpsmaxxing_mock_provider::MockProvider;
     use thiserror::Error;
 
-    /// Flags this binary accepts, in `--help` order.
+    /// Value-taking flags this binary accepts, in [`USAGE`] order.
     const FLAGS: [&str; 2] = ["--socket", "--journal"];
+
+    /// Arguments that ask for [`USAGE`] instead of a run.
+    const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
+
+    /// What `--help` prints.
+    const USAGE: &str = "\
+Usage: fpsmaxxing-broker [--socket <path>] [--journal <path>]
+
+  --socket <path>   Unix domain socket to listen on
+                    (environment: FPSMAXXING_BROKER_SOCKET)
+  --journal <path>  SQLite audit journal to write
+                    (environment: FPSMAXXING_BROKER_JOURNAL_PATH)
+  -h, --help        Print this message and exit
+
+A flag wins over its environment variable. Unset, each falls back into an
+owner-only directory under $XDG_RUNTIME_DIR (or /run when it is unset, is not
+absolute, or the broker runs as root). Every path must be absolute and sit
+under a parent chain owned by the broker or root that no other user can
+write, or the broker refuses to start.";
 
     /// Environment override for `--socket`.
     const SOCKET_ENV: &str = "FPSMAXXING_BROKER_SOCKET";
@@ -89,6 +109,12 @@ mod unix {
     /// Journal file name inside the broker's private directory.
     const DEFAULT_JOURNAL_NAME: &str = "journal.sqlite";
 
+    /// The only mode the audit journal may have: owner access only.
+    const JOURNAL_FILE_MODE: u32 = 0o600;
+
+    /// Suffixes `SQLite` appends to a database path for its side files.
+    const JOURNAL_SIDE_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
     /// Why the command line was refused.
     ///
     /// A privileged daemon must not silently relocate its socket or journal
@@ -119,7 +145,12 @@ mod unix {
     }
 
     pub async fn run() -> Result<(), Box<dyn Error>> {
-        let options = parse_args(env::args().skip(1))?;
+        let arguments: Vec<String> = env::args().skip(1).collect();
+        if arguments.iter().any(|argument| wants_help(argument)) {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        let options = parse_args(arguments)?;
         let authorizer = SameUidAuthorizer::for_current_process();
         let broker_uid = authorizer.expected_uid();
         let (socket_path, journal_path) = resolve_paths(options, broker_uid)?;
@@ -127,6 +158,7 @@ mod unix {
         let ledger = Arc::new(OwnershipLedger::new());
         let broker = spawn_service(move || {
             let provider = Box::new(MockProvider::new(0));
+            restrict_journal(&journal_path)?;
             let plane = ControlPlane::open(provider, &journal_path).map_err(io::Error::other)?;
             Ok(BrokerService::new(plane, ledger))
         })
@@ -142,41 +174,133 @@ mod unix {
         Ok(())
     }
 
+    /// Whether an argument asks for [`USAGE`] rather than a run.
+    ///
+    /// Checked before [`parse_args`], which knows only [`FLAGS`] and would
+    /// otherwise refuse `--help` as an unrecognized argument and exit non-zero.
+    fn wants_help(argument: &str) -> bool {
+        HELP_FLAGS.contains(&argument)
+    }
+
     /// Resolves the socket and journal locations, in override order.
     ///
-    /// An explicit flag wins over the matching environment variable, and either
-    /// is taken verbatim: the operator has named a path they control. Anything
+    /// An explicit flag wins over the matching environment variable. Anything
     /// left unset falls back into [`private_directory`] rather than beside the
     /// inherited working directory, so a privileged daemon never places its IPC
     /// endpoint or its durable audit journal somewhere it does not own.
+    ///
+    /// The environment is read with [`env::var_os`] rather than `env::var`, so a
+    /// path that is not UTF-8 relocates the socket or journal as configured
+    /// instead of being silently dropped back to the default.
     fn resolve_paths(options: Options, broker_uid: u32) -> io::Result<(PathBuf, PathBuf)> {
-        resolve_paths_from(options, broker_uid, |name| env::var(name).ok())
+        resolve_paths_from(options, broker_uid, |name| env::var_os(name))
     }
 
     /// [`resolve_paths`] against an arbitrary environment lookup.
     ///
     /// Only [`SOCKET_ENV`] and [`JOURNAL_ENV`] are ever consulted; the broker
     /// shares no path variable with the unprivileged gateway or CLI.
+    ///
+    /// Every resolved path is put through [`vet_resolved_path`], whatever named
+    /// it. An environment variable is inherited from whoever started the broker,
+    /// so honoring one verbatim would hand that caller the choice of where a
+    /// root-owned socket and audit journal are created - exactly what
+    /// [`runtime_base`] refuses them for `XDG_RUNTIME_DIR`.
     fn resolve_paths_from<F>(
         options: Options,
         broker_uid: u32,
         lookup: F,
     ) -> io::Result<(PathBuf, PathBuf)>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<OsString>,
     {
-        let socket = options.socket.or_else(|| lookup(SOCKET_ENV));
-        let journal = options.journal.or_else(|| lookup(JOURNAL_ENV));
-        match (socket, journal) {
-            (Some(socket), Some(journal)) => Ok((PathBuf::from(socket), PathBuf::from(journal))),
+        let socket = options
+            .socket
+            .map(OsString::from)
+            .or_else(|| lookup(SOCKET_ENV));
+        let journal = options
+            .journal
+            .map(OsString::from)
+            .or_else(|| lookup(JOURNAL_ENV));
+        let (socket, journal) = match (socket, journal) {
+            (Some(socket), Some(journal)) => (PathBuf::from(socket), PathBuf::from(journal)),
             (socket, journal) => {
                 let directory = private_directory(broker_uid)?;
-                Ok((
+                (
                     socket.map_or_else(|| directory.join(DEFAULT_SOCKET_NAME), PathBuf::from),
                     journal.map_or_else(|| directory.join(DEFAULT_JOURNAL_NAME), PathBuf::from),
-                ))
+                )
+            }
+        };
+        vet_resolved_path(&socket, broker_uid)?;
+        vet_resolved_path(&journal, broker_uid)?;
+        Ok((socket, journal))
+    }
+
+    /// Refuses a resolved socket or journal path the broker must not use.
+    ///
+    /// A relative path would resolve against the inherited working directory,
+    /// which is as much the caller's choice as the variable that named it. A
+    /// parent another user may write is what makes the socket path raceable at
+    /// bind time and the journal readable, so the whole chain above the file
+    /// goes through [`vet_ancestors`] - the same vet the default directory gets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::PermissionDenied`] for a path that is not
+    /// absolute or names no parent directory, or whatever [`vet_ancestors`]
+    /// refuses the parent with.
+    fn vet_resolved_path(path: &Path, broker_uid: u32) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .filter(|_| path.is_absolute())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} must be an absolute path to an entry inside a directory",
+                        path.display()
+                    ),
+                )
+            })?;
+        vet_ancestors(parent, broker_uid)
+    }
+
+    /// Restricts the audit journal to its owner before the journal is opened.
+    ///
+    /// `SQLite` creates a database with mode `0666` masked by the inherited
+    /// umask, so an operator-supplied path outside the broker's own `0700`
+    /// directory would otherwise hold every `apply-intent` record - the full
+    /// change request - in a world-readable file. Creating the database
+    /// owner-only first closes that, and closes it for the rollback journal and
+    /// write-ahead log too: `SQLite` copies the database file's mode onto the
+    /// side files it creates beside it. A side file left behind by an earlier
+    /// run is restricted directly, since nothing will recreate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal cannot be created or if it or an existing
+    /// side file cannot be restricted.
+    fn restrict_journal(path: &Path) -> io::Result<()> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(JOURNAL_FILE_MODE)
+            .open(path)?;
+        std::fs::set_permissions(path, Permissions::from_mode(JOURNAL_FILE_MODE))?;
+        for suffix in JOURNAL_SIDE_SUFFIXES {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            match std::fs::set_permissions(
+                Path::new(&side),
+                Permissions::from_mode(JOURNAL_FILE_MODE),
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
         }
+        Ok(())
     }
 
     /// Returns the broker's private directory, creating it when it is absent.
@@ -333,15 +457,18 @@ mod unix {
     mod tests {
         use std::cell::RefCell;
         use std::collections::BTreeSet;
-        use std::ffi::OsStr;
+        use std::ffi::{OsStr, OsString};
         use std::io;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
+
+        use fpsmaxxing_control_plane::ControlPlane;
+        use fpsmaxxing_mock_provider::MockProvider;
 
         use super::{
-            ArgError, FALLBACK_RUNTIME_BASE, JOURNAL_ENV, Options, PRIVATE_DIR_MODE,
-            PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV, parse_args, private_directory_in,
-            resolve_paths_from, runtime_base,
+            ArgError, FALLBACK_RUNTIME_BASE, HELP_FLAGS, JOURNAL_ENV, JOURNAL_FILE_MODE, Options,
+            PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV, parse_args,
+            private_directory_in, resolve_paths_from, restrict_journal, runtime_base, wants_help,
         };
 
         /// The variable the unprivileged gateway and CLI use for their journal.
@@ -354,12 +481,23 @@ mod unix {
             parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
         }
 
-        /// A lookup that answers every name and records which were asked for.
-        fn recording_lookup(seen: &RefCell<BTreeSet<String>>) -> impl Fn(&str) -> Option<String> {
+        /// A lookup that answers every name with a vettable path under `base`.
+        ///
+        /// It records which names were asked for, so a test can prove the broker
+        /// never reaches for a variable that is not its own.
+        fn recording_lookup<'a>(
+            base: &'a Path,
+            seen: &'a RefCell<BTreeSet<String>>,
+        ) -> impl Fn(&str) -> Option<OsString> + 'a {
             move |name| {
                 seen.borrow_mut().insert(name.to_owned());
-                Some(format!("/from-env/{name}"))
+                Some(base.join(name).into_os_string())
             }
+        }
+
+        /// A lookup that answers only [`SOCKET_ENV`], with `value`.
+        fn socket_env_lookup(value: &Path) -> impl Fn(&str) -> Option<OsString> + '_ {
+            move |name| (name == SOCKET_ENV).then(|| value.as_os_str().to_owned())
         }
 
         /// The uid the test process creates files as, read from one it created.
@@ -372,6 +510,13 @@ mod unix {
         fn chmod(path: &Path, mode: u32) {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .expect("mode should apply");
+        }
+
+        /// A path as the `String` a command-line flag would carry.
+        fn path_string(path: &Path) -> String {
+            path.to_str()
+                .expect("a temporary path should be UTF-8")
+                .to_owned()
         }
 
         #[test]
@@ -430,13 +575,18 @@ mod unix {
 
         #[test]
         fn the_journal_never_comes_from_the_gateway_environment() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
             let seen = RefCell::new(BTreeSet::new());
-            let (socket, journal) =
-                resolve_paths_from(Options::default(), SESSION_UID, recording_lookup(&seen))
-                    .expect("both paths come from the environment, so no directory is touched");
+            let (socket, journal) = resolve_paths_from(
+                Options::default(),
+                uid,
+                recording_lookup(base.path(), &seen),
+            )
+            .expect("both paths come from the environment, so no directory is touched");
 
-            assert_eq!(socket, PathBuf::from(format!("/from-env/{SOCKET_ENV}")));
-            assert_eq!(journal, PathBuf::from(format!("/from-env/{JOURNAL_ENV}")));
+            assert_eq!(socket, base.path().join(SOCKET_ENV));
+            assert_eq!(journal, base.path().join(JOURNAL_ENV));
             assert_eq!(JOURNAL_ENV, "FPSMAXXING_BROKER_JOURNAL_PATH");
             assert!(
                 !seen.borrow().contains(GATEWAY_JOURNAL_ENV),
@@ -452,20 +602,130 @@ mod unix {
 
         #[test]
         fn explicit_flags_win_over_the_environment() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
             let seen = RefCell::new(BTreeSet::new());
             let options = Options {
-                socket: Some("/run/b.sock".to_owned()),
-                journal: Some("/var/j.sqlite".to_owned()),
+                socket: Some(path_string(&base.path().join("b.sock"))),
+                journal: Some(path_string(&base.path().join("j.sqlite"))),
             };
             let (socket, journal) =
-                resolve_paths_from(options, SESSION_UID, recording_lookup(&seen))
+                resolve_paths_from(options, uid, recording_lookup(base.path(), &seen))
                     .expect("explicit flags need no directory");
-            assert_eq!(socket, PathBuf::from("/run/b.sock"));
-            assert_eq!(journal, PathBuf::from("/var/j.sqlite"));
+            assert_eq!(socket, base.path().join("b.sock"));
+            assert_eq!(journal, base.path().join("j.sqlite"));
             assert!(
                 seen.borrow().is_empty(),
                 "a flag must not consult the environment at all"
             );
+        }
+
+        #[test]
+        fn a_relative_path_from_the_environment_is_refused() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let options = Options {
+                journal: Some(path_string(&base.path().join("j.sqlite"))),
+                ..Options::default()
+            };
+            let error =
+                resolve_paths_from(options, uid, socket_env_lookup(Path::new("broker.sock")))
+                    .expect_err("a relative override would land beside the inherited cwd");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn a_path_from_the_environment_under_a_writable_parent_is_refused() {
+            let outer = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(outer.path());
+            let reachable = outer.path().join("reachable");
+            std::fs::create_dir(&reachable).expect("directory should create");
+            chmod(&reachable, 0o777);
+
+            let options = Options {
+                journal: Some(path_string(&outer.path().join("j.sqlite"))),
+                ..Options::default()
+            };
+            let error = resolve_paths_from(
+                options,
+                uid,
+                socket_env_lookup(&reachable.join("broker.sock")),
+            )
+            .expect_err("an override under a world-writable parent must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+            // The same override is accepted once nobody else can write its parent.
+            chmod(&reachable, PRIVATE_DIR_MODE);
+            let options = Options {
+                journal: Some(path_string(&outer.path().join("j.sqlite"))),
+                ..Options::default()
+            };
+            let (socket, _journal) = resolve_paths_from(
+                options,
+                uid,
+                socket_env_lookup(&reachable.join("broker.sock")),
+            )
+            .expect("an owner-only parent is sound");
+            assert_eq!(socket, reachable.join("broker.sock"));
+        }
+
+        #[test]
+        fn a_flag_path_is_vetted_the_same_way_as_the_environment() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let uid = own_uid(base.path());
+            let options = Options {
+                socket: Some("broker.sock".to_owned()),
+                journal: Some(path_string(&base.path().join("j.sqlite"))),
+            };
+            let error = resolve_paths_from(options, uid, |_| None)
+                .expect_err("a flag must not bypass the vet an override is held to");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn the_journal_is_owner_only_once_it_is_open() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let journal = base.path().join("journal.sqlite");
+            restrict_journal(&journal).expect("the journal should be restricted");
+            let plane = ControlPlane::open(Box::new(MockProvider::new(0)), &journal)
+                .expect("control plane should open");
+            drop(plane);
+
+            let metadata = std::fs::symlink_metadata(&journal).expect("journal should stat");
+            assert_eq!(
+                metadata.mode() & 0o777,
+                JOURNAL_FILE_MODE,
+                "the privileged audit journal must not be readable by anyone else"
+            );
+        }
+
+        #[test]
+        fn an_existing_journal_and_its_side_files_are_restricted() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let journal = base.path().join("journal.sqlite");
+            std::fs::write(&journal, b"").expect("journal should create");
+            chmod(&journal, 0o644);
+            let side = base.path().join("journal.sqlite-wal");
+            std::fs::write(&side, b"").expect("side file should create");
+            chmod(&side, 0o644);
+
+            restrict_journal(&journal).expect("an existing journal should be restricted");
+            for path in [&journal, &side] {
+                let metadata = std::fs::symlink_metadata(path).expect("path should stat");
+                assert_eq!(metadata.mode() & 0o777, JOURNAL_FILE_MODE);
+            }
+        }
+
+        #[test]
+        fn help_is_recognized_before_the_command_line_is_parsed() {
+            for flag in HELP_FLAGS {
+                assert!(wants_help(flag), "{flag} should ask for usage");
+                assert!(
+                    matches!(parse(&[flag]), Err(ArgError::Unrecognized { .. })),
+                    "{flag} is intercepted before the parser, which knows only FLAGS"
+                );
+            }
+            assert!(!wants_help("--socket"));
         }
 
         #[test]

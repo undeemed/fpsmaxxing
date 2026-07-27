@@ -28,11 +28,15 @@ It is not the shipping policy for the privilege split described above: once the 
 The real privilege-split ACL arrives with the Windows named-pipe SID implementation of the `PeerAuthorizer` trait, tracked separately; because every caller reaches the ACL through that trait, no call site changes when it lands.
 The trusted uid is read from the broker's own effective credentials rather than from the socket file's owner, so replacing the socket path cannot redirect the ACL.
 In this interim every authorized peer is the same identity, so journaling the verified peer uid and pid against each lifecycle, and authenticating the client-supplied owner label against them, only carry their weight once split-privilege ACLs arrive; both are tracked as follow-up work `fpsm-broker-splitacl`.
+A peer refused by the ACL is told only that it is not authorized: the refusal names neither uid, because the caller it reaches has not authenticated, and the uid pair is traced locally instead.
 Unless an explicit path is given, the broker keeps its socket and its journal in an owner-only directory under `$XDG_RUNTIME_DIR` (or `/run`) rather than beside the inherited working directory, so no other user can race the socket path or read the audit journal.
 `XDG_RUNTIME_DIR` is inherited from whoever started the broker, so it is honored only when it is absolute and only for an unprivileged broker; a broker running as root always uses `/run`.
 That directory and every directory above it must be owned by the broker or root and unwritable by anyone else, or the broker fails closed: a writable parent is what would let another user swap a vetted directory for a symlink between the check and the bind.
+Every resolved path is held to that same bar, whether a flag, an environment variable, or the default named it: it must be absolute, and the whole chain above it is vetted, so an inherited variable cannot buy a caller the placement `XDG_RUNTIME_DIR` is filtered to deny them.
 The socket file's own mode is not pinned, because the only ways to do so are a symlink-following `chmod` or a window in the process-global umask; confidentiality rests on the private directory and the `SO_PEERCRED` gate instead.
+The audit journal is different: it holds every `apply-intent` record and outlives the process, so it is created mode `0600` before it is opened, which also restricts the rollback journal and write-ahead log `SQLite` creates beside it.
 The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway and CLI use, so an operator who exported that variable cannot move the privileged audit journal.
+Both are read as raw `OsString` values, so a path that is not UTF-8 relocates the socket or journal as configured rather than being silently dropped back to the default.
 
 The broker fails fast rather than degrading.
 Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.
@@ -42,6 +46,7 @@ Deploy it under a supervisor that restarts on failure, and let the watchdog own 
 
 - `fpsm-broker-splitacl`: the real split-privilege ACL, replacing the interim same-uid policy described above, plus journaling the verified peer uid and pid against each lifecycle and authenticating the client-supplied owner label against them.
 - Client reconnect on `Closed`: the broker closes a connection idle for 30 seconds, and `BrokerClient` holds one long-lived stream with no keepalive or reconnect, so a caller whose requests are further apart than that gets `ClientError::Closed`. Whether the client reconnects transparently, the server distinguishes a healthy idle peer from a stalled one, or callers connect per request is undecided.
+- `broker-dispatch-unbounded`: neither `BrokerHandle::dispatch` nor `BrokerClient::request` bounds the wait on the single control-plane worker, so a provider that blocks inside `apply` or `verify` stalls every peer rather than failing one. Deferred to the pass that adds graceful shutdown, which has to answer the same question: what a request already in flight is owed when the broker stops serving.
 
 ### Watchdog
 
