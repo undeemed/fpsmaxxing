@@ -99,6 +99,7 @@ Try the read-only alpha:
 cargo test --workspace
 cargo run -p fpsmaxxing-cli -- doctor
 cargo run -p fpsmaxxing-mock-provider
+cargo run -p fpsmaxxing-experiment-runner
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fpsmaxxing.run_mock_lifecycle","arguments":{"value":42,"lease_seconds":30}}}' \
@@ -110,6 +111,9 @@ Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL
 
 Run the watchdog against the same journal to reclaim leaked experiments: `cargo run -p fpsmaxxing-watchdog -- --once` performs a single expired-lease pass and `--recover-all` rolls back every unclosed experiment after a crash.
 It accepts the same `--journal <path>` and `FPSMAXXING_JOURNAL_PATH` overrides, plus `--interval <seconds>` for its steady-state poll loop.
+
+The experiment runner measures a baseline and a candidate against a deterministic stand-in for live telemetry, gates the candidate's lifecycle on the immutable evaluator's verdict, journals the trial with its spec, samples, and verdict, then replays it from the journal alone and checks the re-evaluated verdict against the recorded one.
+It is a demonstration binary rather than an MCP tool, takes no arguments, and journals to an in-memory SQLite database, so it leaves nothing on disk and exits non-zero if a replay diverges from the journal, falls outside the policy gate, or the broker refuses a promoted lifecycle.
 
 ## Architecture
 
@@ -134,7 +138,7 @@ Start with the [documentation index](docs/README.md). The core references are th
 
 ### Can Claude optimize my PC for higher FPS?
 
-That is the intended workflow. A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy. The alpha already runs capability discovery and the bounded snapshot-to-rollback lifecycle over MCP against a mock provider; the measurement-driven keep-or-rollback decision and real hardware providers are not implemented yet.
+That is the intended workflow. A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy. The alpha already runs capability discovery and the bounded snapshot-to-rollback lifecycle over MCP against a mock provider, and it promotes or rejects one measured experiment through an immutable evaluator that decides from recorded samples and fixed bounds alone. Real hardware providers, live frame-time measurement, and a promotion that survives its lease are not implemented yet: the alpha measures a deterministic stand-in for telemetry, and the verdict gates whether a candidate is applied at all rather than whether it persists.
 
 ### Can an AI safely overclock a GPU?
 

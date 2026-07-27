@@ -39,6 +39,7 @@ The recorded samples themselves are not re-derived and nothing ties them to the 
 Re-deriving the samples would in fact work today, because the stand-in model is a pure function of values the record already carries, and it is deliberately not done: real telemetry is not reproducible, which is why samples are journaled verbatim in the first place, so a gate built on the model's reproducibility would have to be deleted the moment that model is replaced.
 Measurement-content integrity needs a signed or hash-chained journal instead, which the alpha defers rather than approximates.
 Because mock capabilities are leased and the broker lifecycle always rolls back, the verdict gates whether the candidate is applied at all rather than whether it persists; durable keep-or-rollback awaits the privileged broker.
+The candidate is also measured before it is applied, which only the pure stand-in model permits: real `PresentMon` or hardware telemetry cannot observe a candidate that was never written, so swapping it in moves the candidate measurement inside the apply-and-lease window and runs the gate after it.
 
 ### Provider sidecars
 

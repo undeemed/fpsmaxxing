@@ -99,6 +99,13 @@ observe
 
 Use the LLM for hypothesis generation and explanation. Use deterministic search and statistics for numeric optimization.
 
+The alpha implements this loop deterministically in `apps/experiment-runner` against the mock provider.
+A typed spec (`schemas/experiment.schema.json`) declares the hypothesis, the target capability change, the warmup and repeated baseline/candidate sample counts, and the decision bounds.
+The immutable evaluator applies one fixed, ordered threshold rule - minimum sample count, then the temperature, power, and error ceilings, then the mean-FPS improvement threshold - and returns a verdict (`schemas/verdict.schema.json`) that gates whether the candidate reaches the broker lifecycle at all.
+Every trial is journaled with its spec, recorded samples, and verdict, so it replays and re-evaluates from the journal alone.
+Measurement is a deterministic stand-in for `PresentMon` and hardware telemetry, and a leased mock change cannot outlive its lifecycle, so live telemetry, statistical search, and durable promotion remain ahead of this phase.
+Because that stand-in depends only on the knob value, the alpha measures the candidate before applying it; real telemetry moves that measurement inside the apply-and-lease window shown above.
+
 ## Safety invariants
 
 - No generic shell or raw Registry path reaches the broker.
