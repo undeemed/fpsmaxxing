@@ -8,10 +8,15 @@
 //! A replay that diverges from the journal means the record was tampered with
 //! or the immutable evaluator drifted, and a replay the policy gate refuses -
 //! its capability, hypothesis length, sample counts, decision bounds, target
-//! parameters, candidate value, TTL lease, baseline ceiling, the lifecycle
-//! fields its decision implies, or the agreement between the record and the
-//! spec it carries - means the journaled row is not one this runner would write
-//! under the policy in force now. The remaining two failures are the trial's
+//! parameters, TTL lease, the candidate value the spec's own copy of it
+//! implies, the ceiling the baseline is held under, the lifecycle fields its
+//! decision implies, or the agreement between the record and the spec it
+//! carries - means the journaled row is not one this runner would write under
+//! the policy in force now. A clean replay is not the converse: the samples are
+//! not re-derived and nothing ties them to the values they were taken at, so a
+//! rewrite of the measurements with the verdict they imply, of the hypothesis
+//! within its length bounds, or of the candidate and baseline values within
+//! policy passes both reads. The remaining two failures are the trial's
 //! own: a lifecycle that fails after the trial was measured, which is journaled
 //! anyway so the error names the row or says why the row was lost, and a
 //! journal that refuses the record of a trial that already ran, which reports

@@ -436,22 +436,32 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// spec as well. [`run_trial`] always journals the value it validated, exactly
 /// the sample counts the spec asked for, and a baseline inside the same
 /// [`MAX_MOCK_VALUE`] ceiling, so a record contradicting its own spec was not
-/// written by this runner. The lifecycle fields are held to the decision that
-/// authorized them for the same reason: the trial row is the only auditable
-/// statement about whether a promotion reached the provider, so a promotion
-/// whose lifecycle went unrecorded, or a rejection carrying one, is a claim this
-/// runner cannot make. A recorded lifecycle is held to its own contents too:
+/// written by this runner. Those terms are not equally independent: the sample
+/// counts are held to a declaration the record makes separately from the
+/// samples themselves, but the candidate value is held only to the copy of
+/// itself the spec carries in `parameters.value`, and the baseline value has no
+/// second term anywhere - it is bounded by the ceiling and nothing else. The
+/// lifecycle fields are held to the decision that authorized them for the same
+/// reason: the trial row is the only auditable statement about whether a
+/// promotion reached the provider, so a promotion whose lifecycle went
+/// unrecorded, or a rejection carrying one, is a claim this runner cannot make.
+/// A recorded lifecycle is held to its own contents too:
 /// [`ControlPlane::run_lifecycle`] returns an outcome only after the applied
 /// value verified and the captured baseline was restored, so a row claiming a
 /// promotion that went unverified, or one whose knob was left mutated, is the
 /// same kind of unwritable claim.
 ///
-/// Detection stops at that structural layer. The recorded samples are not
-/// re-derived, and the hypothesis is held to its length rather than its content:
-/// every other checked field has a second term to disagree with, while the
-/// hypothesis is free text with no redundant copy in the record. So a rewrite of
-/// the measurements together with the verdict they imply, or of the hypothesis
-/// text within its bounds, passes both this check and the verdict comparison.
+/// Detection stops at that structural layer, and covers less of it than the
+/// list of checked fields reads like. The recorded samples are not re-derived,
+/// and nothing ties them to the knob values they were taken at, so three
+/// rewrites pass both this check and the verdict comparison: the measurements
+/// together with the verdict they imply, the hypothesis text within its length
+/// bounds, and a coherent relabelling of the knob values. That last one needs
+/// no forged sample at all - editing `parameters.value` and `candidate_value`
+/// together to any other in-bounds value, or `baseline_value` to any other
+/// value under the ceiling, leaves the samples and the verdict untouched, so
+/// the row replays as legal while the archive now attributes those measurements
+/// to a value they were never taken at.
 ///
 /// Re-deriving the samples is possible in this alpha and deliberately not done.
 /// [`model::measure`] is pure in the knob value and the two counts, all three of
