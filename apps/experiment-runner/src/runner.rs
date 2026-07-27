@@ -348,7 +348,11 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// spec as well. [`run_trial`] always journals the value it validated, exactly
 /// the sample counts the spec asked for, and a baseline inside the same
 /// [`MAX_MOCK_VALUE`] ceiling, so a record contradicting its own spec was not
-/// written by this runner.
+/// written by this runner. The lifecycle fields are held to the decision that
+/// authorized them for the same reason: the trial row is the only auditable
+/// statement about whether a promotion reached the provider, so a promotion
+/// whose lifecycle went unrecorded, or a rejection carrying one, is a claim this
+/// runner cannot make.
 ///
 /// Detection stops at that structural layer. The recorded samples are not
 /// re-derived, so a rewrite of the measurements together with the verdict they
@@ -368,7 +372,10 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
         )));
     }
     if record.baseline_value > MAX_MOCK_VALUE {
-        return Err(RunnerError::BaselineOutOfPolicy(record.baseline_value));
+        return Err(RunnerError::InconsistentRecord(format!(
+            "baseline_value is {}, above the {MAX_MOCK_VALUE} the policy allows",
+            record.baseline_value
+        )));
     }
     for (label, samples, declared) in [
         (
@@ -390,7 +397,26 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
             )));
         }
     }
+    let recorded_lifecycle = record.lifecycle.is_some();
+    let recorded_failure = record.lifecycle_error.is_some();
+    let holds = match record.verdict.decision {
+        Decision::Promote => recorded_lifecycle != recorded_failure,
+        Decision::Reject => !recorded_lifecycle && !recorded_failure,
+    };
+    if !holds {
+        return Err(RunnerError::InconsistentRecord(format!(
+            "verdict is {:?} with lifecycle {} and lifecycle_error {}, but a promotion records exactly one of the two and a rejection neither",
+            record.verdict.decision,
+            presence(recorded_lifecycle),
+            presence(recorded_failure)
+        )));
+    }
     Ok(())
+}
+
+/// Renders whether an optional record field was journaled.
+fn presence(recorded: bool) -> &'static str {
+    if recorded { "present" } else { "absent" }
 }
 
 /// Whether a recorded measurement set holds exactly the count its spec declared.

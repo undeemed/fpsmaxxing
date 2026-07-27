@@ -397,7 +397,7 @@ fn a_replay_reports_bounds_outside_the_policy_envelope() {
 }
 
 #[test]
-fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
+fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
     let journal = NamedTempFile::new().expect("temp journal");
     let mut plane =
         ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
@@ -405,9 +405,9 @@ fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
     let recorded = plane.read_trial(trial.id).expect("trial should read");
 
     // Each of these rows re-evaluates to exactly the verdict it carries, so
-    // comparing verdicts cannot catch any of them. Replay re-runs the whole
-    // run-time gate over the journaled spec instead, and cross-checks the
-    // record against the spec it carries.
+    // comparing verdicts cannot catch any of them. Replay applies the policy
+    // gate to the journaled spec instead - deliberately without the run-time
+    // manifest check - and cross-checks the record against the spec it carries.
     let refused = [
         (
             "a capability the model never described",
@@ -439,7 +439,7 @@ fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
         ),
         (
             "a baseline outside the policy envelope",
-            "snapshot value",
+            "baseline_value",
             {
                 let mut payload = recorded.clone();
                 payload["baseline_value"] = json!(MAX_MOCK_VALUE + 1);
@@ -483,6 +483,59 @@ fn a_replay_reports_a_record_the_run_time_gate_would_refuse() {
     let outcome = replay_trial(&plane, trial.id).expect("replay trial");
     assert!(outcome.is_consistent() && outcome.policy_legal);
     assert!(outcome.policy_reason.is_none());
+}
+
+#[test]
+fn a_replay_reports_lifecycle_fields_that_contradict_the_verdict() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let promoted = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+    let rejected = run_trial(&mut plane, &spec_for(70, 5.0, 80.0)).expect("run trial");
+    assert_eq!(rejected.record.verdict.decision, Decision::Reject);
+
+    // A promotion is journaled once its lifecycle has finished, carrying either
+    // the outcome or the broker error, so a row with neither claims a promotion
+    // whose fate went unrecorded.
+    let mut stripped = plane.read_trial(promoted.id).expect("trial should read");
+    stripped["lifecycle"] = json!(null);
+
+    // A rejected candidate is never applied, so a lifecycle on that row claims
+    // the knob was written when it never was - the trial record is the only
+    // auditable statement that it reached the provider.
+    let mut fabricated = plane.read_trial(rejected.id).expect("trial should read");
+    fabricated["lifecycle"] = json!({
+        "provider_id": "mock",
+        "preview": "set value to 70",
+        "verified": true,
+        "rolled_back": true,
+    });
+
+    for (rewrite, payload) in [
+        ("a promotion recording no lifecycle", stripped),
+        ("a rejection recording a lifecycle", fabricated),
+    ] {
+        let tampered = plane
+            .record_trial(&payload)
+            .expect("a rewritten record should append");
+        let outcome = replay_trial(&plane, tampered).expect("replay trial");
+        assert!(
+            outcome.is_consistent(),
+            "{rewrite} still reproduces the recorded verdict"
+        );
+        assert!(!outcome.policy_legal, "{rewrite} must replay as illegal");
+        let reason = outcome
+            .policy_reason
+            .unwrap_or_else(|| panic!("{rewrite} must carry a reason"));
+        assert!(reason.contains("lifecycle"), "{rewrite}: {reason}");
+    }
+
+    // Both trials as they were actually run stay legal.
+    for id in [promoted.id, rejected.id] {
+        let outcome = replay_trial(&plane, id).expect("replay trial");
+        assert!(outcome.is_consistent() && outcome.policy_legal);
+        assert!(outcome.policy_reason.is_none());
+    }
 }
 
 #[test]

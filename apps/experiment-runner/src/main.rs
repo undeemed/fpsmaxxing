@@ -8,9 +8,10 @@
 //! A replay that diverges from the journal means the record was tampered with
 //! or the immutable evaluator drifted, and a replay the policy gate refuses -
 //! its capability, sample counts, decision bounds, candidate value, baseline
-//! ceiling, or the agreement between the record and the spec it carries - means
-//! the journaled row is not one this runner would have written. The demo exits
-//! non-zero on either rather than reporting it as a successful run.
+//! ceiling, the lifecycle fields its decision implies, or the agreement between
+//! the record and the spec it carries - means the journaled row is not one this
+//! runner would have written. The demo exits non-zero on either rather than
+//! reporting it as a successful run.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
