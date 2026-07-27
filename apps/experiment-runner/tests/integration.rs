@@ -22,7 +22,7 @@ use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_tr
 use fpsmaxxing_mock_provider::MockProvider;
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
 /// Builds a spec that drives the mock knob to `candidate` under the given
@@ -663,19 +663,15 @@ fn a_replay_reports_bounds_outside_the_policy_envelope() {
     assert!(outcome.policy_reason.is_none());
 }
 
-#[test]
-fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
-    let journal = NamedTempFile::new().expect("temp journal");
-    let mut plane =
-        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
-    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
-    let recorded = plane.read_trial(trial.id).expect("trial should read");
-
-    // Each of these rows re-evaluates to exactly the verdict it carries, so
-    // comparing verdicts cannot catch any of them. Replay applies the policy
-    // gate to the journaled spec instead - deliberately without the run-time
-    // manifest check - and cross-checks the record against the spec it carries.
-    let refused = [
+/// Rewrites of a journaled promotion that the policy gate must refuse.
+///
+/// Each row re-evaluates to exactly the verdict it carries, so comparing
+/// verdicts cannot catch any of them. Replay applies the policy gate to the
+/// journaled spec instead - deliberately without the run-time manifest check -
+/// and cross-checks the record against the spec it carries. Every entry is a
+/// rewrite label, the gate name its reason must mention, and the payload.
+fn rewrites_the_policy_gate_refuses(recorded: &Value) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
         (
             "a capability the model never described",
             "unknown capability",
@@ -746,9 +742,18 @@ fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
                 payload
             },
         ),
-    ];
+    ]
+}
 
-    for (rewrite, expected_reason, payload) in refused {
+#[test]
+fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+    let recorded = plane.read_trial(trial.id).expect("trial should read");
+
+    for (rewrite, expected_reason, payload) in rewrites_the_policy_gate_refuses(&recorded) {
         let tampered = plane
             .record_trial(&payload)
             .expect("a rewritten record should append");

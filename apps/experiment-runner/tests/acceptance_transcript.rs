@@ -12,8 +12,11 @@
 //! produced them.
 
 use std::num::{NonZeroU32, NonZeroU64};
+use std::path::Path;
 
-use fpsmaxxing_contracts::{ChangeRequest, Decision, DecisionBounds, ExperimentSpec, VerdictReason};
+use fpsmaxxing_contracts::{
+    ChangeRequest, Decision, DecisionBounds, ExperimentSpec, VerdictReason,
+};
 use fpsmaxxing_control_plane::ControlPlane;
 use fpsmaxxing_experiment_runner::{StoredTrial, TrialRecord, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
@@ -107,56 +110,90 @@ fn report(label: &str, trial: &StoredTrial) {
     }
 }
 
+/// Measures both experiments over one journal, returning the trials they stored.
+///
+/// The control plane is dropped when this returns, so the journal file is closed
+/// before the transcript reads it back.
+fn measure_both_experiments(journal_path: &Path) -> (StoredTrial, StoredTrial) {
+    let mut plane = ControlPlane::open(Box::new(MockProvider::new(BASELINE_VALUE)), journal_path)
+        .expect("open");
+    println!(
+        "provider parked at mock.value = {}\n",
+        current_value(&plane)
+    );
+
+    // A measured experiment the evaluator promotes: the candidate gains 30 fps
+    // and stays inside every safety ceiling, so the broker runs the full
+    // snapshot/preview/apply/verify/rollback lifecycle.
+    let promoted = run_trial(&mut plane, &spec_for(40)).expect("run promoted trial");
+    report("promoted", &promoted);
+    assert_eq!(promoted.record.verdict.decision, Decision::Promote);
+    assert_eq!(promoted.record.verdict.reason, VerdictReason::Promoted);
+    let lifecycle = promoted
+        .record
+        .lifecycle
+        .clone()
+        .expect("a promotion records its lifecycle");
+    assert!(lifecycle.verified && lifecycle.rolled_back);
+    println!(
+        "  provider after  : mock.value = {} (the lease restored the pre-state)\n",
+        current_value(&plane)
+    );
+    assert_eq!(current_value(&plane), BASELINE_VALUE);
+
+    // A measured experiment the evaluator rejects: the candidate gains even more
+    // fps but drives modeled temperature to 85 C, past the ceiling, so it is
+    // never applied and the baseline is left exactly as it was.
+    let rejected = run_trial(&mut plane, &spec_for(70)).expect("run rejected trial");
+    report("rejected", &rejected);
+    assert_eq!(rejected.record.verdict.decision, Decision::Reject);
+    assert_eq!(
+        rejected.record.verdict.reason,
+        VerdictReason::TemperatureExceeded
+    );
+    assert!(rejected.record.lifecycle.is_none());
+    assert!(rejected.record.lifecycle_error.is_none());
+    println!(
+        "  provider after  : mock.value = {} (untouched - nothing was applied)\n",
+        current_value(&plane)
+    );
+    assert_eq!(current_value(&plane), BASELINE_VALUE);
+
+    (promoted, rejected)
+}
+
+/// Shows that a clean replay is a real check rather than a rubber stamp.
+///
+/// Appends a copy of the promotion whose temperature ceiling was widened after
+/// the fact. It re-evaluates to the very verdict it carries, so only the policy
+/// gate replay re-applies can catch it.
+fn replay_catches_widened_bounds(archive: &ControlPlane, promoted_id: i64) {
+    let mut widened = archive.read_trial(promoted_id).expect("read trial");
+    widened["spec"]["bounds"]["max_temperature_c"] = json!(200.0);
+    let widened_id = archive
+        .record_trial(&widened)
+        .expect("append the widened row");
+    let outcome = replay_trial(archive, widened_id).expect("replay the widened row");
+    println!(
+        "  [tampered] trial {}: bounds widened to 200 C; recomputed verdict still identical = {}, but policy legal = {} ({})",
+        outcome.trial_id,
+        outcome.is_consistent(),
+        outcome.policy_legal,
+        outcome
+            .policy_reason
+            .as_deref()
+            .unwrap_or("no reason given")
+    );
+    assert!(outcome.is_consistent());
+    assert!(!outcome.policy_legal);
+}
+
 #[test]
 fn one_measured_experiment_is_promoted_and_another_rejected_then_both_replay() {
     let journal = NamedTempFile::new().expect("temp journal");
     println!("journal file: an on-disk SQLite database\n");
 
-    let promoted;
-    let rejected;
-    {
-        let mut plane =
-            ControlPlane::open(Box::new(MockProvider::new(BASELINE_VALUE)), journal.path())
-                .expect("open");
-        println!("provider parked at mock.value = {}\n", current_value(&plane));
-
-        // A measured experiment the evaluator promotes: the candidate gains
-        // 30 fps and stays inside every safety ceiling, so the broker runs the
-        // full snapshot/preview/apply/verify/rollback lifecycle.
-        promoted = run_trial(&mut plane, &spec_for(40)).expect("run promoted trial");
-        report("promoted", &promoted);
-        assert_eq!(promoted.record.verdict.decision, Decision::Promote);
-        assert_eq!(promoted.record.verdict.reason, VerdictReason::Promoted);
-        let lifecycle = promoted
-            .record
-            .lifecycle
-            .clone()
-            .expect("a promotion records its lifecycle");
-        assert!(lifecycle.verified && lifecycle.rolled_back);
-        println!(
-            "  provider after  : mock.value = {} (the lease restored the pre-state)\n",
-            current_value(&plane)
-        );
-        assert_eq!(current_value(&plane), BASELINE_VALUE);
-
-        // A measured experiment the evaluator rejects: the candidate gains even
-        // more fps but drives modeled temperature to 85 C, past the ceiling, so
-        // it is never applied and the baseline is left exactly as it was.
-        rejected = run_trial(&mut plane, &spec_for(70)).expect("run rejected trial");
-        report("rejected", &rejected);
-        assert_eq!(rejected.record.verdict.decision, Decision::Reject);
-        assert_eq!(
-            rejected.record.verdict.reason,
-            VerdictReason::TemperatureExceeded
-        );
-        assert!(rejected.record.lifecycle.is_none());
-        assert!(rejected.record.lifecycle_error.is_none());
-        println!(
-            "  provider after  : mock.value = {} (untouched - nothing was applied)\n",
-            current_value(&plane)
-        );
-        assert_eq!(current_value(&plane), BASELINE_VALUE);
-    }
+    let (promoted, rejected) = measure_both_experiments(journal.path());
 
     // The rows as the journal actually holds them, read with a plain SQLite
     // connection rather than through the control plane, so the durable state is
@@ -189,7 +226,10 @@ fn one_measured_experiment_is_promoted_and_another_rejected_then_both_replay() {
             |row| row.get(0),
         )
         .expect("read the promoted payload");
-    println!("\nstored payload of trial {}:\n  {stored_payload}", promoted.id);
+    println!(
+        "\nstored payload of trial {}:\n  {stored_payload}",
+        promoted.id
+    );
 
     // Reopen the file as a brand new handle, with a provider parked at an
     // unrelated value, and re-evaluate both trials from the journal alone.
@@ -227,25 +267,7 @@ fn one_measured_experiment_is_promoted_and_another_rejected_then_both_replay() {
         assert_eq!(outcome.recomputed, trial.record.verdict);
     }
 
-    // A clean replay is a real check rather than a rubber stamp: append a copy
-    // of the promotion whose temperature ceiling was widened after the fact.
-    // It re-evaluates to the very verdict it carries, so only the policy gate
-    // replay re-applies can catch it.
-    let mut widened = archive.read_trial(promoted.id).expect("read trial");
-    widened["spec"]["bounds"]["max_temperature_c"] = json!(200.0);
-    let widened_id = archive
-        .record_trial(&widened)
-        .expect("append the widened row");
-    let outcome = replay_trial(&archive, widened_id).expect("replay the widened row");
-    println!(
-        "  [tampered] trial {}: bounds widened to 200 C; recomputed verdict still identical = {}, but policy legal = {} ({})",
-        outcome.trial_id,
-        outcome.is_consistent(),
-        outcome.policy_legal,
-        outcome.policy_reason.as_deref().unwrap_or("no reason given")
-    );
-    assert!(outcome.is_consistent());
-    assert!(!outcome.policy_legal);
+    replay_catches_widened_bounds(&archive, promoted.id);
 
     println!(
         "\nacceptance criterion: {} measured experiments reached a decision through the immutable evaluator - {:?} and {:?} - and both re-evaluate identically from the journal alone",
