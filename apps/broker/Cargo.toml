@@ -16,6 +16,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 fpsmaxxing-provider-sdk.workspace = true
 rusqlite.workspace = true

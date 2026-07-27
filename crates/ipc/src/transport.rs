@@ -68,7 +68,8 @@ mod unix {
     impl SocketIdentity {
         /// Reads the identity of the socket entry currently at `path`.
         fn of(path: &Path) -> io::Result<Self> {
-            let metadata = std::fs::symlink_metadata(path)?;
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| named(path, "inspected", &error))?;
             if !metadata.file_type().is_socket() {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -110,38 +111,36 @@ mod unix {
     impl UnixSocketTransport {
         /// Binds a fresh socket at `path`, replacing a stale socket file.
         ///
-        /// Only a stale socket is replaced. An existing socket is connect-probed
-        /// first, and a path something still answers on fails closed with
-        /// [`io::ErrorKind::AddrInUse`]: a second broker that unlinked it would
-        /// leave two processes driving the same knobs through their own
-        /// ownership ledgers, which is the single-owner invariant broken across
-        /// processes. This is the transport's own guard; a supervisor-level
-        /// single-instance unit can layer on top of it later.
+        /// A socket file outlives the process that bound it, so a socket
+        /// already at `path` is unlinked and rebound - it is the file a crashed
+        /// broker leaves behind. Nothing here has to tell that file apart from
+        /// a live endpoint, because this bind is not what keeps a second broker
+        /// out: the caller takes an exclusive lock beside its journal before it
+        /// reaches this code (see the broker's single-instance lock), so only
+        /// one process gets here for a given instance. A probe would be the
+        /// weaker guard anyway - stat, probe, unlink, and bind are four steps,
+        /// and two brokers can both find the same path stale.
         ///
         /// A regular file, a directory, or a symlink already at `path` fails
         /// closed with [`io::ErrorKind::AlreadyExists`] rather than being
         /// deleted, so a mistyped `--socket` on a privileged broker cannot
         /// destroy an unrelated file.
         ///
+        /// Every failure names `path`. The broker has three configurable paths,
+        /// and `std`'s io errors carry none of them.
+        ///
         /// # Errors
         ///
-        /// Returns an error if `path` holds a non-socket entry, holds a socket a
-        /// live process is serving, cannot be probed, cannot be removed once it
-        /// is known stale, or the socket cannot be bound.
+        /// Returns an error if `path` holds a non-socket entry, cannot be
+        /// inspected, cannot be removed, or the socket cannot be bound.
         pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
             let path = path.as_ref().to_path_buf();
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_socket() => {
-                    if is_served(&path)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AddrInUse,
-                            format!("{} is already served by a running broker", path.display()),
-                        ));
-                    }
                     match std::fs::remove_file(&path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
+                        Err(error) => return Err(named(&path, "removed", &error)),
                     }
                 }
                 Ok(_) => {
@@ -151,9 +150,10 @@ mod unix {
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(named(&path, "inspected", &error)),
             }
-            let listener = UnixListener::bind(&path)?;
+            let listener =
+                UnixListener::bind(&path).map_err(|error| named(&path, "bound", &error))?;
             let identity = SocketIdentity::of(&path).inspect_err(|_| {
                 let _ = std::fs::remove_file(&path);
             })?;
@@ -171,20 +171,16 @@ mod unix {
         }
     }
 
-    /// Whether a process is still listening on the socket at `path`.
+    /// Names `path` in `error`, which `std`'s io errors never carry themselves.
     ///
-    /// A stale socket file - the one a crashed broker leaves behind - refuses
-    /// the connection, and an entry that vanished between the stat and the
-    /// probe is no endpoint at all; both clear the path for a rebind. Every
-    /// other failure is reported rather than assumed stale, so a socket the
-    /// broker cannot probe is never unlinked.
-    fn is_served(path: &Path) -> io::Result<bool> {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_probe) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+    /// The socket is one of three paths the broker can be pointed at, so a bare
+    /// `Permission denied` leaves an operator no way to tell which of them the
+    /// start-up failed on.
+    fn named(path: &Path, action: &str, error: &io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!("{} cannot be {action}: {error}", path.display()),
+        )
     }
 
     impl LocalTransport for UnixSocketTransport {
@@ -250,22 +246,15 @@ mod unix {
         }
 
         #[tokio::test]
-        async fn bind_refuses_a_socket_a_live_broker_serves() {
+        async fn a_bind_failure_names_the_socket_path() {
             let dir = tempfile::tempdir().expect("temporary directory should exist");
-            let path = dir.path().join("broker.sock");
-            let incumbent = UnixSocketTransport::bind(&path).expect("socket should bind");
-
+            let path = dir.path().join("absent").join("broker.sock");
             let error = UnixSocketTransport::bind(&path)
-                .expect_err("a second broker must not take over a served socket");
-            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+                .expect_err("no socket can be bound under a directory that is not there");
             assert!(
-                std::fs::symlink_metadata(&path).is_ok(),
-                "the incumbent's endpoint must survive the refused bind"
+                error.to_string().contains(&path.display().to_string()),
+                "the broker takes three configurable paths, so a failure must say which: {error}"
             );
-            UnixStream::connect(&path)
-                .await
-                .expect("the incumbent must still be reachable, so no client is stranded");
-            drop(incumbent);
         }
 
         #[tokio::test]

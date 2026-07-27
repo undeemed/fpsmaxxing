@@ -15,6 +15,11 @@
 //! before it is used: absolute, directly inside a directory no other user can
 //! reach, under an ancestor chain no other user can write.
 //!
+//! Only one broker may run against a journal. An exclusive advisory lock beside
+//! it is taken before the journal is opened and before the socket is bound, so
+//! a second process refuses to start rather than driving the same knobs through
+//! an ownership ledger of its own.
+//!
 //! The process exits non-zero on any fatal condition, including the loss of the
 //! control-plane worker thread; run it under a supervisor that restarts it.
 
@@ -40,7 +45,7 @@ mod unix {
     use std::env;
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
-    use std::fs::{DirBuilder, OpenOptions, Permissions};
+    use std::fs::{DirBuilder, File, OpenOptions, Permissions};
     use std::io;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -50,6 +55,8 @@ mod unix {
     use fpsmaxxing_control_plane::ControlPlane;
     use fpsmaxxing_ipc::{PeerAuthorizer, SameUidAuthorizer, UnixSocketTransport};
     use fpsmaxxing_mock_provider::MockProvider;
+    use rustix::fs::{FlockOperation, flock};
+    use rustix::io::Errno;
     use thiserror::Error;
 
     /// Value-taking flags this binary accepts, in [`USAGE`] order.
@@ -123,6 +130,12 @@ that no other user can write, or the broker refuses to start.";
     /// Suffixes `SQLite` appends to a database path for its side files.
     const JOURNAL_SIDE_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+    /// Suffix the single-instance lock file takes beside the audit journal.
+    ///
+    /// Deliberately not one of [`JOURNAL_SIDE_SUFFIXES`], so the lock can never
+    /// collide with a file `SQLite` owns.
+    const LOCK_FILE_SUFFIX: &str = ".lock";
+
     /// Why the command line was refused.
     ///
     /// A privileged daemon must not silently relocate its socket or journal
@@ -183,6 +196,7 @@ that no other user can write, or the broker refuses to start.";
         let authorizer = SameUidAuthorizer::for_current_process();
         let broker_uid = authorizer.expected_uid();
         let (socket_path, journal_path) = resolve_paths(options, broker_uid)?;
+        let _single_instance = lock_single_instance(&journal_path)?;
 
         let ledger = Arc::new(OwnershipLedger::new());
         let broker = spawn_service(move || {
@@ -298,6 +312,56 @@ that no other user can write, or the broker refuses to start.";
         match parent.parent() {
             Some(above) => vet_ancestors(above, broker_uid),
             None => Ok(()),
+        }
+    }
+
+    /// Takes the exclusive lock that makes this process the only broker.
+    ///
+    /// Single-owner-per-knob holds inside one process because one ownership
+    /// ledger arbitrates it, and two brokers would hold one each. Nothing about
+    /// binding the socket closes that across processes: an existing entry
+    /// cannot be told apart from a live endpoint without a probe, and a probe
+    /// is not a lock - two brokers can both find the path stale, and the second
+    /// one's unlink then strands the first on an unlinked inode, still serving
+    /// its connected clients and still driving the same knobs.
+    ///
+    /// An advisory lock has no such window. It is taken here, before the
+    /// journal is created or opened and before the socket is bound, so a second
+    /// broker touches neither. The kernel drops it when the last descriptor for
+    /// it closes, so a crashed broker leaves nothing to clean up - which is why
+    /// the returned file must be held for as long as the broker serves.
+    ///
+    /// The lock file sits beside the journal, in a directory
+    /// [`vet_resolved_path`] has already held to owner-only access, so no other
+    /// user can create it first or take it. It scopes an instance to its
+    /// journal: brokers pointed at different journals are different instances,
+    /// which is also what makes a test able to run one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AddrInUse`] when another broker holds the lock,
+    /// or an error naming the lock file when it cannot be created or locked.
+    fn lock_single_instance(journal: &Path) -> io::Result<File> {
+        let mut path = journal.as_os_str().to_owned();
+        path.push(LOCK_FILE_SUFFIX);
+        let path = PathBuf::from(path);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(JOURNAL_FILE_MODE)
+            .open(&path)
+            .map_err(|error| named(&path, "opened", &error))?;
+        restrict_to_owner(&path)?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(file),
+            Err(errno) if errno == Errno::WOULDBLOCK => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is held by a running broker; only one may own the journal and its knobs",
+                    path.display()
+                ),
+            )),
+            Err(errno) => Err(named(&path, "locked", &io::Error::from(errno))),
         }
     }
 
@@ -595,8 +659,9 @@ that no other user can write, or the broker refuses to start.";
 
         use super::{
             ArgError, FALLBACK_RUNTIME_BASE, HELP_FLAGS, Invocation, JOURNAL_ENV,
-            JOURNAL_FILE_MODE, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME, ROOT_UID, SOCKET_ENV,
-            parse_args, private_directory_in, resolve_paths_from, restrict_journal, runtime_base,
+            JOURNAL_FILE_MODE, LOCK_FILE_SUFFIX, Options, PRIVATE_DIR_MODE, PRIVATE_DIR_NAME,
+            ROOT_UID, SOCKET_ENV, lock_single_instance, parse_args, private_directory_in,
+            resolve_paths_from, restrict_journal, runtime_base,
         };
 
         /// The variable the unprivileged gateway and CLI use for their journal.
@@ -954,6 +1019,39 @@ that no other user can write, or the broker refuses to start.";
                 let metadata = std::fs::symlink_metadata(path).expect("path should stat");
                 assert_eq!(metadata.mode() & 0o777, JOURNAL_FILE_MODE);
             }
+        }
+
+        #[test]
+        fn a_second_broker_cannot_take_the_lock_on_a_journal() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let journal = base.path().join("journal.sqlite");
+
+            let held = lock_single_instance(&journal).expect("the first broker should be alone");
+            let error = lock_single_instance(&journal)
+                .expect_err("a second broker must not run against the same journal");
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            assert!(
+                !journal.exists(),
+                "a refused broker must not have touched the incumbent's journal"
+            );
+
+            // The kernel releases the lock with the last descriptor for it, so
+            // a crashed broker leaves nothing for its restart to clean up.
+            drop(held);
+            lock_single_instance(&journal).expect("a released lock should be takeable again");
+        }
+
+        #[test]
+        fn the_instance_lock_is_owner_only_and_beside_the_journal() {
+            let base = tempfile::tempdir().expect("temporary directory should exist");
+            let journal = base.path().join("journal.sqlite");
+            let _held = lock_single_instance(&journal).expect("the lock should be taken");
+
+            let lock = base
+                .path()
+                .join(format!("journal.sqlite{LOCK_FILE_SUFFIX}"));
+            let metadata = std::fs::symlink_metadata(&lock).expect("the lock file should stat");
+            assert_eq!(metadata.mode() & 0o777, JOURNAL_FILE_MODE);
         }
 
         #[test]

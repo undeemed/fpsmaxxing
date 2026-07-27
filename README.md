@@ -149,6 +149,8 @@ That directory is held higher than the ancestors above it, in two ways.
 The sticky bit does not excuse group or world write there: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
 Nor is group or world traversal excused: the socket's own mode cannot be pinned, so a merely traversable directory like `/run` would put every local user in front of it, and it is refused too.
 The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
+Only one broker may run against a journal: it takes an exclusive lock on `<journal>.lock` beside it before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
+The kernel releases that lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
 
 ## Architecture
 

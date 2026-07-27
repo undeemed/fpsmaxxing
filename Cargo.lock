@@ -92,6 +92,7 @@ dependencies = [
  "fpsmaxxing-mock-provider",
  "fpsmaxxing-provider-sdk",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",
