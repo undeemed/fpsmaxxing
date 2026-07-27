@@ -21,7 +21,7 @@ flowchart LR
     W["Watchdog<br/>out-of-band guard<br/>lease/TTL + safety"]
     M --> P
     P --> B
-    B --> E
+    B -->|re-measure under workload| E
     E -->|keep, iterate| M
     E -.->|roll back<br/>regression| B
     W -.->|lease/TTL expiry or safety violation:<br/>revert to snapshot| B

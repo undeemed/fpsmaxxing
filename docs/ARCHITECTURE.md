@@ -16,7 +16,7 @@ The privileged Windows service accepts authenticated local requests from the gat
 
 ### Watchdog
 
-The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner.
+The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner. On lease expiry or a safety violation it reverts to the pre-state snapshot through the privileged broker.
 
 ### Experiment runner
 
