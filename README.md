@@ -8,6 +8,30 @@ FPSMaxxing is an open-source Rust control plane for using an AI coding agent or 
 > FPSMaxxing is currently a read-only alpha built around a mock provider.
 > An MCP client can discover typed capabilities and run the full snapshot, preview, apply, verify, and rollback lifecycle, but FPSMaxxing does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
 
+## The closed loop
+
+FPSMaxxing is a closed feedback loop that tunes system and hardware performance through bounded, reversible experiments.
+
+```mermaid
+flowchart LR
+    M["Measure<br/>FPS, latency,<br/>frametimes, thermals"]
+    P["Policy engine<br/>decide bounded<br/>adjustment"]
+    B["Broker<br/>apply via typed capability<br/>snapshot + TTL lease"]
+    W["Watchdog<br/>revert on regression<br/>or safety violation"]
+    E["Evaluator<br/>keep or roll back"]
+    M --> P
+    P --> B
+    B --> W
+    W --> E
+    E -->|iterate| M
+```
+
+An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
+The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
+The **privileged broker** applies that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+An **independent watchdog** owns the lease deadline and can restore the snapshot without the gateway, agent, or experiment runner whenever a regression or safety violation appears.
+The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides whether to keep the change or roll it back before the next iteration begins.
+
 ## Why FPSMaxxing?
 
 Existing tools already know how to control parts of a PC:
