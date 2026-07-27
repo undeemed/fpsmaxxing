@@ -14,7 +14,9 @@ use fpsmaxxing_contracts::{
     CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec, Persistence,
     ProviderManifest, RiskClass, StateSnapshot, VerdictReason,
 };
-use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, MAX_MOCK_VALUE};
+use fpsmaxxing_control_plane::{
+    ControlPlane, ControlPlaneError, MAX_LEASE_SECONDS, MAX_MOCK_VALUE,
+};
 use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
@@ -27,8 +29,7 @@ fn spec_for(candidate: u64, min_fps_improvement: f64, max_temperature_c: f64) ->
     spec_with_lease(candidate, min_fps_improvement, max_temperature_c, 30)
 }
 
-/// Builds the same spec with an explicit lease, so a test can drive the broker
-/// policy into denying the change the evaluator promoted.
+/// Builds the same spec with an explicit TTL lease.
 fn spec_with_lease(
     candidate: u64,
     min_fps_improvement: f64,
@@ -100,6 +101,41 @@ impl Provider for ForeignProvider {
 
     fn rollback(&mut self, _snapshot: &StateSnapshot) -> Result<(), ProviderError> {
         Ok(())
+    }
+}
+
+/// A provider advertising the modeled knob under a risk class the broker's
+/// policy refuses, standing in for a lifecycle denied after the evaluator has
+/// already promoted on the measurements.
+struct ApprovalGatedProvider(MockProvider);
+
+impl Provider for ApprovalGatedProvider {
+    fn manifest(&self) -> ProviderManifest {
+        let mut manifest = self.0.manifest();
+        for capability in &mut manifest.capabilities {
+            capability.risk = RiskClass::ApprovalRequired;
+        }
+        manifest
+    }
+
+    fn snapshot(&self) -> Result<StateSnapshot, ProviderError> {
+        self.0.snapshot()
+    }
+
+    fn preview(&self, request: &ChangeRequest) -> Result<String, ProviderError> {
+        self.0.preview(request)
+    }
+
+    fn apply(&mut self, request: &ChangeRequest) -> Result<(), ProviderError> {
+        self.0.apply(request)
+    }
+
+    fn verify(&self, request: &ChangeRequest) -> Result<bool, ProviderError> {
+        self.0.verify(request)
+    }
+
+    fn rollback(&mut self, snapshot: &StateSnapshot) -> Result<(), ProviderError> {
+        self.0.rollback(snapshot)
     }
 }
 
@@ -186,13 +222,17 @@ fn a_rejected_experiment_is_never_applied_and_leaves_the_baseline() {
 #[test]
 fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
     let journal = NamedTempFile::new().expect("temp journal");
-    let mut plane =
-        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let mut plane = ControlPlane::open(
+        Box::new(ApprovalGatedProvider(MockProvider::new(10))),
+        journal.path(),
+    )
+    .expect("open");
 
-    // The evaluator promotes on the measurements, but the 400 second lease is
-    // outside the broker's policy envelope, so the lifecycle never runs.
-    let spec = spec_with_lease(40, 5.0, 80.0, 400);
-    let error = run_trial(&mut plane, &spec).expect_err("policy should deny the lease");
+    // The evaluator promotes on the measurements, but this provider advertises
+    // the knob under a risk class the broker's policy refuses, so the lifecycle
+    // never runs.
+    let spec = spec_for(40, 5.0, 80.0);
+    let error = run_trial(&mut plane, &spec).expect_err("policy should deny the risk class");
     assert!(matches!(
         error,
         RunnerError::ControlPlane(ControlPlaneError::PolicyDenied(_))
@@ -218,7 +258,13 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
         .lifecycle_error
         .expect("the refused lifecycle is recorded on the trial");
     assert_eq!(failure.kind, "policy-denied");
-    assert!(failure.error.contains("lease exceeds 300 seconds"));
+    assert!(
+        failure
+            .error
+            .contains("only reversible mock capabilities are enabled"),
+        "{}",
+        failure.error
+    );
 
     let outcome = replay_trial(&plane, ids[0]).expect("replay trial");
     assert!(outcome.is_consistent());
@@ -291,6 +337,77 @@ fn a_candidate_outside_the_policy_bound_is_refused_before_any_measurement() {
         "a refused spec journals nothing"
     );
     assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
+fn a_lease_outside_the_policy_bound_is_refused_before_any_measurement() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // The lease bounds how long a mutation may persist and the broker only
+    // checks it inside the lifecycle, so a spec that can only ever be denied is
+    // refused before it is measured and journaled as an authoritative trial.
+    let error = run_trial(
+        &mut plane,
+        &spec_with_lease(40, 5.0, 80.0, MAX_LEASE_SECONDS + 1),
+    )
+    .expect_err("an out-of-policy lease should be refused");
+    assert!(matches!(error, RunnerError::InvalidSpec(_)), "{error:?}");
+
+    assert!(
+        plane.trial_ids().expect("trial ids").is_empty(),
+        "a refused spec journals nothing"
+    );
+    assert_eq!(current_value(&plane), 10);
+
+    // A lease exactly at the ceiling is inside the envelope and still runs.
+    let trial = run_trial(
+        &mut plane,
+        &spec_with_lease(40, 5.0, 80.0, MAX_LEASE_SECONDS),
+    )
+    .expect("run trial");
+    assert_eq!(trial.record.verdict.decision, Decision::Promote);
+}
+
+#[test]
+fn a_trial_record_without_a_readable_version_fails_closed() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+    let trial = run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect("run trial");
+    let recorded = plane.read_trial(trial.id).expect("trial should read");
+
+    // A row stating no version this build can read was not written by an older
+    // runner, so it is reported apart from a version merely unsupported here.
+    for rewrite in [json!(null), json!("one"), json!(u64::from(u32::MAX) + 1)] {
+        let mut payload = recorded.clone();
+        payload["schema_version"] = rewrite.clone();
+        let malformed = plane
+            .record_trial(&payload)
+            .expect("a malformed record should append");
+        let error =
+            replay_trial(&plane, malformed).expect_err("an unreadable version should be refused");
+        assert!(
+            matches!(error, RunnerError::MalformedRecordVersion),
+            "{rewrite}: {error:?}"
+        );
+    }
+
+    // A record that simply omits the field is the same signal.
+    let mut payload = recorded;
+    payload
+        .as_object_mut()
+        .expect("a trial record is an object")
+        .remove("schema_version");
+    let malformed = plane
+        .record_trial(&payload)
+        .expect("a malformed record should append");
+    let error = replay_trial(&plane, malformed).expect_err("an absent version should be refused");
+    assert!(
+        matches!(error, RunnerError::MalformedRecordVersion),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -428,6 +545,11 @@ fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
                 payload
             },
         ),
+        ("a lease above the policy ceiling", "lease_seconds", {
+            let mut payload = recorded.clone();
+            payload["spec"]["target"]["lease_seconds"] = json!(MAX_LEASE_SECONDS + 1);
+            payload
+        }),
         (
             "a candidate value contradicting its own spec",
             "candidate_value",
@@ -511,9 +633,20 @@ fn a_replay_reports_lifecycle_fields_that_contradict_the_verdict() {
         "rolled_back": true,
     });
 
+    // The broker returns an outcome only once the applied value verified and
+    // the captured baseline was restored, so a row claiming a promoted knob was
+    // left mutated - or was never verified - is one this runner cannot write.
+    let mut left_mutated = plane.read_trial(promoted.id).expect("trial should read");
+    left_mutated["lifecycle"]["rolled_back"] = json!(false);
+
+    let mut unverified = plane.read_trial(promoted.id).expect("trial should read");
+    unverified["lifecycle"]["verified"] = json!(false);
+
     for (rewrite, payload) in [
         ("a promotion recording no lifecycle", stripped),
         ("a rejection recording a lifecycle", fabricated),
+        ("a promotion left un-rolled-back", left_mutated),
+        ("a promotion recording no verification", unverified),
     ] {
         let tampered = plane
             .record_trial(&payload)

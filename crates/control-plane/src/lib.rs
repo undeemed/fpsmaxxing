@@ -1,6 +1,6 @@
 //! Capability registry, policy seam, broker lifecycle, and durable journal.
 
-use std::{num::NonZeroU64, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, RiskClass, StateSnapshot};
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
@@ -15,6 +15,15 @@ use thiserror::Error;
 /// so the experiment runner, which acts on a candidate value before the
 /// lifecycle runs, can refuse the same values this policy would.
 pub const MAX_MOCK_VALUE: u64 = 100;
+
+/// Inclusive ceiling the bounded alpha policy enforces on a change request's
+/// TTL lease, in seconds.
+///
+/// [`ControlPlane::run_lifecycle`] rejects any change above it. It is exported
+/// alongside [`MAX_MOCK_VALUE`] so the experiment runner, which bounds a spec
+/// before the lifecycle runs, holds the lease to the same ceiling this policy
+/// does rather than restating it.
+pub const MAX_LEASE_SECONDS: u64 = 300;
 
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
@@ -285,10 +294,10 @@ impl ControlPlane {
                 "only reversible mock capabilities are enabled".to_owned(),
             ));
         }
-        if request.lease_seconds > NonZeroU64::new(300).expect("constant is non-zero") {
-            return Err(ControlPlaneError::PolicyDenied(
-                "lease exceeds 300 seconds".to_owned(),
-            ));
+        if request.lease_seconds.get() > MAX_LEASE_SECONDS {
+            return Err(ControlPlaneError::PolicyDenied(format!(
+                "lease exceeds {MAX_LEASE_SECONDS} seconds"
+            )));
         }
         let value = request
             .parameters
@@ -471,7 +480,7 @@ impl ControlPlane {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use fpsmaxxing_contracts::{CapabilityDescriptor, Persistence};
 

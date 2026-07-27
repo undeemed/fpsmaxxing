@@ -40,7 +40,9 @@ use fpsmaxxing_contracts::{
     Decision, DecisionBounds, ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
     MAX_DECISION_TEMPERATURE_C, MAX_SAMPLES, MetricSample, ProviderManifest, Verdict,
 };
-use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
+use fpsmaxxing_control_plane::{
+    ControlPlane, ControlPlaneError, LifecycleResult, MAX_LEASE_SECONDS, MAX_MOCK_VALUE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -77,6 +79,13 @@ pub enum RunnerError {
     /// A journaled trial record was written by an unsupported record version.
     #[error("journaled trial uses unsupported record version {0}")]
     UnsupportedRecordVersion(u32),
+    /// A journaled trial record does not carry a readable record version.
+    ///
+    /// Distinct from [`UnsupportedRecordVersion`](Self::UnsupportedRecordVersion):
+    /// the row states no version at all, so it was not written by any runner
+    /// this format describes rather than by an older one.
+    #[error("journaled trial does not carry a readable record version")]
+    MalformedRecordVersion,
     /// A journaled trial record could not be decoded for replay.
     #[error(transparent)]
     Decode(#[from] serde_json::Error),
@@ -298,18 +307,20 @@ pub fn run_trial(
 /// # Errors
 ///
 /// Returns an error if the trial cannot be read from the durable journal, its
-/// record cannot be decoded, or the record was written by an unsupported
-/// [`TRIAL_RECORD_VERSION`].
+/// record cannot be decoded, the record was written by an unsupported
+/// [`TRIAL_RECORD_VERSION`], or it states no readable version at all.
 pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, RunnerError> {
     let payload = plane.read_trial(id)?;
     // The version is read off the raw payload so a record whose fields this
     // build cannot decode still reports the version that wrote it rather than a
-    // decode error that says nothing about why.
+    // decode error that says nothing about why. A row stating no readable
+    // version is not an older record but a foreign or corrupted one, so it is
+    // reported apart from a version this build merely does not support.
     let version = payload
         .get("schema_version")
         .and_then(Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
-        .unwrap_or_default();
+        .ok_or(RunnerError::MalformedRecordVersion)?;
     if version != TRIAL_RECORD_VERSION {
         return Err(RunnerError::UnsupportedRecordVersion(version));
     }
@@ -352,7 +363,11 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// authorized them for the same reason: the trial row is the only auditable
 /// statement about whether a promotion reached the provider, so a promotion
 /// whose lifecycle went unrecorded, or a rejection carrying one, is a claim this
-/// runner cannot make.
+/// runner cannot make. A recorded lifecycle is held to its own contents too:
+/// [`ControlPlane::run_lifecycle`] returns an outcome only after the applied
+/// value verified and the captured baseline was restored, so a row claiming a
+/// promotion that went unverified, or one whose knob was left mutated, is the
+/// same kind of unwritable claim.
 ///
 /// Detection stops at that structural layer. The recorded samples are not
 /// re-derived, so a rewrite of the measurements together with the verdict they
@@ -411,6 +426,14 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
             presence(recorded_failure)
         )));
     }
+    if let Some(lifecycle) = &record.lifecycle
+        && !(lifecycle.verified && lifecycle.rolled_back)
+    {
+        return Err(RunnerError::InconsistentRecord(format!(
+            "lifecycle records verified {} and rolled_back {}, but a completed lifecycle observes the applied value and restores the captured baseline",
+            lifecycle.verified, lifecycle.rolled_back
+        )));
+    }
     Ok(())
 }
 
@@ -456,11 +479,14 @@ fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, R
 /// bounds are intersected with the policy envelope by [`validate_bounds`], and
 /// the candidate knob value drives the modeled metrics and is checked against
 /// [`MAX_MOCK_VALUE`], the same ceiling the broker policy enforces later in the
-/// lifecycle and the same one [`baseline_value`] holds the provider to. A spec
-/// that asks for fewer counted samples than its own bounds require can never
-/// promote, so it is refused up front rather than measured and then rejected.
-/// The validated value is returned so the measurement uses exactly what was
-/// bounded here.
+/// lifecycle and the same one [`baseline_value`] holds the provider to. The
+/// target's TTL lease is bounded here too, against the broker's own
+/// [`MAX_LEASE_SECONDS`]: it is the last broker-enforced field on the change
+/// request, and a spec the lifecycle can only ever deny must not be measured
+/// and journaled as an authoritative trial first. A spec that asks for fewer
+/// counted samples than its own bounds require can never promote either, so it
+/// is refused up front rather than measured and then rejected. The validated
+/// value is returned so the measurement uses exactly what was bounded here.
 ///
 /// The capability check is what keeps unknown hardware failing closed, and it is
 /// the model rather than the registry that decides what is known: the
@@ -500,6 +526,12 @@ fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
     if value > MAX_MOCK_VALUE {
         return Err(RunnerError::InvalidSpec(format!(
             "target value is {value}, above the {MAX_MOCK_VALUE} the policy allows"
+        )));
+    }
+    let lease = spec.target.lease_seconds.get();
+    if lease > MAX_LEASE_SECONDS {
+        return Err(RunnerError::InvalidSpec(format!(
+            "lease_seconds is {lease}, above the {MAX_LEASE_SECONDS} the policy allows"
         )));
     }
     Ok(value)
@@ -597,7 +629,7 @@ mod tests {
 
     use super::{
         ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
-        MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest, RunnerError, validate,
+        MAX_LEASE_SECONDS, MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest, RunnerError, validate,
     };
 
     /// A manifest advertising only the knob the measurement model describes.
@@ -733,6 +765,24 @@ mod tests {
         let message = rejection(&spec_for_value(2, 5, 5, 3, MAX_MOCK_VALUE + 1));
         assert!(message.contains("target value"), "{message}");
         assert!(rejection(&spec_for_value(2, 5, 5, 3, u64::MAX)).contains("target value"));
+    }
+
+    #[test]
+    fn rejects_a_lease_above_the_policy_bound() {
+        // The lease is the TTL bounding how long a mutation may persist, and
+        // the broker only sees it inside the lifecycle. Measuring first would
+        // journal an authoritative trial the lifecycle can only ever deny.
+        let mut leased = spec(2, 5, 5, 3);
+        leased.target.lease_seconds =
+            NonZeroU64::new(MAX_LEASE_SECONDS).expect("lease is non-zero");
+        assert!(validate(&manifest(), &leased).is_ok());
+
+        leased.target.lease_seconds =
+            NonZeroU64::new(MAX_LEASE_SECONDS + 1).expect("lease is non-zero");
+        assert!(rejection(&leased).contains("lease_seconds"));
+
+        leased.target.lease_seconds = NonZeroU64::MAX;
+        assert!(rejection(&leased).contains("lease_seconds"));
     }
 
     #[test]
