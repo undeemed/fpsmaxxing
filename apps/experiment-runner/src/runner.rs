@@ -18,7 +18,10 @@
 //! together with the identifier that record was stored under, so the caller
 //! addresses its own row rather than the journal's last one - or, when the
 //! journal itself refused the write, with the reason those measurements were
-//! lost.
+//! lost. A journal that refuses the record of a lifecycle that *succeeded*
+//! reports the same loss the other way round, carrying the outcome that record
+//! would have held, so a promotion that reached the provider is never reported
+//! as a bare write failure.
 //! Crash safety for the window between the mutation and that record stays with
 //! the lifecycle journal's write-ahead `apply-intent` stage (ADR 0002).
 //!
@@ -42,8 +45,8 @@ use std::num::NonZeroU32;
 
 use fpsmaxxing_contracts::{
     Decision, DecisionBounds, ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
-    MAX_DECISION_TEMPERATURE_C, MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample,
-    ProviderManifest, Verdict,
+    MAX_DECISION_TEMPERATURE_C, MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES,
+    MIN_HYPOTHESIS_CHARS, MetricSample, ProviderManifest, Verdict,
 };
 use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
 use serde::{Deserialize, Serialize};
@@ -89,6 +92,27 @@ pub enum RunnerError {
         /// `Result` this module returns to the size of two of them.
         journal_error: Option<Box<ControlPlaneError>>,
         /// The broker error that ended the lifecycle.
+        #[source]
+        source: ControlPlaneError,
+    },
+    /// The journal refused the record of a trial that already ran.
+    ///
+    /// The trial row is the only auditable statement that a promotion reached
+    /// the provider, so a lost record carries the lifecycle outcome it would
+    /// have held. Without it a promotion whose knob was written and restored is
+    /// indistinguishable from a rejection that never touched the provider, and
+    /// the lifecycle journal cannot tell them apart either: its terminal
+    /// `completed` record leaves no dangling apply intent for `doctor` to
+    /// report.
+    #[error("{}: {source}", trial_lost(lifecycle.is_some()))]
+    TrialNotJournaled {
+        /// The outcome the lost record would have carried, present only when a
+        /// promotion's lifecycle completed. A rejection never runs one.
+        ///
+        /// Boxed for the same reason
+        /// [`LifecycleFailed`](Self::LifecycleFailed) boxes its journal error.
+        lifecycle: Option<Box<LifecycleOutcome>>,
+        /// Why the record could not be journaled.
         #[source]
         source: ControlPlaneError,
     },
@@ -271,7 +295,11 @@ impl ReplayOutcome {
 /// journaled, as a [`LifecycleFailed`](RunnerError::LifecycleFailed) naming the
 /// identifier that record was stored under; if that write also fails, the
 /// lifecycle error still takes precedence, the identifier is absent, and the
-/// same error carries why the record was lost.
+/// same error carries why the record was lost. A journal that refuses the
+/// record of a trial whose lifecycle succeeded is reported as a
+/// [`TrialNotJournaled`](RunnerError::TrialNotJournaled) carrying that
+/// lifecycle's outcome, so the caller is told the provider was mutated rather
+/// than only that a write failed.
 pub fn run_trial(
     plane: &mut ControlPlane,
     spec: &ExperimentSpec,
@@ -322,10 +350,16 @@ pub fn run_trial(
             source,
         });
     }
-    Ok(StoredTrial {
-        id: journaled?,
-        record,
-    })
+    let id = match journaled {
+        Ok(id) => id,
+        Err(source) => {
+            return Err(RunnerError::TrialNotJournaled {
+                lifecycle: record.lifecycle.map(Box::new),
+                source,
+            });
+        }
+    };
+    Ok(StoredTrial { id, record })
 }
 
 /// Re-evaluates a journaled trial from the journal alone.
@@ -380,15 +414,16 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 ///
 /// Replay is the tamper-detection read, so it re-runs the whole of
 /// [`validate_spec`] over the journaled spec rather than only its bounds: a row
-/// whose capability, hypothesis, sample counts, decision bounds, candidate
-/// value, or TTL lease were rewritten is reported as illegal even though
-/// re-evaluating it reproduces the recorded verdict.
+/// whose capability, hypothesis length, sample counts, decision bounds,
+/// candidate value, or TTL lease were rewritten is reported as illegal even
+/// though re-evaluating it reproduces the recorded verdict.
 ///
 /// The gate applied is the current one, so tightening a policy constant flags
 /// every archived row recorded under the looser ceiling. That is the intended
 /// reading rather than a false alarm - those trials are outside the envelope the
-/// alpha now permits - and ADR 0002 makes a constant change a
-/// [`TRIAL_RECORD_VERSION`] bump so a flagged archive stays attributable.
+/// alpha now permits. It is deliberately not a [`TRIAL_RECORD_VERSION`] bump:
+/// the version gate refuses a row outright before this one runs, so bumping it
+/// would make the archive unreadable rather than flagged (ADR 0002).
 ///
 /// The attached provider's manifest is deliberately not consulted. A trial
 /// journal outlives the process that wrote it, so requiring the provider running
@@ -412,10 +447,13 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
 /// same kind of unwritable claim.
 ///
 /// Detection stops at that structural layer. The recorded samples are not
-/// re-derived, so a rewrite of the measurements together with the verdict they
-/// imply passes both this check and the verdict comparison; catching that needs
-/// each row anchored outside itself - a signed or hash-chained journal - which
-/// the alpha deliberately does not do.
+/// re-derived, and the hypothesis is held to its length rather than its content:
+/// every other checked field has a second term to disagree with, while the
+/// hypothesis is free text with no redundant copy in the record. So a rewrite of
+/// the measurements together with the verdict they imply, or of the hypothesis
+/// text within its bounds, passes both this check and the verdict comparison;
+/// catching that needs each row anchored outside itself - a signed or
+/// hash-chained journal - which the alpha deliberately does not do.
 ///
 /// # Errors
 ///
@@ -479,6 +517,15 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
     Ok(())
 }
 
+/// Renders whether a lost trial record would have recorded a lifecycle.
+fn trial_lost(applied: bool) -> &'static str {
+    if applied {
+        "trial record was lost after its promotion completed the lifecycle"
+    } else {
+        "trial record was lost"
+    }
+}
+
 /// Renders where a failed lifecycle's trial record came to rest.
 fn journaled_as(trial_id: Option<i64>, journal_error: Option<&ControlPlaneError>) -> String {
     match (trial_id, journal_error) {
@@ -538,8 +585,10 @@ fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, R
 /// counted samples than its own bounds require can never promote either, so it
 /// is refused up front rather than measured and then rejected. The hypothesis is
 /// the one field neither phase consumes, but it is written verbatim into a
-/// single durable trial row, so it is held to [`MAX_HYPOTHESIS_CHARS`] rather
-/// than sizing that row by whatever the author sent. The validated value is
+/// single durable trial row, so it is held to both ends of the range the spec
+/// schema publishes - [`MAX_HYPOTHESIS_CHARS`] so the row is not sized by
+/// whatever the author sent, and [`MIN_HYPOTHESIS_CHARS`] so a promotion cannot
+/// be journaled with no statement of what it was for. The validated value is
 /// returned so the measurement uses exactly what was bounded here.
 ///
 /// The capability check is what keeps unknown hardware failing closed, and it is
@@ -555,6 +604,11 @@ fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
     }
     validate_bounds(&spec.bounds)?;
     let hypothesis = spec.hypothesis.chars().count();
+    if hypothesis < MIN_HYPOTHESIS_CHARS as usize {
+        return Err(RunnerError::InvalidSpec(format!(
+            "hypothesis is {hypothesis} characters, below the {MIN_HYPOTHESIS_CHARS} the schema requires"
+        )));
+    }
     if hypothesis > MAX_HYPOTHESIS_CHARS as usize {
         return Err(RunnerError::InvalidSpec(format!(
             "hypothesis is {hypothesis} characters, above the {MAX_HYPOTHESIS_CHARS} ceiling"
@@ -689,8 +743,8 @@ mod tests {
 
     use super::{
         ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
-        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest,
-        RunnerError, validate,
+        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_MOCK_VALUE, MAX_SAMPLES, MIN_HYPOTHESIS_CHARS,
+        ProviderManifest, RunnerError, validate,
     };
 
     /// A manifest advertising only the knob the measurement model describes.
@@ -844,6 +898,21 @@ mod tests {
 
         leased.target.lease_seconds = NonZeroU64::MAX;
         assert!(rejection(&leased).contains("lease_seconds"));
+    }
+
+    #[test]
+    fn rejects_an_empty_hypothesis() {
+        // The schema publishes a floor of one character, and the trial row is
+        // the durable statement of what a promotion was for, so a blank
+        // hypothesis must not be measured and journaled as authoritative.
+        let mut blank = spec(2, 5, 5, 3);
+        blank.hypothesis = String::new();
+        let message = rejection(&blank);
+        assert!(message.contains("hypothesis"), "{message}");
+        assert!(
+            message.contains(&format!("below the {MIN_HYPOTHESIS_CHARS}")),
+            "{message}"
+        );
     }
 
     #[test]

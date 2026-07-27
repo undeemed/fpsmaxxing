@@ -7,11 +7,11 @@
 //!
 //! A replay that diverges from the journal means the record was tampered with
 //! or the immutable evaluator drifted, and a replay the policy gate refuses -
-//! its capability, hypothesis, sample counts, decision bounds, candidate value,
-//! TTL lease, baseline ceiling, the lifecycle fields its decision implies, or
-//! the agreement between the record and the spec it carries - means the
-//! journaled row is not one this runner would write under the policy in force
-//! now. A lifecycle that fails after the trial was measured is the third
+//! its capability, hypothesis length, sample counts, decision bounds, candidate
+//! value, TTL lease, baseline ceiling, the lifecycle fields its decision
+//! implies, or the agreement between the record and the spec it carries - means
+//! the journaled row is not one this runner would write under the policy in
+//! force now. A lifecycle that fails after the trial was measured is the third
 //! failure: the trial is journaled anyway and the error names the row, or says
 //! why the row was lost, which the demo reports. It exits non-zero on any of
 //! the three rather than reporting a successful run.

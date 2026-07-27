@@ -5,8 +5,9 @@
 //! full lifecycle, a rejected experiment that is never applied and leaves the
 //! baseline untouched, a promoted experiment whose lifecycle the broker refuses
 //! but which is still journaled, the same refusal when the journal cannot take
-//! the record either, and a replay from the durable journal alone - reopened as
-//! a fresh handle - that reproduces the recorded verdict exactly.
+//! the record either, a completed promotion whose record the journal refuses,
+//! and a replay from the durable journal alone - reopened as a fresh handle -
+//! that reproduces the recorded verdict exactly.
 //! The final test states the MVP acceptance criterion directly.
 
 use std::num::{NonZeroU32, NonZeroU64};
@@ -347,6 +348,58 @@ fn a_refused_lifecycle_reports_why_its_trial_could_not_be_journaled() {
 }
 
 #[test]
+fn a_lost_record_reports_the_lifecycle_the_promotion_had_already_run() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane =
+        ControlPlane::open(Box::new(MockProvider::new(10)), journal.path()).expect("open");
+
+    // Take the trial table away behind the broker's back, so the promotion runs
+    // its whole lifecycle and only the record of it is lost. The trial row is
+    // the only auditable statement that a promotion reached the provider, and
+    // the lifecycle journal cannot stand in for it - its terminal `completed`
+    // record leaves no dangling apply intent for `doctor` to report - so the
+    // outcome travels with the error.
+    Connection::open(journal.path())
+        .expect("second journal handle")
+        .execute_batch("DROP TABLE experiment_trials")
+        .expect("the trial table should drop");
+
+    let error =
+        run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect_err("the record cannot be stored");
+    let reported = error.to_string();
+    let RunnerError::TrialNotJournaled { lifecycle, source } = error else {
+        panic!("a lost record reports the lifecycle it would have carried, got {reported}");
+    };
+    assert!(
+        matches!(source, ControlPlaneError::Journal(_)),
+        "{source:?}"
+    );
+    let lifecycle = lifecycle.expect("a completed promotion reports its lifecycle");
+    assert_eq!(lifecycle.provider_id, "mock");
+    assert!(lifecycle.verified && lifecycle.rolled_back);
+    assert!(
+        reported.contains("completed the lifecycle"),
+        "the reported error says the provider was reached: {reported}"
+    );
+
+    // A rejection never runs a lifecycle, so its lost record carries none - the
+    // distinction the caller could not otherwise draw.
+    let error =
+        run_trial(&mut plane, &spec_for(70, 5.0, 80.0)).expect_err("the record cannot be stored");
+    let reported = error.to_string();
+    let RunnerError::TrialNotJournaled { lifecycle, .. } = error else {
+        panic!("a lost record is reported as such, got {reported}");
+    };
+    assert!(
+        lifecycle.is_none(),
+        "a rejected candidate never reached the provider: {lifecycle:?}"
+    );
+
+    // The leased lifecycle still restored the pre-state on the way out.
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
 fn a_trial_replays_from_the_journal_alone_with_an_identical_verdict() {
     let journal = NamedTempFile::new().expect("temp journal");
 
@@ -625,6 +678,15 @@ fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
         ("a hypothesis above the policy ceiling", "hypothesis", {
             let mut payload = recorded.clone();
             payload["spec"]["hypothesis"] = json!("x".repeat(MAX_HYPOTHESIS_CHARS as usize + 1));
+            payload
+        }),
+        // Blanking the statement of what a promotion was for is the cheaper
+        // rewrite of the two, so the floor is gated like the ceiling. Only the
+        // length is checked, though: a hypothesis rewritten within its bounds
+        // has no redundant copy in the record to contradict it.
+        ("a blanked hypothesis", "hypothesis", {
+            let mut payload = recorded.clone();
+            payload["spec"]["hypothesis"] = json!("");
             payload
         }),
         (

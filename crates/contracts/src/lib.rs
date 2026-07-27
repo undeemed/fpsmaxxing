@@ -205,16 +205,24 @@ pub const MAX_SAMPLES: u32 = 10_000;
 /// into a single durable trial row, so it is bounded like every other field of
 /// the spec rather than sizing that row by whatever the author sends. The
 /// ceiling is mirrored as `maxLength` in `schemas/experiment.schema.json`, which
-/// counts Unicode characters, so the runner counts them the same way.
+/// counts Unicode characters, so the runner counts them the same way. The floor
+/// is [`MIN_HYPOTHESIS_CHARS`].
 pub const MAX_HYPOTHESIS_CHARS: u32 = 4_096;
+
+/// Inclusive floor on an [`ExperimentSpec`]'s hypothesis, in characters.
+///
+/// A trial row is the durable statement of what a promotion was for, so the
+/// hypothesis that states it may not be blank. The floor is mirrored as
+/// `minLength` in `schemas/experiment.schema.json`.
+pub const MIN_HYPOTHESIS_CHARS: u32 = 1;
 
 /// A declarative, typed experiment the runner can execute, journal, and replay.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentSpec {
-    /// Human-authored hypothesis the trial tests; at most
-    /// [`MAX_HYPOTHESIS_CHARS`] characters.
-    #[schemars(length(max = MAX_HYPOTHESIS_CHARS))]
+    /// Human-authored hypothesis the trial tests; from
+    /// [`MIN_HYPOTHESIS_CHARS`] to [`MAX_HYPOTHESIS_CHARS`] characters.
+    #[schemars(length(min = MIN_HYPOTHESIS_CHARS, max = MAX_HYPOTHESIS_CHARS))]
     pub hypothesis: String,
     /// Bounded, policy-checkable capability change under test.
     pub target: ChangeRequest,
@@ -288,8 +296,9 @@ mod tests {
     use super::{
         CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
         MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
-        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample, MetricSummary,
-        NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict, VerdictReason,
+        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES, MIN_HYPOTHESIS_CHARS, MetricSample,
+        MetricSummary, NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict,
+        VerdictReason,
     };
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
@@ -711,21 +720,24 @@ mod tests {
     #[test]
     fn the_hypothesis_is_bounded_like_the_schema() {
         // The hypothesis is free text an agent authors and the runner journals
-        // verbatim, so its ceiling is declared here and mirrored by the schema
-        // the agent writes against.
+        // verbatim, so both its ceiling and its floor are declared here and
+        // mirrored by the schema the agent writes against. The floor matters as
+        // much as the ceiling: a blank hypothesis leaves a promoted trial with
+        // no statement of what it was for.
         let checked_in: Value =
             serde_json::from_str(EXPERIMENT_SCHEMA).expect("experiment schema should parse");
-        assert_eq!(
-            checked_in["properties"]["hypothesis"]["maxLength"],
-            json!(MAX_HYPOTHESIS_CHARS)
-        );
-
         let generated = serde_json::to_value(schemars::schema_for!(ExperimentSpec))
             .expect("generated schema should serialize");
-        assert_eq!(
-            generated["properties"]["hypothesis"]["maxLength"],
-            json!(MAX_HYPOTHESIS_CHARS)
-        );
+        for schema in [&checked_in, &generated] {
+            assert_eq!(
+                schema["properties"]["hypothesis"]["maxLength"],
+                json!(MAX_HYPOTHESIS_CHARS)
+            );
+            assert_eq!(
+                schema["properties"]["hypothesis"]["minLength"],
+                json!(MIN_HYPOTHESIS_CHARS)
+            );
+        }
     }
 
     #[test]
