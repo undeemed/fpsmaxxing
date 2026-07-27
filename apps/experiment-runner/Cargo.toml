@@ -17,6 +17,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 fpsmaxxing-provider-sdk.workspace = true
+rusqlite.workspace = true
 tempfile = "3"
 
 [lints]

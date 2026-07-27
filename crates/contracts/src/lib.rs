@@ -71,7 +71,9 @@ pub struct ProviderManifest {
 /// it is mirrored as `maximum` on `lease_seconds` in
 /// `schemas/experiment.schema.json`, applied by the broker policy in
 /// `crates/control-plane` before a lifecycle runs, and applied again by the
-/// experiment runner, which bounds a spec before it measures anything.
+/// experiment runner, which bounds a spec before it measures anything. Callers
+/// that publish their own request schema, such as the gateway's advertised tool
+/// input, state the bound independently.
 pub const MAX_LEASE_SECONDS: u64 = 300;
 
 /// A requested provider change after policy validation.
@@ -197,11 +199,22 @@ pub struct DecisionBounds {
 /// mirrored as `maximum` in `schemas/experiment.schema.json`.
 pub const MAX_SAMPLES: u32 = 10_000;
 
+/// Inclusive ceiling on an [`ExperimentSpec`]'s hypothesis, in characters.
+///
+/// The hypothesis is free text an agent authors and the runner writes verbatim
+/// into a single durable trial row, so it is bounded like every other field of
+/// the spec rather than sizing that row by whatever the author sends. The
+/// ceiling is mirrored as `maxLength` in `schemas/experiment.schema.json`, which
+/// counts Unicode characters, so the runner counts them the same way.
+pub const MAX_HYPOTHESIS_CHARS: u32 = 4_096;
+
 /// A declarative, typed experiment the runner can execute, journal, and replay.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentSpec {
-    /// Human-authored hypothesis the trial tests.
+    /// Human-authored hypothesis the trial tests; at most
+    /// [`MAX_HYPOTHESIS_CHARS`] characters.
+    #[schemars(length(max = MAX_HYPOTHESIS_CHARS))]
     pub hypothesis: String,
     /// Bounded, policy-checkable capability change under test.
     pub target: ChangeRequest,
@@ -274,9 +287,9 @@ mod tests {
 
     use super::{
         CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
-        MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C, MAX_LEASE_SECONDS,
-        MAX_SAMPLES, MetricSample, MetricSummary, NonZeroU32, NonZeroU64, Persistence,
-        ProviderManifest, RiskClass, Verdict, VerdictReason,
+        MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
+        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample, MetricSummary,
+        NonZeroU32, NonZeroU64, Persistence, ProviderManifest, RiskClass, Verdict, VerdictReason,
     };
 
     const CAPABILITY_SCHEMA: &str = include_str!("../../../schemas/capability.schema.json");
@@ -693,6 +706,26 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn the_hypothesis_is_bounded_like_the_schema() {
+        // The hypothesis is free text an agent authors and the runner journals
+        // verbatim, so its ceiling is declared here and mirrored by the schema
+        // the agent writes against.
+        let checked_in: Value =
+            serde_json::from_str(EXPERIMENT_SCHEMA).expect("experiment schema should parse");
+        assert_eq!(
+            checked_in["properties"]["hypothesis"]["maxLength"],
+            json!(MAX_HYPOTHESIS_CHARS)
+        );
+
+        let generated = serde_json::to_value(schemars::schema_for!(ExperimentSpec))
+            .expect("generated schema should serialize");
+        assert_eq!(
+            generated["properties"]["hypothesis"]["maxLength"],
+            json!(MAX_HYPOTHESIS_CHARS)
+        );
     }
 
     #[test]

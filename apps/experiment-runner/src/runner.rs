@@ -16,7 +16,9 @@
 //! still recorded, as a [`LifecycleFailure`] carried by the same record as the
 //! measurements that authorized the apply, and is also returned to the caller
 //! together with the identifier that record was stored under, so the caller
-//! addresses its own row rather than the journal's last one.
+//! addresses its own row rather than the journal's last one - or, when the
+//! journal itself refused the write, with the reason those measurements were
+//! lost.
 //! Crash safety for the window between the mutation and that record stays with
 //! the lifecycle journal's write-ahead `apply-intent` stage (ADR 0002).
 //!
@@ -40,8 +42,8 @@ use std::num::NonZeroU32;
 
 use fpsmaxxing_contracts::{
     Decision, DecisionBounds, ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W,
-    MAX_DECISION_TEMPERATURE_C, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample, ProviderManifest,
-    Verdict,
+    MAX_DECISION_TEMPERATURE_C, MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_SAMPLES, MetricSample,
+    ProviderManifest, Verdict,
 };
 use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, LifecycleResult, MAX_MOCK_VALUE};
 use serde::{Deserialize, Serialize};
@@ -70,11 +72,22 @@ pub enum RunnerError {
     /// reading back the last identifier the journal holds would be wrong: the
     /// trial journal is shared, and a concurrent runner can append between the
     /// write and the read.
-    #[error("lifecycle failed after {}: {source}", journaled_as(*trial_id))]
+    ///
+    /// Exactly one of `trial_id` and `journal_error` is set: journaling the
+    /// record either produced an identifier or failed with a reason. Losing the
+    /// measurements is the graver of the two conditions, so the reason it was
+    /// lost travels with the error rather than being reported out of band, even
+    /// though the lifecycle error stays the primary one.
+    #[error("lifecycle failed after {}: {source}", journaled_as(*trial_id, journal_error.as_deref()))]
     LifecycleFailed {
         /// Identifier of the journaled trial, absent only when journaling the
-        /// record failed too; that failure is traced to stderr.
+        /// record failed too.
         trial_id: Option<i64>,
+        /// Why the record could not be journaled, present only when it was not.
+        ///
+        /// Boxed so carrying a second broker error does not widen every
+        /// `Result` this module returns to the size of two of them.
+        journal_error: Option<Box<ControlPlaneError>>,
         /// The broker error that ended the lifecycle.
         #[source]
         source: ControlPlaneError,
@@ -219,8 +232,8 @@ pub struct ReplayOutcome {
     pub recorded: Verdict,
     /// The verdict recomputed from the journaled samples and bounds.
     pub recomputed: Verdict,
-    /// Whether the journaled record passes the policy gate and agrees with the
-    /// spec it carries; see [`replay_trial`].
+    /// Whether the journaled record passes the policy gate as it stands now and
+    /// agrees with the spec it carries; see [`replay_trial`].
     pub policy_legal: bool,
     /// Which gate the record tripped, absent when `policy_legal` holds.
     ///
@@ -258,7 +271,7 @@ impl ReplayOutcome {
 /// journaled, as a [`LifecycleFailed`](RunnerError::LifecycleFailed) naming the
 /// identifier that record was stored under; if that write also fails, the
 /// lifecycle error still takes precedence, the identifier is absent, and the
-/// journal failure is traced to stderr.
+/// same error carries why the record was lost.
 pub fn run_trial(
     plane: &mut ControlPlane,
     spec: &ExperimentSpec,
@@ -299,16 +312,15 @@ pub fn run_trial(
     };
     let journaled = plane.record_trial(&record);
     if let Some(Err(source)) = outcome {
-        let trial_id = match journaled {
-            Ok(id) => Some(id),
-            Err(journal_error) => {
-                eprintln!(
-                    "fpsmaxxing-experiment-runner: could not journal the trial whose lifecycle failed: {journal_error}"
-                );
-                None
-            }
+        let (trial_id, journal_error) = match journaled {
+            Ok(id) => (Some(id), None),
+            Err(journal_error) => (None, Some(Box::new(journal_error))),
         };
-        return Err(RunnerError::LifecycleFailed { trial_id, source });
+        return Err(RunnerError::LifecycleFailed {
+            trial_id,
+            journal_error,
+            source,
+        });
     }
     Ok(StoredTrial {
         id: journaled?,
@@ -364,13 +376,19 @@ pub fn replay_trial(plane: &ControlPlane, id: i64) -> Result<ReplayOutcome, Runn
     })
 }
 
-/// Checks a journaled record against the gate that admitted it.
+/// Checks a journaled record against the gate as it stands now.
 ///
 /// Replay is the tamper-detection read, so it re-runs the whole of
 /// [`validate_spec`] over the journaled spec rather than only its bounds: a row
-/// whose capability, sample counts, decision bounds, candidate value, or TTL
-/// lease were rewritten is reported as illegal even though re-evaluating it
-/// reproduces the recorded verdict.
+/// whose capability, hypothesis, sample counts, decision bounds, candidate
+/// value, or TTL lease were rewritten is reported as illegal even though
+/// re-evaluating it reproduces the recorded verdict.
+///
+/// The gate applied is the current one, so tightening a policy constant flags
+/// every archived row recorded under the looser ceiling. That is the intended
+/// reading rather than a false alarm - those trials are outside the envelope the
+/// alpha now permits - and ADR 0002 makes a constant change a
+/// [`TRIAL_RECORD_VERSION`] bump so a flagged archive stays attributable.
 ///
 /// The attached provider's manifest is deliberately not consulted. A trial
 /// journal outlives the process that wrote it, so requiring the provider running
@@ -462,10 +480,11 @@ fn check_policy(record: &TrialRecord) -> Result<(), RunnerError> {
 }
 
 /// Renders where a failed lifecycle's trial record came to rest.
-fn journaled_as(trial_id: Option<i64>) -> String {
-    match trial_id {
-        Some(id) => format!("journaling trial {id}"),
-        None => "failing to journal its trial".to_owned(),
+fn journaled_as(trial_id: Option<i64>, journal_error: Option<&ControlPlaneError>) -> String {
+    match (trial_id, journal_error) {
+        (Some(id), _) => format!("journaling trial {id}"),
+        (None, Some(error)) => format!("failing to journal its trial: {error}"),
+        (None, None) => "failing to journal its trial".to_owned(),
     }
 }
 
@@ -517,8 +536,11 @@ fn validate(manifest: &ProviderManifest, spec: &ExperimentSpec) -> Result<u64, R
 /// request, and a spec the lifecycle can only ever deny must not be measured
 /// and journaled as an authoritative trial first. A spec that asks for fewer
 /// counted samples than its own bounds require can never promote either, so it
-/// is refused up front rather than measured and then rejected. The validated
-/// value is returned so the measurement uses exactly what was bounded here.
+/// is refused up front rather than measured and then rejected. The hypothesis is
+/// the one field neither phase consumes, but it is written verbatim into a
+/// single durable trial row, so it is held to [`MAX_HYPOTHESIS_CHARS`] rather
+/// than sizing that row by whatever the author sent. The validated value is
+/// returned so the measurement uses exactly what was bounded here.
 ///
 /// The capability check is what keeps unknown hardware failing closed, and it is
 /// the model rather than the registry that decides what is known: the
@@ -532,6 +554,12 @@ fn validate_spec(spec: &ExperimentSpec) -> Result<u64, RunnerError> {
         return Err(ControlPlaneError::UnknownCapability(spec.target.capability_id.clone()).into());
     }
     validate_bounds(&spec.bounds)?;
+    let hypothesis = spec.hypothesis.chars().count();
+    if hypothesis > MAX_HYPOTHESIS_CHARS as usize {
+        return Err(RunnerError::InvalidSpec(format!(
+            "hypothesis is {hypothesis} characters, above the {MAX_HYPOTHESIS_CHARS} ceiling"
+        )));
+    }
     let min_samples = spec.bounds.min_samples.get();
     for (label, count) in [
         ("warmup_samples", spec.warmup_samples),
@@ -661,7 +689,8 @@ mod tests {
 
     use super::{
         ExperimentSpec, MAX_DECISION_ERRORS, MAX_DECISION_POWER_W, MAX_DECISION_TEMPERATURE_C,
-        MAX_LEASE_SECONDS, MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest, RunnerError, validate,
+        MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, MAX_MOCK_VALUE, MAX_SAMPLES, ProviderManifest,
+        RunnerError, validate,
     };
 
     /// A manifest advertising only the knob the measurement model describes.
@@ -815,6 +844,25 @@ mod tests {
 
         leased.target.lease_seconds = NonZeroU64::MAX;
         assert!(rejection(&leased).contains("lease_seconds"));
+    }
+
+    #[test]
+    fn rejects_a_hypothesis_above_the_policy_bound() {
+        // The hypothesis is free text the runner writes verbatim into one
+        // durable row, so the row is not sized by whatever the author sent.
+        // The ceiling counts characters, as the schema's maxLength does.
+        let ceiling = MAX_HYPOTHESIS_CHARS as usize;
+        let mut verbose = spec(2, 5, 5, 3);
+        verbose.hypothesis = "\u{e9}".repeat(ceiling);
+        assert!(validate(&manifest(), &verbose).is_ok());
+
+        verbose.hypothesis = "\u{e9}".repeat(ceiling + 1);
+        let message = rejection(&verbose);
+        assert!(message.contains("hypothesis"), "{message}");
+        assert!(
+            message.contains(&format!("{} characters", ceiling + 1)),
+            "the ceiling counts characters rather than bytes: {message}"
+        );
     }
 
     #[test]

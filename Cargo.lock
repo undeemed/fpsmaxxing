@@ -117,6 +117,7 @@ dependencies = [
  "fpsmaxxing-control-plane",
  "fpsmaxxing-mock-provider",
  "fpsmaxxing-provider-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

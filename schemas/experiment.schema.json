@@ -13,7 +13,7 @@
     "bounds"
   ],
   "properties": {
-    "hypothesis": { "type": "string", "minLength": 1 },
+    "hypothesis": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "target": { "$ref": "#/$defs/change_request" },
     "warmup_samples": { "type": "integer", "minimum": 0, "maximum": 10000 },
     "baseline_samples": { "type": "integer", "minimum": 1, "maximum": 10000 },

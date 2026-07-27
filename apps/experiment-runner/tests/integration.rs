@@ -4,20 +4,23 @@
 //! the mock provider through the broker: a promoted experiment that runs the
 //! full lifecycle, a rejected experiment that is never applied and leaves the
 //! baseline untouched, a promoted experiment whose lifecycle the broker refuses
-//! but which is still journaled, and a replay from the durable journal alone -
-//! reopened as a fresh handle - that reproduces the recorded verdict exactly.
+//! but which is still journaled, the same refusal when the journal cannot take
+//! the record either, and a replay from the durable journal alone - reopened as
+//! a fresh handle - that reproduces the recorded verdict exactly.
 //! The final test states the MVP acceptance criterion directly.
 
 use std::num::{NonZeroU32, NonZeroU64};
 
 use fpsmaxxing_contracts::{
     CapabilityDescriptor, ChangeRequest, Decision, DecisionBounds, ExperimentSpec,
-    MAX_LEASE_SECONDS, Persistence, ProviderManifest, RiskClass, StateSnapshot, VerdictReason,
+    MAX_HYPOTHESIS_CHARS, MAX_LEASE_SECONDS, Persistence, ProviderManifest, RiskClass,
+    StateSnapshot, VerdictReason,
 };
 use fpsmaxxing_control_plane::{ControlPlane, ControlPlaneError, MAX_MOCK_VALUE};
 use fpsmaxxing_experiment_runner::{RunnerError, TrialRecord, evaluate, replay_trial, run_trial};
 use fpsmaxxing_mock_provider::MockProvider;
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
+use rusqlite::Connection;
 use serde_json::json;
 use tempfile::NamedTempFile;
 
@@ -236,12 +239,21 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
     // The measurements that authorized the promotion are journaled with the
     // refusal, in one append, and the error names the row it was written to, so
     // the caller addresses its own trial instead of the journal's last one.
-    let RunnerError::LifecycleFailed { trial_id, source } = error else {
+    let RunnerError::LifecycleFailed {
+        trial_id,
+        journal_error,
+        source,
+    } = error
+    else {
         panic!("a refused lifecycle reports the trial it journaled, got {reported}");
     };
     assert!(
         matches!(source, ControlPlaneError::PolicyDenied(_)),
         "{source:?}"
+    );
+    assert!(
+        journal_error.is_none(),
+        "the record was stored, so nothing explains a loss: {journal_error:?}"
     );
     let trial_id = trial_id.expect("the refused lifecycle journaled its trial");
     assert!(
@@ -276,6 +288,59 @@ fn a_promoted_trial_survives_a_lifecycle_the_broker_refuses() {
     let outcome = replay_trial(&plane, trial_id).expect("replay trial");
     assert!(outcome.is_consistent());
     assert_eq!(outcome.recomputed.decision, Decision::Promote);
+
+    // Nothing reached the provider, so the baseline is untouched.
+    assert_eq!(current_value(&plane), 10);
+}
+
+#[test]
+fn a_refused_lifecycle_reports_why_its_trial_could_not_be_journaled() {
+    let journal = NamedTempFile::new().expect("temp journal");
+    let mut plane = ControlPlane::open(
+        Box::new(ApprovalGatedProvider(MockProvider::new(10))),
+        journal.path(),
+    )
+    .expect("open");
+
+    // Take the trial table away behind the broker's back, so the append that
+    // records the refused promotion fails too. Losing the measurements that
+    // authorized a mutation is the graver of the two failures, so the reason
+    // travels with the error rather than being reported out of band.
+    Connection::open(journal.path())
+        .expect("second journal handle")
+        .execute_batch("DROP TABLE experiment_trials")
+        .expect("the trial table should drop");
+
+    let error =
+        run_trial(&mut plane, &spec_for(40, 5.0, 80.0)).expect_err("policy should deny the change");
+    let reported = error.to_string();
+    let RunnerError::LifecycleFailed {
+        trial_id,
+        journal_error,
+        source,
+    } = error
+    else {
+        panic!("a refused lifecycle reports how its trial was journaled, got {reported}");
+    };
+
+    // The lifecycle error stays the primary one.
+    assert!(
+        matches!(source, ControlPlaneError::PolicyDenied(_)),
+        "{source:?}"
+    );
+    assert!(
+        trial_id.is_none(),
+        "no identifier exists for a record that was never stored"
+    );
+    let journal_error = journal_error.expect("a lost record reports why it was lost");
+    assert!(
+        matches!(*journal_error, ControlPlaneError::Journal(_)),
+        "a storage fault is distinguishable from a serialization one: {journal_error:?}"
+    );
+    assert!(
+        reported.contains("failing to journal its trial") && reported.contains("experiment_trials"),
+        "the reported error names both failures: {reported}"
+    );
 
     // Nothing reached the provider, so the baseline is untouched.
     assert_eq!(current_value(&plane), 10);
@@ -555,6 +620,11 @@ fn a_replay_reports_a_record_the_policy_gate_would_refuse() {
         ("a lease above the policy ceiling", "lease_seconds", {
             let mut payload = recorded.clone();
             payload["spec"]["target"]["lease_seconds"] = json!(MAX_LEASE_SECONDS + 1);
+            payload
+        }),
+        ("a hypothesis above the policy ceiling", "hypothesis", {
+            let mut payload = recorded.clone();
+            payload["spec"]["hypothesis"] = json!("x".repeat(MAX_HYPOTHESIS_CHARS as usize + 1));
             payload
         }),
         (
