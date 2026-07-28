@@ -9,7 +9,7 @@ FPSMaxxing is an open-source Rust control plane for using an AI coding agent or 
 > An MCP client can discover typed capabilities and run the full snapshot, preview, apply, verify, and rollback lifecycle, but FPSMaxxing does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
 > Measurement is a deterministic stand-in for live telemetry, and the gateway does not route through the privileged broker yet.
 >
-> Everything below is written in the present tense for what runs today on that mock path, and in the future tense for what does not exist yet.
+> Every claim below about what the system does is written in the present tense for what runs today on that mock path, and in the future tense for what does not exist yet; the design principles and the planned integrations state intent rather than status.
 > Read every present-tense claim against this caveat rather than as a claim about real hardware.
 
 ## The closed loop
@@ -35,6 +35,7 @@ An MCP agent reaches the machine only through the unprivileged **gateway**, whic
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
 The **privileged broker** applies that adjustment, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
 It will reach the hardware through a **provider sidecar**; today it links its provider in process.
+That adjustment will reach the broker across the local IPC boundary; today the gateway drives a control plane of its own in process.
 An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
 It will perform that restore through the broker, and will also trigger on a safety violation.
 The **deterministic evaluator** - kept outside the LLM's writable surface - decides from the recorded measurements whether the candidate is applied at all.
@@ -120,7 +121,7 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 
 ### Privileged broker
 
-`fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run outside Linux because only that transport is implemented.
+`fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run on Windows because the Windows named-pipe transport is not yet available.
 The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above.
 [Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
 

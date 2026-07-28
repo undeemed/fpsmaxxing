@@ -5,7 +5,7 @@ For why the boundary is shaped this way, read [Architecture](ARCHITECTURE.md); f
 
 The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
 It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket.
-Only the Linux transport is implemented, so the binary refuses to run elsewhere.
+Only the Unix domain socket transport is implemented, and the Windows named-pipe transport is not yet available, so the binary refuses to run there.
 The gateway does not connect to it yet - it still opens an in-process control plane of its own - so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by an MCP client.
 
 ## Running the broker
@@ -28,12 +28,12 @@ cargo run -p fpsmaxxing-broker -- \
 
 ## Socket and journal paths
 
-| Setting | Flag | Environment variable | Default |
-| --- | --- | --- | --- |
-| IPC socket | `--socket <path>` | `FPSMAXXING_BROKER_SOCKET` | `<private dir>/broker.sock` |
+| Setting       | Flag               | Environment variable             | Default                        |
+| ------------- | ------------------ | -------------------------------- | ------------------------------ |
+| IPC socket    | `--socket <path>`  | `FPSMAXXING_BROKER_SOCKET`       | `<private dir>/broker.sock`    |
 | Audit journal | `--journal <path>` | `FPSMAXXING_BROKER_JOURNAL_PATH` | `<private dir>/journal.sqlite` |
 
-A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
+A flag wins over its environment variable, and both are broker-specific so nothing the gateway, the CLI, or the watchdog exports can move the privileged journal.
 
 A path from a flag or an environment variable is held to the same bar as the default: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
 Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
