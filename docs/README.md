@@ -1,6 +1,6 @@
 # FPSMaxxing documentation
 
-Use this page as the documentation entry point. The Markdown documents are canonical; the HTML implementation plan is a static visualization of the same design.
+Use this page as the documentation entry point. The Markdown documents are canonical; the HTML implementation plan is a static visualization of the same design. The project [README](../README.md) carries the closed-loop overview of how measurement, policy, broker, watchdog, and evaluator fit together before the detailed design below.
 
 ## Core design
 

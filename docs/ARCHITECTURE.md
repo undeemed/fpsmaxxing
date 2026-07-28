@@ -17,7 +17,7 @@ The privileged Windows service accepts authenticated local requests from the gat
 
 ### Watchdog
 
-The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner.
+The independent watchdog owns lease deadlines and emergency rollback. It must restore state without the gateway, agent, or experiment runner. On lease expiry or a safety violation it reverts to the pre-state snapshot through the privileged broker.
 
 `apps/watchdog` implements this on the Linux-safe mock path.
 It reads the durable journal owned by the control plane and scans for experiments that recorded a write-ahead `apply-intent` with no terminal `completed` or `failed` record: either a crash between the mutation and its rollback, or an elapsed TTL lease.

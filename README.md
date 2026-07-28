@@ -8,6 +8,31 @@ FPSMaxxing is an open-source Rust control plane for using an AI coding agent or 
 > FPSMaxxing is currently a read-only alpha built around a mock provider.
 > An MCP client can discover typed capabilities and run the full snapshot, preview, apply, verify, and rollback lifecycle, but FPSMaxxing does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
 
+## The closed loop
+
+FPSMaxxing is designed as a closed feedback loop that tunes system and hardware performance through bounded, reversible experiments.
+
+```mermaid
+flowchart LR
+    M["Measure<br/>FPS, latency,<br/>frametimes, thermals"]
+    P["Policy engine<br/>decide bounded<br/>adjustment"]
+    B["Broker<br/>apply via typed capability<br/>snapshot + TTL lease"]
+    E["Evaluator<br/>keep or roll back"]
+    W["Watchdog<br/>out-of-band guard<br/>lease/TTL + safety"]
+    M --> P
+    P --> B
+    B -->|re-measure under workload| E
+    E -->|keep, iterate| M
+    E -.->|roll back<br/>regression| B
+    W -.->|lease/TTL expiry or safety violation:<br/>revert to snapshot| B
+```
+
+An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
+The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
+The **privileged broker** is designed to apply that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+An **independent watchdog** will own the lease deadline and restore the snapshot through the broker, without the gateway, agent, or experiment runner, whenever a lease expires or a safety violation appears.
+In the target design the loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those measurements whether to keep the change or roll back a regression before the next iteration begins.
+
 ## Why FPSMaxxing?
 
 Existing tools already know how to control parts of a PC:
@@ -92,9 +117,9 @@ LLM / MCP client
        │
        ▼
 Rust gateway ──► policy engine ──► privileged broker ──► provider sidecars
-       ▲                                  │
-       │                                  ▼
-telemetry normalizer ◄──────────── independent watchdog
+       ▲                                  ▲                      │
+       │                           independent watchdog          │
+telemetry normalizer ◄───────────────────────────────────────────┘
        │
        ▼
 experiment journal and benchmark decision gate
