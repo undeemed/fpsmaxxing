@@ -52,7 +52,7 @@ Existing tools already know how to control parts of a PC:
 - NVML and AMD SMI expose supported GPU telemetry and controls.
 - Windows APIs expose power policy and documented Registry settings.
 
-FPSMaxxing connects those control planes to the reproducible research loop described above.
+FPSMaxxing will connect those control planes to the reproducible research loop described above; today only the mock provider is wired.
 The LLM proposes an experiment.
 Deterministic policy, broker, provider, watchdog, and measurement components decide whether the experiment is allowed and whether its measured result should be retained.
 
@@ -83,7 +83,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path, apart from the hops the walkthrough marks as future work: the provider-sidecar hop, the watchdog's restore through the broker, re-measurement inside the lease window, the keep-and-iterate edge, and the safety-violation trigger.
+Every stage of the closed loop above has a working implementation on the mock path, apart from the hops the walkthrough marks as future work.
 What ships today, by capability:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
@@ -121,7 +121,8 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 ### Privileged broker
 
 `fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run outside Linux because only that transport is implemented.
-The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above, and [broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
+The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above.
+[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
 
 ```bash
 cargo run -p fpsmaxxing-broker
