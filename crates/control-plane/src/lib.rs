@@ -1,13 +1,24 @@
 //! Capability registry, policy seam, broker lifecycle, and durable journal.
 
-use std::{num::NonZeroU64, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
-use fpsmaxxing_contracts::{ChangeRequest, ProviderManifest, RiskClass, StateSnapshot};
+use fpsmaxxing_contracts::{
+    ChangeRequest, MAX_LEASE_SECONDS, ProviderManifest, RiskClass, StateSnapshot,
+};
 use fpsmaxxing_provider_sdk::{Provider, ProviderError};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+
+/// Inclusive ceiling the bounded alpha policy enforces on `mock.value`.
+///
+/// [`ControlPlane::run_lifecycle`] rejects any change above it. It is exported
+/// so the experiment runner, which acts on a candidate value before the
+/// lifecycle runs, can refuse the same values this policy would. Callers that
+/// publish their own request schema, such as the gateway's advertised tool
+/// input, state the bound independently.
+pub const MAX_MOCK_VALUE: u64 = 100;
 
 /// Fail-closed errors from the broker seam.
 #[derive(Debug, Error)]
@@ -27,6 +38,13 @@ pub enum ControlPlaneError {
     /// The post-rollback probe did not match the captured snapshot.
     #[error("rollback verification failed")]
     RollbackVerificationFailed,
+    /// No trial has been recorded under the requested identifier.
+    ///
+    /// This is distinct from [`Journal`](Self::Journal): the trial journal is
+    /// append-only, so a missing identifier is a consistency signal about
+    /// recorded history rather than a transient storage fault.
+    #[error("unknown trial: {0}")]
+    UnknownTrial(i64),
     /// The durable journal could not be read or written.
     #[error(transparent)]
     Journal(#[from] rusqlite::Error),
@@ -45,6 +63,7 @@ impl ControlPlaneError {
             Self::Provider(_) => "provider",
             Self::VerificationFailed => "verification-failed",
             Self::RollbackVerificationFailed => "rollback-verification-failed",
+            Self::UnknownTrial(_) => "unknown-trial",
             Self::Journal(_) => "journal",
             Self::Serialization(_) => "serialization",
         }
@@ -124,6 +143,11 @@ impl ControlPlane {
                 stage TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS experiment_trials (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                payload TEXT NOT NULL
             );",
         )?;
         Ok(Self {
@@ -183,6 +207,76 @@ impl ControlPlane {
             .map_err(ControlPlaneError::from)
     }
 
+    /// Reads the provider's current typed state snapshot.
+    ///
+    /// This read-only accessor lets an experiment runner establish a baseline
+    /// before measuring a candidate; it mutates no provider or journal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider cannot produce a snapshot.
+    pub fn snapshot(&self) -> Result<StateSnapshot, ControlPlaneError> {
+        Ok(self.provider.snapshot()?)
+    }
+
+    /// Appends a self-describing trial record to the durable trial journal and
+    /// returns its identifier.
+    ///
+    /// The payload is opaque to the control plane: a runner stores the spec,
+    /// recorded samples, and verdict together so the trial can be replayed and
+    /// re-evaluated from the journal alone, without chat history.
+    ///
+    /// This is the only write the trial journal exposes, so the table is
+    /// append-only like the lifecycle journal: a recorded trial has no API that
+    /// can rewrite its verdict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be encoded or the durable journal
+    /// cannot be written.
+    pub fn record_trial(&self, payload: &impl Serialize) -> Result<i64, ControlPlaneError> {
+        self.journal.execute(
+            "INSERT INTO experiment_trials (recorded_at, payload)
+             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?1)",
+            params![serde_json::to_string(payload)?],
+        )?;
+        Ok(self.journal.last_insert_rowid())
+    }
+
+    /// Reads one trial record by identifier for replay and re-evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownTrial`](ControlPlaneError::UnknownTrial) if no trial has
+    /// the identifier, keeping an absent record distinct from a journal that
+    /// cannot be read or decoded.
+    pub fn read_trial(&self, id: i64) -> Result<Value, ControlPlaneError> {
+        let payload: String = self
+            .journal
+            .query_row(
+                "SELECT payload FROM experiment_trials WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ControlPlaneError::UnknownTrial(id))?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    /// Lists recorded trial identifiers in insertion order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable journal cannot be queried.
+    pub fn trial_ids(&self) -> Result<Vec<i64>, ControlPlaneError> {
+        let mut statement = self
+            .journal
+            .prepare("SELECT id FROM experiment_trials ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(ControlPlaneError::from)
+    }
+
     fn validate(&self, request: &ChangeRequest) -> Result<(), ControlPlaneError> {
         let capability = self
             .manifest
@@ -195,10 +289,10 @@ impl ControlPlane {
                 "only reversible mock capabilities are enabled".to_owned(),
             ));
         }
-        if request.lease_seconds > NonZeroU64::new(300).expect("constant is non-zero") {
-            return Err(ControlPlaneError::PolicyDenied(
-                "lease exceeds 300 seconds".to_owned(),
-            ));
+        if request.lease_seconds.get() > MAX_LEASE_SECONDS {
+            return Err(ControlPlaneError::PolicyDenied(format!(
+                "lease exceeds {MAX_LEASE_SECONDS} seconds"
+            )));
         }
         let value = request
             .parameters
@@ -207,10 +301,10 @@ impl ControlPlane {
             .ok_or_else(|| {
                 ControlPlaneError::PolicyDenied("mock.value requires an unsigned value".to_owned())
             })?;
-        if value > 100 {
-            return Err(ControlPlaneError::PolicyDenied(
-                "mock.value is bounded to 0..=100".to_owned(),
-            ));
+        if value > MAX_MOCK_VALUE {
+            return Err(ControlPlaneError::PolicyDenied(format!(
+                "mock.value is bounded to 0..={MAX_MOCK_VALUE}"
+            )));
         }
         Ok(())
     }
@@ -381,7 +475,7 @@ impl ControlPlane {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use fpsmaxxing_contracts::{CapabilityDescriptor, Persistence};
 
@@ -470,10 +564,14 @@ mod tests {
     ];
 
     fn request(value: u64) -> ChangeRequest {
+        leased_request(value, 30)
+    }
+
+    fn leased_request(value: u64, lease_seconds: u64) -> ChangeRequest {
         ChangeRequest {
             capability_id: "mock.value".to_owned(),
             parameters: json!({ "value": value }),
-            lease_seconds: NonZeroU64::new(30).expect("lease is non-zero"),
+            lease_seconds: NonZeroU64::new(lease_seconds).expect("lease is non-zero"),
         }
     }
 
@@ -773,5 +871,98 @@ mod tests {
             .err()
             .expect("foreign targets should be rejected");
         assert!(matches!(error, ControlPlaneError::PolicyDenied(_)));
+    }
+
+    #[test]
+    fn a_lease_above_the_policy_ceiling_is_denied() {
+        // The lease is the TTL that bounds how long a mutation may persist, and
+        // the gateway hands one straight from an agent to this seam, so the
+        // ceiling is checked before the provider is touched at all.
+        let mut plane = plane(false);
+        let error = plane
+            .run_lifecycle(&leased_request(42, MAX_LEASE_SECONDS + 1))
+            .expect_err("an oversized lease should be denied");
+        assert!(
+            matches!(&error, ControlPlaneError::PolicyDenied(message) if message.contains("lease")),
+            "{error:?}"
+        );
+        assert!(
+            plane
+                .journal_stages()
+                .expect("journal should read")
+                .is_empty(),
+            "a denied request opens no experiment"
+        );
+
+        // The ceiling is inclusive, so a lease exactly at it still runs.
+        let result = plane
+            .run_lifecycle(&leased_request(42, MAX_LEASE_SECONDS))
+            .expect("a lease at the ceiling is inside the envelope");
+        assert!(result.verified && result.rolled_back);
+        assert_eq!(
+            plane.journal_stages().expect("journal should read"),
+            LIFECYCLE_STAGES
+        );
+    }
+
+    #[test]
+    fn trial_records_round_trip_through_the_journal() {
+        let plane = plane(false);
+        assert!(
+            plane.trial_ids().expect("ids should read").is_empty(),
+            "a fresh journal has no trials"
+        );
+        let first = plane
+            .record_trial(&json!({ "hypothesis": "higher clocks help", "decision": "promote" }))
+            .expect("first trial should record");
+        let second = plane
+            .record_trial(&json!({ "hypothesis": "wider power budget", "decision": "reject" }))
+            .expect("second trial should record");
+        assert_eq!(plane.trial_ids().expect("ids should read"), [first, second]);
+        let read = plane.read_trial(first).expect("trial should read");
+        assert_eq!(read["hypothesis"], "higher clocks help");
+        assert_eq!(read["decision"], "promote");
+    }
+
+    #[test]
+    fn recording_a_trial_never_disturbs_an_earlier_one() {
+        // The trial journal exposes no update, so a recorded verdict stays as
+        // it was written and later trials only ever append.
+        let plane = plane(false);
+        let first = plane
+            .record_trial(&json!({ "decision": "promote", "lifecycle": { "verified": true } }))
+            .expect("first trial should record");
+        let second = plane
+            .record_trial(&json!({ "decision": "reject" }))
+            .expect("second trial should record");
+        assert_eq!(
+            plane.read_trial(first).expect("trial should read"),
+            json!({ "decision": "promote", "lifecycle": { "verified": true } })
+        );
+        assert_eq!(
+            plane.read_trial(second).expect("trial should read")["decision"],
+            "reject"
+        );
+        assert_eq!(plane.trial_ids().expect("ids should read"), [first, second]);
+    }
+
+    #[test]
+    fn reading_an_unknown_trial_fails_closed() {
+        // An identifier that was never recorded is a consistency signal, so it
+        // is reported apart from a journal that could not be read at all.
+        let plane = plane(false);
+        let error = plane
+            .read_trial(404)
+            .expect_err("an unrecorded trial cannot be read");
+        assert!(matches!(error, ControlPlaneError::UnknownTrial(404)));
+        assert_eq!(error.kind(), "unknown-trial");
+    }
+
+    #[test]
+    fn snapshot_reads_the_current_provider_state() {
+        let plane = plane(false);
+        let snapshot = plane.snapshot().expect("snapshot should read");
+        assert_eq!(snapshot.state["value"], 7);
+        assert_eq!(snapshot.provider_id, "fake");
     }
 }

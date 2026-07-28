@@ -2,8 +2,8 @@
 
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
-The current read-only alpha implements the gateway and an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, wired to a single mock provider.
-The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker and experiment runner remain scaffolds.
+The current read-only alpha implements the gateway, an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, and a deterministic experiment runner (`apps/experiment-runner`) that gates measured trials through an immutable evaluator, all wired to a single mock provider.
+The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker remains a scaffold.
 
 ## Processes
 
@@ -29,6 +29,17 @@ A steady-state poll reclaims only expired leases, while a crash-recovery pass (`
 ### Experiment runner
 
 The runner controls workload setup, warmup, repeated measurements, cooldown, correctness checks, and promotion decisions. Evaluator code is outside the LLM's writable surface.
+
+In the safe alpha (`apps/experiment-runner`) the runner measures a baseline and a candidate against a deterministic model, then a pure immutable evaluator returns a promote or reject verdict from the recorded samples and fixed bounds alone - no clock, no LLM, no I/O. Every trial is journaled as a self-describing, versioned record so it can be replayed and re-evaluated from the journal without the original conversation.
+The record is appended once, after the broker lifecycle it authorized has finished and carrying either that lifecycle's outcome or the error the broker returned, so a promotion the broker refuses still leaves the measurements that authorized it and no API can rewrite a recorded verdict.
+Sample counts and the hypothesis text are bounded by the spec schema and rechecked by the runner before any measurement runs, the target must name the one capability the measurement model describes and the accepted provider advertises so unknown hardware fails closed before anything is measured or journaled, the free-form parameter object that capability is invoked with is held to the keys it actually takes so nothing unread is journaled, the candidate and the provider's own baseline are both held to the knob ceiling the broker policy enforces later, the target's TTL lease is held to the ceiling the broker enforces on every change request, and the spec's decision bounds are intersected with a policy-owned envelope - declared once in `crates/contracts`, mirrored in `schemas/experiment.schema.json`, and re-checked on replay - so a spec can tighten its own safety gate but never loosen it.
+Replay applies that whole gate again to the journaled record rather than the bounds alone, so a row whose spec, capability, hypothesis length, declared sample counts, target parameters, or TTL lease was rewritten after the fact is reported as outside policy even when re-evaluating it reproduces the recorded verdict; the gate applied is the current one, so tightening a policy constant deliberately flags archived rows recorded under the looser ceiling (ADR 0002).
+The two recorded knob values are held more weakly than that list reads: the candidate value is cross-checked only against the copy of itself the spec carries in `parameters.value`, and the baseline value is held to the knob ceiling with no second term at all.
+The recorded samples themselves are not re-derived and nothing ties them to the values they were taken at, and the hypothesis is held to its length rather than its content, so three rewrites pass replay - the measurements together with the verdict they imply, the hypothesis text within its bounds, and a coherent relabelling of the knob values that edits `parameters.value` and the recorded candidate value together to another in-bounds value or moves the baseline to another value under the ceiling.
+Re-deriving the samples would in fact work today, because the stand-in model is a pure function of values the record already carries, and it is deliberately not done: real telemetry is not reproducible, which is why samples are journaled verbatim in the first place, so a gate built on the model's reproducibility would have to be deleted the moment that model is replaced.
+Measurement-content integrity needs a signed or hash-chained journal instead, which the alpha defers rather than approximates.
+Because mock capabilities are leased and the broker lifecycle always rolls back, the verdict gates whether the candidate is applied at all rather than whether it persists; durable keep-or-rollback awaits the privileged broker.
+The candidate is also measured before it is applied, which only the pure stand-in model permits: real `PresentMon` or hardware telemetry cannot observe a candidate that was never written, so swapping it in moves the candidate measurement inside the apply-and-lease window and runs the gate after it.
 
 ### Provider sidecars
 

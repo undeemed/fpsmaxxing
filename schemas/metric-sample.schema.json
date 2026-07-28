@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/metric-sample.schema.json",
+  "title": "FPSMaxxing metric sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fps", "temperature_c", "power_w", "errors"],
+  "properties": {
+    "fps": { "type": "number" },
+    "temperature_c": { "type": "number" },
+    "power_w": { "type": "number" },
+    "errors": { "type": "integer", "minimum": 0 }
+  }
+}

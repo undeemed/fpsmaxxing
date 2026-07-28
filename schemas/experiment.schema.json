@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/experiment.schema.json",
+  "title": "FPSMaxxing experiment specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hypothesis",
+    "target",
+    "warmup_samples",
+    "baseline_samples",
+    "candidate_samples",
+    "bounds"
+  ],
+  "properties": {
+    "hypothesis": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "target": { "$ref": "#/$defs/change_request" },
+    "warmup_samples": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "baseline_samples": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "candidate_samples": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "bounds": { "$ref": "#/$defs/decision_bounds" }
+  },
+  "$defs": {
+    "change_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "parameters", "lease_seconds"],
+      "properties": {
+        "capability_id": { "type": "string", "minLength": 1 },
+        "parameters": { "type": "object" },
+        "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+      }
+    },
+    "decision_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_samples",
+        "min_fps_improvement",
+        "max_temperature_c",
+        "max_power_w",
+        "max_errors"
+      ],
+      "properties": {
+        "min_samples": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "min_fps_improvement": { "type": "number", "minimum": 0.0 },
+        "max_temperature_c": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 90.0
+        },
+        "max_power_w": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 250.0
+        },
+        "max_errors": { "type": "integer", "minimum": 0, "maximum": 0 }
+      }
+    }
+  }
+}

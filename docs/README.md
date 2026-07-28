@@ -17,6 +17,6 @@ Use this page as the documentation entry point. The Markdown documents are canon
 | --- | --- |
 | [Provider guide](providers/README.md) | Rules and lifecycle for provider implementations |
 | [Rust-first ADR](adr/0001-rust-first.md) | Why the control plane uses Rust with one isolated .NET bridge |
-| [Alpha journal ADR](adr/0002-alpha-experiment-journal.md) | Write-ahead apply intent, terminal outcomes, and deferred two-phase journaling |
+| [Alpha journal ADR](adr/0002-alpha-experiment-journal.md) | Write-ahead apply intent, terminal outcomes, append-only trial records, and deferred two-phase journaling |
 
 Repository-wide contributor, security, support, and governance documents remain at the project root so GitHub can discover them automatically.
