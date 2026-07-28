@@ -33,8 +33,8 @@ flowchart LR
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
-The **privileged broker** will apply that adjustment across the local IPC boundary, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-Today the gateway drives a control plane of its own in process, which applies the adjustment under those same snapshot, lease, and journal rules.
+The **privileged broker** applies that adjustment across the local IPC boundary, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+The gateway does not reach the broker over that boundary yet; today it drives a control plane of its own in process, under those same snapshot, lease, and journal rules.
 The broker will reach the hardware through a **provider sidecar**; today that in-process control plane links its provider directly.
 An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
 It will perform that restore through the broker, and will also trigger on a safety violation.
@@ -55,7 +55,7 @@ Existing tools already know how to control parts of a PC:
 
 FPSMaxxing will connect those control planes to the reproducible research loop described above; today only the mock provider is wired.
 The LLM proposes an experiment.
-Deterministic policy, broker, provider, watchdog, and measurement components decide whether the experiment is allowed and whether its measured result should be retained.
+Deterministic policy, broker, provider, watchdog, and measurement components decide whether the experiment is allowed and whether its measured result clears the evaluator.
 
 ## Design principles
 
@@ -84,7 +84,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path, apart from the hops the walkthrough marks as future work.
+Every stage of the closed loop above has a working implementation on the mock path, except what the walkthrough marks as future.
 What ships today, by capability:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
