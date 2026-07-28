@@ -37,7 +37,8 @@ The **privileged broker** applies that adjustment, always capturing a pre-state 
 It will reach the hardware through a **provider sidecar**; today it links its provider in process.
 An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
 It will perform that restore through the broker, and will also trigger on a safety violation.
-The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those measurements whether to keep the change or roll back a regression before the next iteration begins.
+The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those recorded measurements whether the candidate is applied at all.
+That same verdict will decide whether an improvement persists past its lease, and will drive the next iteration of the loop.
 
 ## Why FPSMaxxing?
 
@@ -81,7 +82,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path:
+Every stage of the closed loop above has a working implementation on the mock path, except the keep-and-iterate edge and the safety-violation trigger, which remain target design:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
 - **Policy and journal.** A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and a durable SQLite experiment journal.
@@ -107,7 +108,7 @@ printf '%s\n' \
 
 The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
 Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
-`FPSMAXXING_JOURNAL_PATH` belongs to the gateway and the CLI only - the privileged broker deliberately does not read it.
+`FPSMAXXING_JOURNAL_PATH` belongs to the unprivileged tools - the gateway, the CLI, and the watchdog - and the privileged broker deliberately does not read it.
 
 Run the watchdog against the same journal to reclaim leaked experiments: `cargo run -p fpsmaxxing-watchdog -- --once` performs a single expired-lease pass and `--recover-all` rolls back every unclosed experiment after a crash.
 It accepts the same `--journal <path>` and `FPSMAXXING_JOURNAL_PATH` overrides, plus `--interval <seconds>` for its steady-state poll loop.
