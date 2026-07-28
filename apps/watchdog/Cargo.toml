@@ -7,5 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+fpsmaxxing-contracts.workspace = true
+fpsmaxxing-provider-sdk.workspace = true
+fpsmaxxing-mock-provider = { path = "../../sidecars/mock-provider" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+fpsmaxxing-control-plane = { path = "../../crates/control-plane" }
+tempfile = "3"
+
 [lints]
 workspace = true

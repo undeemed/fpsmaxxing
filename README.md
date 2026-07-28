@@ -62,7 +62,8 @@ The repository currently includes:
 - A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal
 - A working stdio MCP gateway that serves the mock path end to end
 - A CLI `doctor` command that reports gateway and journal status
-- Scaffolds for the privileged broker, watchdog, and experiment runner
+- An independent watchdog that restores prior state from the journal after a crash or lease expiry, on the Linux-safe mock path
+- Scaffolds for the privileged broker and experiment runner
 - OSS governance, security policy, issue templates, and CI
 - An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 
@@ -80,6 +81,9 @@ printf '%s\n' \
 
 The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
 Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
+
+Run the watchdog against the same journal to reclaim leaked experiments: `cargo run -p fpsmaxxing-watchdog -- --once` performs a single expired-lease pass and `--recover-all` rolls back every unclosed experiment after a crash.
+It accepts the same `--journal <path>` and `FPSMAXXING_JOURNAL_PATH` overrides, plus `--interval <seconds>` for its steady-state poll loop.
 
 ## Architecture
 
