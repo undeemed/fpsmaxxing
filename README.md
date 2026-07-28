@@ -94,7 +94,8 @@ What ships today, by capability:
 - **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
 - **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
 
-Real hardware providers, live frame-time measurement, a promotion that survives its lease, and the provider-sidecar, gateway-to-broker IPC, and watchdog safety-violation hops the walkthrough marks as future work are the work that remains.
+Everything the walkthrough above states in the future tense is still ahead of us.
+So are real hardware providers and live frame-time measurement.
 
 Try the read-only alpha:
 
