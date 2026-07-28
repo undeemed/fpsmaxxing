@@ -37,7 +37,8 @@ The **privileged broker** applies that adjustment, always capturing a pre-state 
 It will reach the hardware through a **provider sidecar**; today it links its provider in process.
 An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
 It will perform that restore through the broker, and will also trigger on a safety violation.
-The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those recorded measurements whether the candidate is applied at all.
+The **deterministic evaluator** - kept outside the LLM's writable surface - decides from the recorded measurements whether the candidate is applied at all.
+The loop will re-measure under workload inside the lease window; today it measures the candidate before the apply.
 That same verdict will decide whether an improvement persists past its lease, and will drive the next iteration of the loop.
 
 ## Why FPSMaxxing?
@@ -66,23 +67,24 @@ Deterministic policy, broker, provider, watchdog, and measurement components dec
 
 ## Planned integrations
 
-| Area | Initial provider | Intended use |
-| --- | --- | --- |
-| Process scheduling | Process Lasso | CPU affinity, CPU sets, priorities, process power profiles |
-| Frame performance | PresentMon | FPS, frame time, latency, GPU telemetry |
-| Hardware telemetry | LibreHardwareMonitor bridge | Temperatures, clocks, loads, power, fan RPM |
-| Fan control | Fan Control | Complete, reviewed thermal profiles |
-| NVIDIA GPU | NVML | Supported clock and power-limit operations |
-| AMD GPU | AMD SMI | Supported telemetry and control operations |
-| Windows power | Native Windows APIs | Cloned power schemes and processor policy |
-| Registry | Curated catalog | Documented, typed, versioned, reversible settings only |
+| Area               | Initial provider            | Intended use                                               |
+| ------------------ | --------------------------- | ---------------------------------------------------------- |
+| Process scheduling | Process Lasso               | CPU affinity, CPU sets, priorities, process power profiles |
+| Frame performance  | PresentMon                  | FPS, frame time, latency, GPU telemetry                    |
+| Hardware telemetry | LibreHardwareMonitor bridge | Temperatures, clocks, loads, power, fan RPM                |
+| Fan control        | Fan Control                 | Complete, reviewed thermal profiles                        |
+| NVIDIA GPU         | NVML                        | Supported clock and power-limit operations                 |
+| AMD GPU            | AMD SMI                     | Supported telemetry and control operations                 |
+| Windows power      | Native Windows APIs         | Cloned power schemes and processor policy                  |
+| Registry           | Curated catalog             | Documented, typed, versioned, reversible settings only     |
 
 BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arbitrary Registry paths are explicitly outside the first release.
 
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path, except the keep-and-iterate edge and the safety-violation trigger, which remain target design:
+Every stage of the closed loop above has a working implementation on the mock path, apart from the hops the walkthrough marks as future work: the provider-sidecar hop, the watchdog's restore through the broker, re-measurement inside the lease window, the keep-and-iterate edge, and the safety-violation trigger.
+What ships today, by capability:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
 - **Policy and journal.** A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and a durable SQLite experiment journal.
