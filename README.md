@@ -33,8 +33,10 @@ flowchart LR
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
-The **privileged broker** applies that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-An **independent watchdog** owns the lease deadline and restores the snapshot through the broker, without the gateway, agent, or experiment runner, whenever a lease expires or a safety violation appears.
+The **privileged broker** applies that adjustment, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+It will reach the hardware through a **provider sidecar**; today it links its provider in process.
+An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
+It will perform that restore through the broker, and will also trigger on a safety violation.
 The loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those measurements whether to keep the change or roll back a regression before the next iteration begins.
 
 ## Why FPSMaxxing?
@@ -88,7 +90,7 @@ Every stage of the closed loop above has a working implementation on the mock pa
 - **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
 - **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
 
-Real hardware providers and live frame-time measurement are the work that remains.
+Real hardware providers, live frame-time measurement, and a promotion that survives its lease are the work that remains.
 
 Try the read-only alpha:
 
@@ -116,7 +118,7 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 ### Privileged broker
 
 `fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run outside Linux because only that transport is implemented.
-The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` end-to-end tests in `crates/ipc` rather than by the MCP command above, and [broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
+The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above, and [broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
 
 ```bash
 cargo run -p fpsmaxxing-broker
