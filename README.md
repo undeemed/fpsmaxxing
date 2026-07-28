@@ -83,7 +83,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 
 ## Repository status
 
-FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, and provider guides.
+FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, broker operations, and provider guides.
 Every stage of the closed loop above has a working implementation on the mock path, except what the walkthrough marks as future.
 What ships today, by capability:
 
