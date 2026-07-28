@@ -34,3 +34,13 @@
 - Append-only trial records re-evaluated and re-gated against current policy on replay
 - A signed or hash-chained journal before recorded measurement content itself is trusted
 - Hardware-in-the-loop fault tests before enabling writes
+
+## Interim state of the local IPC boundary
+
+The Linux broker in `apps/broker` implements the authenticated local IPC boundary; these parts of the required mitigations are not there yet.
+
+- The peer ACL is an interim same-uid check (`SO_PEERCRED`). It refuses every other local user, but it does not separate an unprivileged gateway from a privileged broker: once the broker runs as a service account, the gateway it is meant to serve would be refused. The split-privilege ACL arrives with the Windows named-pipe SID authorizer, tracked as `fpsm-broker-splitacl`.
+- The verified peer uid and pid are checked before any request is read and then dropped: they are not journaled against a lifecycle, and the client-supplied owner label is not authenticated against them. Both wait on the same follow-up, because under a same-uid ACL every authorized peer is one identity.
+- Policy is enforced in the broker for the requests it serves, but the gateway still runs its own in-process control plane rather than calling the broker, so no shipped path crosses this boundary yet.
+
+`docs/ARCHITECTURE.md` records the filesystem, single-instance, and fail-fast reasoning behind the boundary as built.

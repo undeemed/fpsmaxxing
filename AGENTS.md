@@ -17,6 +17,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 - Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
 - Keep the capability registry, policy, broker lifecycle, and experiment journal in `crates/control-plane`.
+- Keep the local IPC transport, framing, and peer-authentication seams behind traits in `crates/ipc` (Unix domain socket now, Windows named pipe later); the privileged broker in `apps/broker` composes them over the control plane and enforces peer auth, catalog policy, and single-owner-per-knob. The non-`Send` control plane is confined to one worker thread reached through a `Send` handle.
 - Keep the independent crash and lease recovery path in `apps/watchdog`; it reads the journal owned by `crates/control-plane` and writes only its own restore-outcome records, never the schema.
 - Keep the measurement model, immutable evaluator, and replayable trial records in `apps/experiment-runner`; the evaluator stays a pure function of recorded samples and fixed bounds.
 - Put provider-specific code in one `sidecars/<provider>` package; sidecars may not import each other.

@@ -3,7 +3,8 @@
 FPSMaxxing separates reasoning, policy, privilege, hardware integration, measurement, and recovery.
 
 The current read-only alpha implements the gateway, an in-process control-plane seam (`crates/control-plane`) holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal, and a deterministic experiment runner (`apps/experiment-runner`) that gates measured trials through an immutable evaluator, all wired to a single mock provider.
-The independent watchdog restore path is implemented against that journal on the Linux-safe mock path (`apps/watchdog`); the privileged broker remains a scaffold.
+The privileged broker exposes that control plane over an authenticated local IPC boundary on the Linux-safe socket path (`apps/broker`, `crates/ipc`), and the independent watchdog restore path is implemented against the journal on the Linux-safe mock path (`apps/watchdog`).
+The gateway does not route through the broker yet - it still opens an in-process control plane of its own - so the two paths run side by side over separate journals.
 
 ## Processes
 
@@ -14,6 +15,58 @@ The unprivileged MCP server translates agent tool calls into typed capability re
 ### Broker
 
 The privileged Windows service accepts authenticated local requests from the gateway, revalidates policy, journals the transaction, and supervises provider sidecars. It exposes no raw command or memory primitive.
+
+`apps/broker` implements this on the Linux-safe path.
+It owns the control plane on a dedicated worker thread and serves exactly two operations - capability discovery and a bounded provider lifecycle - to authenticated local peers over the transport seam in `crates/ipc` (a Unix domain socket now, a Windows named pipe later).
+Three fail-closed checks guard the boundary: peer authentication before any request is read (a Linux `SO_PEERCRED` same-uid ACL, shaped so a Windows SID ACL can satisfy the same trait), a capability-catalog check that rejects raw shell, arbitrary Registry paths, and out-of-catalog ids, and single-owner-per-knob enforcement that refuses a second concurrent owner of a setting.
+Typed request and response messages live in `crates/contracts` with `schemas/broker-request.schema.json` and `schemas/broker-response.schema.json` kept in sync; a malformed frame is rejected with a typed error without taking the broker down.
+A frame is a big-endian `u32` body length followed by that many bytes of JSON, bounded at one mebibyte so a hostile peer cannot force an unbounded allocation; the framing is transport-agnostic, so a named-pipe transport would reuse it unchanged.
+At most 32 connections are served at once, and one that stalls for 30 seconds in either direction is closed, so a peer cannot pin a task, a descriptor, or a frame buffer; a peer refused by the ACL gets a far shorter deadline to take its rejection frame, because it has not authenticated and must not be able to hold a connection slot for the full idle budget.
+A response is a tagged union of its outcome and that outcome's payload, so a tag without its payload never crosses the boundary and no consumer has to unwrap one.
+Any text a client chose is truncated before it is quoted back in an error message, so a rejected request is always answered with a typed error rather than a response too large for the frame limit.
+
+The same-uid ACL is the deliberate interim policy for the current single-user, Linux-safe mock path, where the broker and its only client run as the same desktop user.
+It is not the shipping policy for the privilege split described above: once the broker runs as a service account, an unprivileged gateway would be refused by construction.
+The real privilege-split ACL arrives with the Windows named-pipe SID implementation of the `PeerAuthorizer` trait, tracked separately; because every caller reaches the ACL through that trait, no call site changes when it lands.
+The trusted uid is read from the broker's own effective credentials rather than from the socket file's owner, so replacing the socket path cannot redirect the ACL.
+In this interim every authorized peer is the same identity, so journaling the verified peer uid and pid against each lifecycle, and authenticating the client-supplied owner label against them, only carry their weight once split-privilege ACLs arrive; both are tracked as follow-up work `fpsm-broker-splitacl`.
+A peer refused by the ACL is told only that it is not authorized: the refusal names neither uid, because the caller it reaches has not authenticated, and the uid pair is traced locally instead.
+The broker always establishes one owner-only directory of its own under `$XDG_RUNTIME_DIR` (or `/run`), and unless an explicit path is given it keeps its socket and its journal there rather than beside the inherited working directory, so no other user can race the socket path or read the audit journal.
+`XDG_RUNTIME_DIR` is inherited from whoever started the broker, so it is honored only when it is absolute and only for an unprivileged broker; a broker running as root always uses `/run`.
+That directory and every directory above it must be owned by the broker or root and unwritable by anyone else, or the broker fails closed: a writable parent is what would let another user swap a vetted directory for a symlink between the check and the bind.
+Every resolved path is held to that same bar, whether a flag, an environment variable, or the default named it: it must be absolute, and the whole chain above it is vetted, so an inherited variable cannot buy a caller the placement `XDG_RUNTIME_DIR` is filtered to deny them.
+The directory that directly holds the socket or the journal is held higher still: no other user may reach it at all, sticky or not.
+Sticky only stops another user renaming or removing the broker's entry, not creating that entry first in a shared directory like `/tmp` and keeping ownership of the file the broker then writes every `apply-intent` record into.
+Traversal alone is enough to reach the socket, whose own mode cannot be pinned, so a directory like `/run` that merely lets everyone through is refused as well.
+Above that directory, neither is the threat and swapping a directory is, which is exactly what sticky prevents, so the not-writable-by-others bar with its sticky exemption stands where it is sound.
+The socket file's own mode is not pinned, because the only ways to do so are a symlink-following `chmod` or a window in the process-global umask; confidentiality rests on the owner-only directory and the `SO_PEERCRED` gate instead.
+What keeps single-owner-per-knob true across processes is an exclusive advisory lock rather than the bind: the broker locks a fixed `0600` file in its private directory before the journal is opened and before the socket is bound, so a second broker refuses to start instead of driving the same knobs through an ownership ledger of its own, and it refuses before it has touched either.
+The bind cannot do that job, because it cannot be made atomic: stat, probe, unlink, and bind are four steps, and two brokers that both found the same socket file stale would leave the first serving an unlinked inode - still answering its connected clients - while the second owned the path, with nothing logged anywhere.
+The kernel releases the lock with the last descriptor for it, so a broker that crashed leaves its successor nothing to clean up, and the socket file it left behind is simply rebound.
+The transport unlinks on drop only the entry it bound itself - matched by device and inode - so an exiting instance can never strand a live successor.
+The lock is placed by uid rather than derived from the socket or the journal, and the private directory holding it is established even when both of those are overridden, so neither `--socket` nor `--journal` nor the environment variables behind them buy a second instance.
+Keying it to a path would not hold: only the path left unset falls back to the default, so two brokers given different journals would take two locks and then share one socket.
+What they contend for is the machine's knobs, not a file, and a supervisor-level single-instance unit can layer on top later.
+For the privileged deployment the guarantee is unconditional: a root broker ignores `XDG_RUNTIME_DIR`, so its private directory is always the fixed `/run/fpsmaxxing` and there is exactly one lock file to contend for.
+An unprivileged broker keeps that directory wherever the inherited `XDG_RUNTIME_DIR` puts it, so the lock moves with the variable: one user starting two brokers under two different values for it takes two locks, and both start.
+Single-instance is therefore best-effort off the privileged path, which is the dev and test path it serves.
+That concession gives up no boundary.
+A same-uid caller who can vary `XDG_RUNTIME_DIR` is already inside the trust domain the same-uid ACL admits, and could drive the same knobs through the running broker without starting a second one; the shipping broker runs as root, where the variable is refused and the guarantee is airtight.
+The audit journal is different: it holds every `apply-intent` record and outlives the process, so it is created mode `0600` before it is opened, which also restricts the rollback journal and write-ahead log `SQLite` creates beside it.
+The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway and CLI use, so an operator who exported that variable cannot move the privileged audit journal.
+Both are read as raw `OsString` values, so a path that is not UTF-8 relocates the socket or journal as configured rather than being silently dropped back to the default.
+The command line is read as `OsString` too, but it is matched against flag names rather than used verbatim, so an argument that is not UTF-8 is a typed fatal parse error naming it - not the mid-iteration panic `env::args` would raise, and not a silent fallback either.
+
+The broker fails fast rather than degrading.
+Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.
+Deploy it under a supervisor that restarts on failure, and let the watchdog own recovery of any state left behind.
+
+#### Deferred broker work
+
+- Gateway wiring: nothing shipped connects to the broker yet, because the gateway still opens its own in-process control plane, so `BrokerClient` in `crates/ipc` is exercised only by the broker's end-to-end tests. Promoting the gateway onto that client also has to settle what becomes of the gateway's own journal once the privileged audit journal is the record of every apply.
+- `fpsm-broker-splitacl`: the real split-privilege ACL, replacing the interim same-uid policy described above, plus journaling the verified peer uid and pid against each lifecycle and authenticating the client-supplied owner label against them.
+- Client reconnect on `Closed`: the broker closes a connection idle for 30 seconds, and `BrokerClient` holds one long-lived stream with no keepalive or reconnect, so a caller whose requests are further apart than that gets `ClientError::Closed`. Whether the client reconnects transparently, the server distinguishes a healthy idle peer from a stalled one, or callers connect per request is undecided.
+- `broker-dispatch-unbounded`: neither `BrokerHandle::dispatch` nor `BrokerClient::request` bounds the wait on the single control-plane worker, so a provider that blocks inside `apply` or `verify` stalls every peer rather than failing one. Deferred to the pass that adds graceful shutdown, which has to answer the same question: what a request already in flight is owed when the broker stops serving.
 
 ### Watchdog
 

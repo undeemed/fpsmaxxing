@@ -87,9 +87,9 @@ The repository currently includes:
 - A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal
 - A working stdio MCP gateway that serves the mock path end to end
 - A CLI `doctor` command that reports gateway and journal status
+- A privileged broker that serves the control plane over an authenticated local IPC boundary
 - An independent watchdog that restores prior state from the journal after a crash or lease expiry, on the Linux-safe mock path
 - A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone
-- Scaffolds for the privileged broker
 - OSS governance, security policy, issue templates, and CI
 - An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
 
@@ -108,12 +108,62 @@ printf '%s\n' \
 
 The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
 Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
+`FPSMAXXING_JOURNAL_PATH` belongs to the gateway and the CLI only - the privileged broker deliberately does not read it.
 
 Run the watchdog against the same journal to reclaim leaked experiments: `cargo run -p fpsmaxxing-watchdog -- --once` performs a single expired-lease pass and `--recover-all` rolls back every unclosed experiment after a crash.
 It accepts the same `--journal <path>` and `FPSMAXXING_JOURNAL_PATH` overrides, plus `--interval <seconds>` for its steady-state poll loop.
 
 The experiment runner measures a baseline and a candidate against a deterministic stand-in for live telemetry, gates the candidate's lifecycle on the immutable evaluator's verdict, journals the trial with its spec, samples, and verdict, then replays it from the journal alone and checks the re-evaluated verdict against the recorded one.
 It is a demonstration binary rather than an MCP tool, takes no arguments, and journals to an in-memory SQLite database, so it leaves nothing on disk and exits non-zero if a replay diverges from the journal, falls outside the policy gate, or the broker refuses a promoted lifecycle.
+
+### Privileged broker
+
+The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
+It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket; only the Linux transport is implemented, so the binary refuses to run elsewhere.
+The gateway does not connect to it yet - it still opens an in-process control plane of its own - so the broker path is driven by the `BrokerClient` in `crates/ipc` and its end-to-end tests rather than by the MCP command above.
+
+Run it with no arguments; it creates and vets its own private directory for the socket and the journal.
+
+```bash
+cargo run -p fpsmaxxing-broker
+cargo run -p fpsmaxxing-broker -- --help
+```
+
+An explicit path is never created for you, and the directory holding it must already be owned by the broker or root and closed to every other user (mode `0700`), so create it first:
+
+```bash
+mkdir -p "$HOME/.local/state/fpsmaxxing" && chmod 700 "$HOME/.local/state/fpsmaxxing"
+cargo run -p fpsmaxxing-broker -- \
+  --socket "$HOME/.local/state/fpsmaxxing/broker.sock" \
+  --journal "$HOME/.local/state/fpsmaxxing/journal.sqlite"
+```
+
+Do not put that directory at `/run/fpsmaxxing`.
+That is the privileged broker's own private directory, and it is the one directory held to exact ownership: root ownership satisfies an explicit `--socket` or `--journal` parent, but a broker accepts its private directory only when it owns that itself.
+Creating `/run/fpsmaxxing` as your user therefore leaves a later root broker refusing to start until it is chowned to root or removed.
+A root broker creates and vets it on its own.
+A systemd unit needs both `RuntimeDirectory=fpsmaxxing` and `RuntimeDirectoryMode=0700`: `RuntimeDirectoryMode` defaults to `0755`, and the broker validates an existing private directory rather than correcting its mode, so a unit that omits the mode is refused on every start.
+The broker still establishes its private directory even when both paths are given, because the single-instance lock lives there, so it also needs to be able to create `$XDG_RUNTIME_DIR/fpsmaxxing` - or `/run/fpsmaxxing`, when that variable is unset - on every start.
+
+| Setting | Flag | Environment variable | Default |
+| --- | --- | --- | --- |
+| IPC socket | `--socket <path>` | `FPSMAXXING_BROKER_SOCKET` | `<private dir>/broker.sock` |
+| Audit journal | `--journal <path>` | `FPSMAXXING_BROKER_JOURNAL_PATH` | `<private dir>/journal.sqlite` |
+
+A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
+The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
+The broker creates it mode `0700` whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
+A path from a flag or an environment variable is held to the same bar: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
+Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
+That directory is held higher than the ancestors above it, in two ways.
+The sticky bit does not excuse group or world write there: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
+Nor is group or world traversal excused: the socket's own mode cannot be pinned, so a merely traversable directory like `/run` would put every local user in front of it, and it is refused too.
+The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
+Only one broker may run per user: it takes an exclusive lock on `<private dir>/broker.lock` before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
+That lock is not derived from `--socket` or `--journal`, so neither of those, nor the environment variables behind them, buys a second instance - the knobs two brokers would drive belong to the machine, not to the paths they were handed.
+`XDG_RUNTIME_DIR` does move it, because it moves the private directory it sits in.
+A root broker ignores that variable, so the privileged broker always locks `/run/fpsmaxxing/broker.lock` and one instance is guaranteed; an unprivileged user who runs two brokers under two different values for it gets two locks and two brokers, which is a dev-path concession rather than a boundary, since a same-uid caller is already admitted by the ACL.
+The kernel releases the lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
 
 ## Architecture
 

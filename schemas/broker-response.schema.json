@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/undeemed/fpsmaxxing/schemas/broker-response.schema.json",
+  "title": "FPSMaxxing broker response",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "capabilities"],
+      "properties": {
+        "outcome": { "const": "capabilities" },
+        "capabilities": { "$ref": "sidecar.schema.json" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "lifecycle"],
+      "properties": {
+        "outcome": { "const": "lifecycle" },
+        "lifecycle": { "$ref": "#/$defs/LifecycleReport" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "error"],
+      "properties": {
+        "outcome": { "const": "error" },
+        "error": { "$ref": "#/$defs/BrokerErrorBody" }
+      }
+    }
+  ],
+  "$defs": {
+    "LifecycleReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "preview", "verified", "rolled_back"],
+      "properties": {
+        "provider_id": { "type": "string" },
+        "preview": { "type": "string" },
+        "verified": { "type": "boolean" },
+        "rolled_back": { "type": "boolean" }
+      }
+    },
+    "BrokerErrorBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unauthenticated",
+            "malformed",
+            "unknown-capability",
+            "policy-denied",
+            "owner-conflict",
+            "lifecycle-failed",
+            "internal"
+          ]
+        },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

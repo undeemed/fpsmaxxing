@@ -1,5 +1,5 @@
 [package]
-name = "fpsmaxxing-control-plane"
+name = "fpsmaxxing-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,13 +9,17 @@ publish = false
 
 [dependencies]
 fpsmaxxing-contracts.workspace = true
-fpsmaxxing-provider-sdk.workspace = true
-rusqlite.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net"] }
+
+[target.'cfg(unix)'.dev-dependencies]
 tempfile.workspace = true
 
 [lints]

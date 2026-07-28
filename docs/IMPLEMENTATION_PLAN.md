@@ -32,7 +32,8 @@ The LLM proposes declarative experiments. It never receives administrator creden
 
 - Rust 2024 edition on the pinned stable toolchain
 - Cargo workspace and `xtask` orchestration
-- Tokio for async services and Windows named pipes
+- Tokio for async services, Unix domain sockets, and Windows named pipes
+- Rustix for the POSIX calls the privileged broker needs, because unsafe Rust is forbidden workspace-wide
 - Interim alpha northbound transport: a minimal, hand-rolled stdio JSON-RPC MCP subset for the Linux-safe mock path
 - Official Rust MCP SDK remains the target northbound interface once the transport is promoted beyond the alpha seam
 - Microsoft Rust crates for focused Windows Registry and service APIs
