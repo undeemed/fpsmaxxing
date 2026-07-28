@@ -33,14 +33,14 @@ flowchart LR
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
-The **privileged broker** applies that adjustment, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-It will reach the hardware through a **provider sidecar**; today it links its provider in process.
-That adjustment will reach the broker across the local IPC boundary; today the gateway drives a control plane of its own in process.
+The **privileged broker** will apply that adjustment across the local IPC boundary, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+Today the gateway drives a control plane of its own in process, which applies the adjustment under those same snapshot, lease, and journal rules.
+The broker will reach the hardware through a **provider sidecar**; today that in-process control plane links its provider directly.
 An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
 It will perform that restore through the broker, and will also trigger on a safety violation.
 The **deterministic evaluator** - kept outside the LLM's writable surface - decides from the recorded measurements whether the candidate is applied at all.
 The loop will re-measure under workload inside the lease window; today it measures the candidate before the apply.
-That same verdict will decide whether an improvement persists past its lease, and will drive the next iteration of the loop.
+That same verdict will decide whether an improvement persists past its lease or is rolled back as a regression, and will drive the next iteration of the loop.
 
 ## Why FPSMaxxing?
 
@@ -94,7 +94,7 @@ What ships today, by capability:
 - **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
 - **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
 
-Real hardware providers, live frame-time measurement, and a promotion that survives its lease are the work that remains.
+Real hardware providers, live frame-time measurement, a promotion that survives its lease, and the provider-sidecar, gateway-to-broker IPC, and watchdog safety-violation hops the walkthrough marks as future work are the work that remains.
 
 Try the read-only alpha:
 
