@@ -29,10 +29,11 @@ cargo run -p fpsmaxxing-broker -- \
 ## The private directory
 
 The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
-The broker creates it mode `0700` on every start, whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
+The broker creates it mode `0700` on every start, whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there.
+It refuses to start unless that directory is owned by the broker's own uid and has mode exactly `0700`, and unless every directory above it is owned by the broker or root and is not writable by anyone else except under a sticky bit.
 
 Do not put your own directory at `/run/fpsmaxxing`.
-That is the privileged broker's own private directory, and it is the one directory held to exact ownership: root ownership satisfies an explicit `--socket` or `--journal` parent, but a broker accepts its private directory only when it owns that itself.
+That is the privileged broker's own private directory.
 Creating `/run/fpsmaxxing` as your user therefore leaves a later root broker refusing to start until it is chowned to root or removed.
 A root broker creates and vets it on its own.
 
