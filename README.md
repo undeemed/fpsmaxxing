@@ -84,7 +84,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, broker operations, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path, except what the walkthrough marks as future.
+Every stage of the closed loop above has a working implementation on the mock path, except what the closed-loop walkthrough above marks as future.
 What ships today, by capability:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
@@ -94,7 +94,7 @@ What ships today, by capability:
 - **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
 - **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
 
-Everything the walkthrough above states in the future tense is still ahead of us.
+Everything the closed-loop walkthrough above states in the future tense is still ahead of us.
 So are real hardware providers and live frame-time measurement.
 
 Try the read-only alpha:
@@ -124,7 +124,7 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 
 `fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run on Windows because the Windows named-pipe transport is not yet available.
 The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above.
-[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
+[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd RuntimeDirectory settings.
 
 ```bash
 cargo run -p fpsmaxxing-broker

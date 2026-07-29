@@ -15,7 +15,7 @@ Use this page as the documentation entry point. The Markdown documents are canon
 
 | Document | Purpose |
 | --- | --- |
-| [Broker operations and deployment](BROKER_OPERATIONS.md) | Running the privileged broker: socket, journal, and lock paths, private-directory ownership rules, and systemd units |
+| [Broker operations and deployment](BROKER_OPERATIONS.md) | Running the privileged broker: socket, journal, and lock paths, private-directory ownership rules, and systemd RuntimeDirectory settings |
 
 ## Extension guides
 

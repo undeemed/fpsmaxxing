@@ -5,7 +5,7 @@
 //! shell, Registry path, or hardware primitive crosses this boundary.
 //!
 //! Only the Unix domain socket transport is implemented; the Windows named-pipe
-//! transport is not yet available, so the binary refuses to run there.
+//! transport is deliberately out of scope, so the binary refuses to run there.
 //!
 //! The broker always establishes one owner-only private directory of its own,
 //! under `$XDG_RUNTIME_DIR` (or `/run`). Unless `--socket`/`--journal` or their
@@ -98,10 +98,10 @@ or the broker refuses to start.";
     /// Environment override for `--journal`.
     ///
     /// Deliberately distinct from the `FPSMAXXING_JOURNAL_PATH` the unprivileged
-    /// gateway, CLI, and watchdog read. Sharing that variable would let an
-    /// operator who exported it for the CLI silently move the privileged
-    /// broker's audit journal out of its owner-only directory and into a file
-    /// the gateway is writing concurrently.
+    /// gateway and CLI read. Sharing that variable would let an operator who
+    /// exported it for the CLI silently move the privileged broker's audit
+    /// journal out of its owner-only directory and into a file the gateway is
+    /// writing concurrently.
     const JOURNAL_ENV: &str = "FPSMAXXING_BROKER_JOURNAL_PATH";
 
     /// Directory the broker keeps its socket and journal in by default.
@@ -259,7 +259,7 @@ or the broker refuses to start.";
     /// [`resolve_paths`] against an arbitrary runtime base and environment.
     ///
     /// Only [`SOCKET_ENV`] and [`JOURNAL_ENV`] are ever consulted; the broker
-    /// shares no path variable with the unprivileged gateway, CLI, or watchdog.
+    /// shares no path variable with the unprivileged gateway or CLI.
     ///
     /// The private directory under `base` is created and vetted whatever the
     /// overrides say, because the single-instance lock lives in it and must not
@@ -692,8 +692,7 @@ or the broker refuses to start.";
             resolve_paths_from, restrict_journal, runtime_base,
         };
 
-        /// The variable the unprivileged gateway, CLI, and watchdog use for
-        /// their journal.
+        /// The variable the unprivileged gateway and CLI use for their journal.
         const GATEWAY_JOURNAL_ENV: &str = "FPSMAXXING_JOURNAL_PATH";
 
         /// An unprivileged uid, so `XDG_RUNTIME_DIR` is eligible at all.
