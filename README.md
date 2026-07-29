@@ -84,7 +84,7 @@ BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arb
 ## Repository status
 
 FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, broker operations, and provider guides.
-Every stage of the closed loop above has a working implementation on the mock path, except what the walkthrough marks as future.
+Every stage of the closed loop above has a working implementation on the mock path, except what the closed-loop walkthrough above marks as future.
 What ships today, by capability:
 
 - **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
@@ -94,7 +94,7 @@ What ships today, by capability:
 - **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
 - **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
 
-Everything the walkthrough above states in the future tense is still ahead of us.
+Everything the closed-loop walkthrough above states in the future tense is still ahead of us.
 So are real hardware providers and live frame-time measurement.
 
 Try the read-only alpha:
