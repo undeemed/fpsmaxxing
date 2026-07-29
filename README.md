@@ -124,7 +124,7 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 
 `fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run on Windows because the Windows named-pipe transport is not yet available.
 The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above.
-[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
+[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd RuntimeDirectory settings.
 
 ```bash
 cargo run -p fpsmaxxing-broker

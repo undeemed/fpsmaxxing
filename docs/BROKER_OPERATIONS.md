@@ -6,7 +6,7 @@ For why the boundary is shaped this way, read [Architecture](ARCHITECTURE.md); f
 The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
 It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket.
 Only the Unix domain socket transport is implemented, and the Windows named-pipe transport is not yet available, so the binary refuses to run there.
-The gateway does not connect to it yet - it still opens an in-process control plane of its own - so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by an MCP client.
+For what currently drives that boundary, see [Privileged broker](../README.md#privileged-broker) in the project README.
 
 ## Running the broker
 
