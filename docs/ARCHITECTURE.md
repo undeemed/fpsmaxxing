@@ -53,7 +53,7 @@ Single-instance is therefore best-effort off the privileged path, which is the d
 That concession gives up no boundary.
 A same-uid caller who can vary `XDG_RUNTIME_DIR` is already inside the trust domain the same-uid ACL admits, and could drive the same knobs through the running broker without starting a second one; the shipping broker runs as root, where the variable is refused and the guarantee is airtight.
 The audit journal is different: it holds every `apply-intent` record and outlives the process, so it is created mode `0600` before it is opened, which also restricts the rollback journal and write-ahead log `SQLite` creates beside it.
-The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway and CLI use, so an operator who exported that variable cannot move the privileged audit journal.
+The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway, CLI, and watchdog use, so an operator who exported that variable cannot move the privileged audit journal.
 Both are read as raw `OsString` values, so a path that is not UTF-8 relocates the socket or journal as configured rather than being silently dropped back to the default.
 The command line is read as `OsString` too, but it is matched against flag names rather than used verbatim, so an argument that is not UTF-8 is a typed fatal parse error naming it - not the mid-iteration panic `env::args` would raise, and not a silent fallback either.
 

@@ -7,6 +7,10 @@ FPSMaxxing is an open-source Rust control plane for using an AI coding agent or 
 > [!IMPORTANT]
 > FPSMaxxing is currently a read-only alpha built around a mock provider.
 > An MCP client can discover typed capabilities and run the full snapshot, preview, apply, verify, and rollback lifecycle, but FPSMaxxing does **not** perform real hardware writes, overclock a GPU, edit BIOS settings, or modify the Windows Registry yet.
+> Measurement is a deterministic stand-in for live telemetry, and the gateway does not route through the privileged broker yet.
+>
+> Every claim below about what the system does is written in the present tense for what runs today on that mock path, and in the future tense for what does not exist yet; the design principles and the planned integrations state intent rather than status.
+> Read every present-tense claim against this caveat rather than as a claim about real hardware.
 
 ## The closed loop
 
@@ -29,9 +33,14 @@ flowchart LR
 
 An MCP agent reaches the machine only through the unprivileged **gateway**, which exposes typed MCP tools instead of a shell, administrator credentials, or raw device access.
 The gateway forwards a proposed experiment to the **capability registry and policy engine**, which intersects it with provider limits and reduces it to a single bounded, reversible adjustment.
-The **privileged broker** is designed to apply that adjustment through a **provider sidecar**, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
-An **independent watchdog** will own the lease deadline and restore the snapshot through the broker, without the gateway, agent, or experiment runner, whenever a lease expires or a safety violation appears.
-In the target design the loop then re-measures under workload, and the **deterministic evaluator** - kept outside the LLM's writable surface - decides from those measurements whether to keep the change or roll back a regression before the next iteration begins.
+The **privileged broker** applies that adjustment across the local IPC boundary, always capturing a pre-state snapshot, holding a TTL lease, and recording every stage in the **durable experiment journal**.
+The gateway does not reach the broker over that boundary yet; today it drives a control plane of its own in process, under those same snapshot, lease, and journal rules.
+The broker will reach the hardware through a **provider sidecar**; today that in-process control plane links its provider directly.
+An **independent watchdog** owns the lease deadline and restores the snapshot from the journal, without the gateway, agent, or experiment runner, whenever a lease expires or a crash leaves an experiment unclosed.
+It will perform that restore through the broker, and will also trigger on a safety violation.
+The **deterministic evaluator** - kept outside the LLM's writable surface - decides from the recorded measurements whether the candidate is applied at all.
+The loop will re-measure under workload inside the lease window; today it measures the candidate before the apply.
+That same verdict will decide whether an improvement persists past its lease or is rolled back as a regression, and will drive the next iteration of the loop.
 
 ## Why FPSMaxxing?
 
@@ -44,13 +53,9 @@ Existing tools already know how to control parts of a PC:
 - NVML and AMD SMI expose supported GPU telemetry and controls.
 - Windows APIs expose power policy and documented Registry settings.
 
-FPSMaxxing is intended to connect those control planes to a reproducible research loop:
-
-```text
-observe → propose → validate → snapshot → apply → benchmark → keep or rollback
-```
-
-The LLM proposes an experiment. Deterministic policy, broker, provider, watchdog, and measurement components decide whether the experiment is allowed and whether its measured result should be retained.
+FPSMaxxing will connect those control planes to the reproducible research loop described above; today only the mock provider is wired.
+The LLM proposes an experiment.
+Deterministic policy, broker, provider, watchdog, and measurement components decide whether the experiment is allowed and whether its measured result clears the evaluator.
 
 ## Design principles
 
@@ -63,35 +68,34 @@ The LLM proposes an experiment. Deterministic policy, broker, provider, watchdog
 
 ## Planned integrations
 
-| Area | Initial provider | Intended use |
-| --- | --- | --- |
-| Process scheduling | Process Lasso | CPU affinity, CPU sets, priorities, process power profiles |
-| Frame performance | PresentMon | FPS, frame time, latency, GPU telemetry |
-| Hardware telemetry | LibreHardwareMonitor bridge | Temperatures, clocks, loads, power, fan RPM |
-| Fan control | Fan Control | Complete, reviewed thermal profiles |
-| NVIDIA GPU | NVML | Supported clock and power-limit operations |
-| AMD GPU | AMD SMI | Supported telemetry and control operations |
-| Windows power | Native Windows APIs | Cloned power schemes and processor policy |
-| Registry | Curated catalog | Documented, typed, versioned, reversible settings only |
+| Area               | Initial provider            | Intended use                                               |
+| ------------------ | --------------------------- | ---------------------------------------------------------- |
+| Process scheduling | Process Lasso               | CPU affinity, CPU sets, priorities, process power profiles |
+| Frame performance  | PresentMon                  | FPS, frame time, latency, GPU telemetry                    |
+| Hardware telemetry | LibreHardwareMonitor bridge | Temperatures, clocks, loads, power, fan RPM                |
+| Fan control        | Fan Control                 | Complete, reviewed thermal profiles                        |
+| NVIDIA GPU         | NVML                        | Supported clock and power-limit operations                 |
+| AMD GPU            | AMD SMI                     | Supported telemetry and control operations                 |
+| Windows power      | Native Windows APIs         | Cloned power schemes and processor policy                  |
+| Registry           | Curated catalog             | Documented, typed, versioned, reversible settings only     |
 
 BIOS changes, voltage changes, raw MSR/PCI/EC access, firmware flashing, and arbitrary Registry paths are explicitly outside the first release.
 
 ## Repository status
 
-The repository currently includes:
+FPSMaxxing is a Rust 2024 Cargo workspace with OSS governance, a security policy, issue templates, CI, and an organized [documentation index](docs/README.md) covering architecture, plans, threat model, broker operations, and provider guides.
+Every stage of the closed loop above has a working implementation on the mock path, except what the walkthrough marks as future.
+What ships today, by capability:
 
-- A Rust 2024 Cargo workspace
-- Shared capability and provider contracts
-- A provider SDK lifecycle
-- A working mock provider with snapshot/preview/apply/verify/rollback tests
-- A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and durable SQLite experiment journal
-- A working stdio MCP gateway that serves the mock path end to end
-- A CLI `doctor` command that reports gateway and journal status
-- A privileged broker that serves the control plane over an authenticated local IPC boundary
-- An independent watchdog that restores prior state from the journal after a crash or lease expiry, on the Linux-safe mock path
-- A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone
-- OSS governance, security policy, issue templates, and CI
-- An organized [documentation index](docs/README.md) with architecture, plans, threat model, and provider guides
+- **Capabilities and providers.** Shared capability and provider contracts, a provider SDK lifecycle, and a mock provider covering snapshot, preview, apply, verify, and rollback under test.
+- **Policy and journal.** A control-plane crate holding the capability registry, bounded policy, broker lifecycle, and a durable SQLite experiment journal.
+- **Agent surface.** A stdio MCP gateway that serves the mock path end to end, and a CLI `doctor` command that reports gateway and journal status.
+- **Privileged boundary.** A broker that serves the control plane to authenticated local peers over an IPC boundary, on the Linux-safe path only.
+- **Crash and lease recovery.** An independent watchdog that restores prior state from the journal after a crash or a lease expiry, on the Linux-safe mock path.
+- **Measurement and decision.** A deterministic experiment runner that gates measured trials through an immutable evaluator and replays them from the journal alone.
+
+Everything the walkthrough above states in the future tense is still ahead of us.
+So are real hardware providers and live frame-time measurement.
 
 Try the read-only alpha:
 
@@ -108,7 +112,7 @@ printf '%s\n' \
 
 The gateway speaks line-delimited JSON-RPC (MCP) on stdio and journals every lifecycle stage attempt plus a terminal outcome to `fpsmaxxing-journal.sqlite` by default.
 Override the journal location with `--journal <path>` or the `FPSMAXXING_JOURNAL_PATH` environment variable; `doctor` reads the same variable when reporting journal status.
-`FPSMAXXING_JOURNAL_PATH` belongs to the gateway and the CLI only - the privileged broker deliberately does not read it.
+`FPSMAXXING_JOURNAL_PATH` belongs to the unprivileged tools - the gateway, the CLI, and the watchdog - and the privileged broker deliberately does not read it.
 
 Run the watchdog against the same journal to reclaim leaked experiments: `cargo run -p fpsmaxxing-watchdog -- --once` performs a single expired-lease pass and `--recover-all` rolls back every unclosed experiment after a crash.
 It accepts the same `--journal <path>` and `FPSMAXXING_JOURNAL_PATH` overrides, plus `--interval <seconds>` for its steady-state poll loop.
@@ -118,66 +122,13 @@ It is a demonstration binary rather than an MCP tool, takes no arguments, and jo
 
 ### Privileged broker
 
-The `fpsmaxxing-broker` binary is the trusted side of the local IPC boundary.
-It owns the control plane and serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket; only the Linux transport is implemented, so the binary refuses to run elsewhere.
-The gateway does not connect to it yet - it still opens an in-process control plane of its own - so the broker path is driven by the `BrokerClient` in `crates/ipc` and its end-to-end tests rather than by the MCP command above.
-
-Run it with no arguments; it creates and vets its own private directory for the socket and the journal.
+`fpsmaxxing-broker` is the trusted side of the local IPC boundary: it serves capability discovery and the bounded provider lifecycle to authenticated local peers over a Unix domain socket, and refuses to run on Windows because the Windows named-pipe transport is not yet available.
+The gateway does not connect to it yet, so the broker path is exercised by the `BrokerClient` in `crates/ipc` and its end-to-end tests in `apps/broker/tests/integration.rs` rather than by the MCP command above.
+[Broker operations and deployment](docs/BROKER_OPERATIONS.md) covers running it directly: socket, journal, and lock paths, private-directory ownership rules, and systemd units.
 
 ```bash
 cargo run -p fpsmaxxing-broker
 cargo run -p fpsmaxxing-broker -- --help
-```
-
-An explicit path is never created for you, and the directory holding it must already be owned by the broker or root and closed to every other user (mode `0700`), so create it first:
-
-```bash
-mkdir -p "$HOME/.local/state/fpsmaxxing" && chmod 700 "$HOME/.local/state/fpsmaxxing"
-cargo run -p fpsmaxxing-broker -- \
-  --socket "$HOME/.local/state/fpsmaxxing/broker.sock" \
-  --journal "$HOME/.local/state/fpsmaxxing/journal.sqlite"
-```
-
-Do not put that directory at `/run/fpsmaxxing`.
-That is the privileged broker's own private directory, and it is the one directory held to exact ownership: root ownership satisfies an explicit `--socket` or `--journal` parent, but a broker accepts its private directory only when it owns that itself.
-Creating `/run/fpsmaxxing` as your user therefore leaves a later root broker refusing to start until it is chowned to root or removed.
-A root broker creates and vets it on its own.
-A systemd unit needs both `RuntimeDirectory=fpsmaxxing` and `RuntimeDirectoryMode=0700`: `RuntimeDirectoryMode` defaults to `0755`, and the broker validates an existing private directory rather than correcting its mode, so a unit that omits the mode is refused on every start.
-The broker still establishes its private directory even when both paths are given, because the single-instance lock lives there, so it also needs to be able to create `$XDG_RUNTIME_DIR/fpsmaxxing` - or `/run/fpsmaxxing`, when that variable is unset - on every start.
-
-| Setting | Flag | Environment variable | Default |
-| --- | --- | --- | --- |
-| IPC socket | `--socket <path>` | `FPSMAXXING_BROKER_SOCKET` | `<private dir>/broker.sock` |
-| Audit journal | `--journal <path>` | `FPSMAXXING_BROKER_JOURNAL_PATH` | `<private dir>/journal.sqlite` |
-
-A flag wins over its environment variable, and both are broker-specific so nothing the gateway or CLI exports can move the privileged journal.
-The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
-The broker creates it mode `0700` whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
-A path from a flag or an environment variable is held to the same bar: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
-Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
-That directory is held higher than the ancestors above it, in two ways.
-The sticky bit does not excuse group or world write there: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
-Nor is group or world traversal excused: the socket's own mode cannot be pinned, so a merely traversable directory like `/run` would put every local user in front of it, and it is refused too.
-The journal file itself is created mode `0600`, and SQLite's rollback journal and write-ahead log inherit that.
-Only one broker may run per user: it takes an exclusive lock on `<private dir>/broker.lock` before the journal is opened and before the socket is bound, so a second broker exits non-zero without having touched either.
-That lock is not derived from `--socket` or `--journal`, so neither of those, nor the environment variables behind them, buys a second instance - the knobs two brokers would drive belong to the machine, not to the paths they were handed.
-`XDG_RUNTIME_DIR` does move it, because it moves the private directory it sits in.
-A root broker ignores that variable, so the privileged broker always locks `/run/fpsmaxxing/broker.lock` and one instance is guaranteed; an unprivileged user who runs two brokers under two different values for it gets two locks and two brokers, which is a dev-path concession rather than a boundary, since a same-uid caller is already admitted by the ACL.
-The kernel releases the lock when the process ends, crash included, so a restart needs no cleanup - it rebinds over the socket file the previous run left behind.
-
-## Architecture
-
-```text
-LLM / MCP client
-       │
-       ▼
-Rust gateway ──► policy engine ──► privileged broker ──► provider sidecars
-       ▲                                  ▲                      │
-       │                           independent watchdog          │
-telemetry normalizer ◄───────────────────────────────────────────┘
-       │
-       ▼
-experiment journal and benchmark decision gate
 ```
 
 ## Documentation
@@ -188,7 +139,12 @@ Start with the [documentation index](docs/README.md). The core references are th
 
 ### Can Claude optimize my PC for higher FPS?
 
-That is the intended workflow. A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy. The alpha already runs capability discovery and the bounded snapshot-to-rollback lifecycle over MCP against a mock provider, and it promotes or rejects one measured experiment through an immutable evaluator that decides from recorded samples and fixed bounds alone. Real hardware providers, live frame-time measurement, and a promotion that survives its lease are not implemented yet: the alpha measures a deterministic stand-in for telemetry, and the verdict gates whether a candidate is applied at all rather than whether it persists.
+That is the intended workflow.
+A Claude or Codex agent should be able to inspect available capabilities, propose a bounded change, run a controlled game or benchmark workload, and keep the change only when frame time, latency, thermals, and correctness remain within policy.
+
+Not yet on real hardware.
+The alpha runs capability discovery and the bounded snapshot-to-rollback lifecycle over MCP against a mock provider, and it promotes or rejects one measured experiment through an immutable evaluator that decides from recorded samples and fixed bounds alone.
+Real hardware providers, live frame-time measurement, and a promotion that survives its lease are not implemented yet: the alpha measures a deterministic stand-in for telemetry, and the verdict gates whether a candidate is applied at all rather than whether it persists.
 
 ### Can an AI safely overclock a GPU?
 

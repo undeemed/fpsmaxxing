@@ -11,6 +11,12 @@ Use this page as the documentation entry point. The Markdown documents are canon
 | [Implementation plan visualization](IMPLEMENTATION_PLAN.html) | Static visual companion to the canonical Markdown plan |
 | [Threat model](threat-model/README.md) | Assets, trust boundaries, threats, and required mitigations |
 
+## Operations
+
+| Document | Purpose |
+| --- | --- |
+| [Broker operations and deployment](BROKER_OPERATIONS.md) | Running the privileged broker: socket, journal, and lock paths, private-directory ownership rules, and systemd units |
+
 ## Extension guides
 
 | Document | Purpose |
