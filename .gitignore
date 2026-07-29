@@ -22,3 +22,7 @@ Thumbs.db
 
 .sentrux/cache.bin
 .sentrux/churn.bin
+
+# Crash dumps must never enter source control.
+core
+core.*
