@@ -29,8 +29,7 @@ cargo run -p fpsmaxxing-broker -- \
 ## The private directory
 
 The private directory is `$XDG_RUNTIME_DIR/fpsmaxxing`, or `/run/fpsmaxxing` when `XDG_RUNTIME_DIR` is unset, is not absolute, or the broker runs as root.
-The broker creates it mode `0700` whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
-It still establishes that directory even when both paths are given, so it also needs to be able to create `$XDG_RUNTIME_DIR/fpsmaxxing` - or `/run/fpsmaxxing`, when that variable is unset - on every start.
+The broker creates it mode `0700` on every start, whether or not an override moved the socket and the journal out of it, because the single-instance lock lives there, and refuses to start unless it and every directory above it are owned by the broker or root and are not writable by anyone else.
 
 Do not put your own directory at `/run/fpsmaxxing`.
 That is the privileged broker's own private directory, and it is the one directory held to exact ownership: root ownership satisfies an explicit `--socket` or `--journal` parent, but a broker accepts its private directory only when it owns that itself.
@@ -48,8 +47,8 @@ A systemd unit needs both `RuntimeDirectory=fpsmaxxing` and `RuntimeDirectoryMod
 
 A flag wins over its environment variable, and both are broker-specific so nothing the gateway, the CLI, or the watchdog exports can move the privileged journal.
 
-A path from a flag or an environment variable is held to the same bar as the default: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
-Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root - the default private directory already is one.
+A path from a flag or an environment variable is vetted as well: it must be absolute, the directory holding it must exist, and the whole chain above it is vetted, so an override cannot place a privileged socket or audit journal somewhere another user can reach it.
+Give the socket and the journal a directory of their own at mode `0700`, owned by the broker or root, which is the looser of the two ownership rules: the default private directory is accepted only when the broker owns it itself.
 
 That directory is held higher than the ancestors above it, in two ways.
 The sticky bit does not excuse group or world write there: sticky stops another user removing the broker's socket or journal, but not creating either one first and keeping ownership of it, so a shared root like `/tmp` is refused.
