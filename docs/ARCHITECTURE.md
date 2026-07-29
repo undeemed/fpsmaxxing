@@ -56,6 +56,7 @@ The audit journal is different: it holds every `apply-intent` record and outlive
 The broker reads only broker-specific overrides (`FPSMAXXING_BROKER_SOCKET`, `FPSMAXXING_BROKER_JOURNAL_PATH`) and never the `FPSMAXXING_JOURNAL_PATH` the unprivileged gateway, CLI, and watchdog use, so an operator who exported that variable cannot move the privileged audit journal.
 Both are read as raw `OsString` values, so a path that is not UTF-8 relocates the socket or journal as configured rather than being silently dropped back to the default.
 The command line is read as `OsString` too, but it is matched against flag names rather than used verbatim, so an argument that is not UTF-8 is a typed fatal parse error naming it - not the mid-iteration panic `env::args` would raise, and not a silent fallback either.
+[Broker operations and deployment](BROKER_OPERATIONS.md) turns these rules into the procedure for running the broker, down to the systemd `RuntimeDirectory` settings a unit needs.
 
 The broker fails fast rather than degrading.
 Losing the control-plane worker thread - including to a panic mid-lifecycle, which may leave provider state applied and un-rolled-back - stops the serve loop and exits the process non-zero instead of answering later requests with an internal fault.
