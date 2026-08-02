@@ -499,7 +499,7 @@ mod tests {
     /// checked-in schema carrying that constraint rather than merely one of
     /// them; for a `deserialize_with` validator, which no checked-in schema can
     /// state, the counterpart to bind is that field's declared `type` in each
-    /// schema publishing it.
+    /// checked-in schema publishing it.
     fn assert_object_parity(label: &str, generated: &Value, checked_in: &Value) {
         let generated_properties: BTreeSet<String> = generated["properties"]
             .as_object()
