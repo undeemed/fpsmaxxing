@@ -15,7 +15,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 ## Repository rules
 
 - Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
-- Give every field whose checked-in schema constrains it beyond `type` (a `minLength`, a `pattern`, a numeric bound) or that carries a `deserialize_with` validator its own dedicated test, following the `*_like_the_schema` tests and `change_request_parameters_are_an_object_in_both`.
+- Give every field whose checked-in schema constrains it beyond `type` (a `minLength`, a `pattern`, a numeric bound) or that carries a `deserialize_with` validator its own dedicated test that binds each checked-in schema carrying that constraint, not merely one of them, following the `*_like_the_schema` tests and `change_request_parameters_are_an_object_in_both`.
   Schema parity compares property names, `required`, and `additionalProperties` only, whether through `assert_object_parity` and `assert_same_shape` or hand-rolled in `response_variants_match_schema`, `capability_fields_match_capability_schema`, and `manifest_fields_match_sidecar_schema`, so a mismatched `type` or a dropped bound otherwise stays green; not every such field carries its test today, and where writing one is blocked rather than merely pending, as it is for `capability_id`, the block is registered as `fpsm-capid-guard` in the deferred work list in `docs/ARCHITECTURE.md`, beside `fpsm-lease-ceiling-parity` for the published lease ceiling.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
 - Keep the capability registry, policy, broker lifecycle, and experiment journal in `crates/control-plane`.
