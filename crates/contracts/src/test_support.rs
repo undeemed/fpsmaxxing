@@ -59,12 +59,12 @@ pub fn serialized_fields(value: impl serde::Serialize) -> BTreeSet<String> {
 /// a definition that drifts in any of the three fails the calling test. Neither
 /// property types nor bounds are compared, so a `type` that disagrees passes
 /// here just as a dropped bound does. A field whose checked-in schema constrains
-/// it beyond a bare `type` (a `minLength`, a `pattern`, a numeric bound) or that
-/// carries a `deserialize_with` validator requires its own dedicated test
-/// instead, one that binds each checked-in schema carrying that constraint
-/// rather than merely one of them; for a `deserialize_with` validator, which no
-/// checked-in schema can state, the counterpart to bind is that field's
-/// declared `type` in each checked-in schema publishing it.
+/// it beyond a bare `type` (a `minLength`, a `minItems`, a `pattern`, a numeric
+/// bound) or that carries a `deserialize_with` validator requires its own
+/// dedicated test instead, one that binds each checked-in schema carrying that
+/// constraint rather than merely one of them; for a `deserialize_with`
+/// validator, which no checked-in schema can state, the counterpart to bind is
+/// that field's declared `type` in each checked-in schema publishing it.
 pub fn assert_same_shape(generated: &schemars::Schema, checked_in: &Value) {
     let generated = serde_json::to_value(generated).expect("generated schema should serialize");
     assert_eq!(properties(&generated), properties(checked_in));
