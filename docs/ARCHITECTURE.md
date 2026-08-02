@@ -68,6 +68,7 @@ Deploy it under a supervisor that restarts on failure, and let the watchdog own 
 - `fpsm-broker-splitacl`: the real split-privilege ACL, replacing the interim same-uid policy described above, plus journaling the verified peer uid and pid against each lifecycle and authenticating the client-supplied owner label against them.
 - Client reconnect on `Closed`: the broker closes a connection idle for 30 seconds, and `BrokerClient` holds one long-lived stream with no keepalive or reconnect, so a caller whose requests are further apart than that gets `ClientError::Closed`. Whether the client reconnects transparently, the server distinguishes a healthy idle peer from a stalled one, or callers connect per request is undecided.
 - `broker-dispatch-unbounded`: neither `BrokerHandle::dispatch` nor `BrokerClient::request` bounds the wait on the single control-plane worker, so a provider that blocks inside `apply` or `verify` stalls every peer rather than failing one. Deferred to the pass that adds graceful shutdown, which has to answer the same question: what a request already in flight is owed when the broker stops serving.
+- `fpsm-lease-ceiling-parity`: the missing `maximum` on `$defs.ChangeRequest.lease_seconds` in `schemas/broker-request.schema.json`, which declares only a minimum while `MAX_LEASE_SECONDS` and `schemas/experiment.schema.json` both carry the ceiling, harmless at runtime because the control-plane policy check rejects an over-ceiling lease and so drift in the published contract rather than in enforcement.
 
 ### Watchdog
 
