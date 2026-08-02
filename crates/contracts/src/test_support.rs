@@ -56,11 +56,13 @@ pub fn serialized_fields(value: impl serde::Serialize) -> BTreeSet<String> {
 /// Asserts that `generated` and `checked_in` declare the same object shape.
 ///
 /// Property names, the `required` list, and `additionalProperties` are compared;
-/// a definition that drifts in any of the three fails the calling test. Property
-/// types and bounds are not compared, so a field whose checked-in schema
-/// constrains it beyond a bare `type` (a `minLength`, a `pattern`, a numeric
-/// bound) or that carries a `deserialize_with` validator requires its own
-/// dedicated test instead.
+/// a definition that drifts in any of the three fails the calling test. Neither
+/// property types nor bounds are compared, so a `type` that disagrees passes
+/// here just as a dropped bound does. A field whose checked-in schema constrains
+/// it beyond a bare `type` (a `minLength`, a `pattern`, a numeric bound) or that
+/// carries a `deserialize_with` validator requires its own dedicated test
+/// instead. That rule covers the narrower subset, so a field declared with
+/// nothing but a `type` stays uncovered by both.
 pub fn assert_same_shape(generated: &schemars::Schema, checked_in: &Value) {
     let generated = serde_json::to_value(generated).expect("generated schema should serialize");
     assert_eq!(properties(&generated), properties(checked_in));

@@ -491,10 +491,13 @@ mod tests {
     /// Asserts that two object schemas declare the same fields.
     ///
     /// Property names, the `required` list, and `additionalProperties` are
-    /// compared; property types and bounds are not, so a field whose checked-in
-    /// schema constrains it beyond a bare `type` (a `minLength`, a `pattern`, a
-    /// numeric bound) or that carries a `deserialize_with` validator requires
-    /// its own dedicated test instead.
+    /// compared; neither property types nor bounds are, so a `type` that
+    /// disagrees passes here just as a dropped bound does. A field whose
+    /// checked-in schema constrains it beyond a bare `type` (a `minLength`, a
+    /// `pattern`, a numeric bound) or that carries a `deserialize_with`
+    /// validator requires its own dedicated test instead. That rule covers the
+    /// narrower subset, so a field declared with nothing but a `type` stays
+    /// uncovered by both.
     fn assert_object_parity(label: &str, generated: &Value, checked_in: &Value) {
         let generated_properties: BTreeSet<String> = generated["properties"]
             .as_object()
