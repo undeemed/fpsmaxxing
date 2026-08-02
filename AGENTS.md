@@ -15,6 +15,7 @@ Start with `docs/README.md`. Read `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECT
 ## Repository rules
 
 - Keep shared wire types in `crates/contracts`, and keep `schemas/*.json` in sync with them; the contract tests enforce matching fields and enum strings.
+- Give every field that carries a type constraint, a range, or a `deserialize_with` validator its own dedicated test, copying the `*_like_the_schema` tests in `crates/contracts/src/lib.rs`; the schema parity test compares property names, `required`, and `additionalProperties` only, so a mismatched field `type` or a dropped bound otherwise stays green.
 - Keep provider lifecycle behavior in `crates/provider-sdk`.
 - Keep the capability registry, policy, broker lifecycle, and experiment journal in `crates/control-plane`.
 - Keep the local IPC transport, framing, and peer-authentication seams behind traits in `crates/ipc` (Unix domain socket now, Windows named pipe later); the privileged broker in `apps/broker` composes them over the control plane and enforces peer auth, catalog policy, and single-owner-per-knob. The non-`Send` control plane is confined to one worker thread reached through a `Send` handle.

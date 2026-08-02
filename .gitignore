@@ -23,6 +23,18 @@ Thumbs.db
 .sentrux/cache.bin
 .sentrux/churn.bin
 
-# Crash dumps must never enter source control.
-core
-core.*
+# Crash artifacts, never repo state. A core dump is a memory image of a process
+# that ran holding live credentials, so an automated fix round staging one into a
+# public repo is a credential exposure, not bloat.
+# Anchored with a leading `/` so these apply at the repo root only: unanchored
+# `core` matches at ANY depth and matches directories, so it would silently
+# untrack a whole `src/core/` subsystem, and unanchored `core.*` would swallow
+# `api/core.ts`. The negation keeps a legitimate root-level `core/` package
+# tracked while still ignoring a root-level `core` FILE.
+# Two dump shapes are covered because `kernel.core_pattern` is per-host:
+# `core` and `core.<pid>` (this container uses the bare `core` form), and
+# `core.<exe>.<pid>` from the common `core.%e.%p` pattern.
+/core
+!/core/
+/core.[0-9]*
+/core.*.[0-9]*
