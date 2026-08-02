@@ -491,8 +491,8 @@ mod tests {
     /// Asserts that two object schemas declare the same fields.
     ///
     /// Property names, the `required` list, and `additionalProperties` are
-    /// compared; property types and bounds are not, so each of those carries its
-    /// own dedicated test instead.
+    /// compared; property types and bounds are not, so each of those requires
+    /// its own dedicated test instead.
     fn assert_object_parity(label: &str, generated: &Value, checked_in: &Value) {
         let generated_properties: BTreeSet<String> = generated["properties"]
             .as_object()

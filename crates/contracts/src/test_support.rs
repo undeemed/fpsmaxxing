@@ -57,8 +57,8 @@ pub fn serialized_fields(value: impl serde::Serialize) -> BTreeSet<String> {
 ///
 /// Property names, the `required` list, and `additionalProperties` are compared;
 /// a definition that drifts in any of the three fails the calling test. Property
-/// types and bounds are not compared, so each of those carries its own dedicated
-/// test instead.
+/// types and bounds are not compared, so each of those requires its own
+/// dedicated test instead.
 pub fn assert_same_shape(generated: &schemars::Schema, checked_in: &Value) {
     let generated = serde_json::to_value(generated).expect("generated schema should serialize");
     assert_eq!(properties(&generated), properties(checked_in));
