@@ -63,8 +63,9 @@ pub fn serialized_fields(value: impl serde::Serialize) -> BTreeSet<String> {
 /// bound) or that carries a `deserialize_with` validator requires its own
 /// dedicated test instead, one that binds each checked-in schema carrying that
 /// constraint rather than merely one of them; for a `deserialize_with`
-/// validator, which no checked-in schema can state, the counterpart to bind is
-/// that field's declared `type` in each checked-in schema publishing it.
+/// validator, which no checked-in schema can state, that test binds each
+/// checked-in schema publishing it and asserts that field's declared `type`
+/// there as the counterpart.
 pub fn assert_same_shape(generated: &schemars::Schema, checked_in: &Value) {
     let generated = serde_json::to_value(generated).expect("generated schema should serialize");
     assert_eq!(properties(&generated), properties(checked_in));
