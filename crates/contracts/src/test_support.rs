@@ -1,8 +1,11 @@
 //! Shared helpers for the schema-synchronization tests.
 //!
 //! `schemas/*.json` are hand-written and must agree with the types in this
-//! crate. Every schema-sync test module compares them the same way, so the
-//! comparison lives here once rather than being re-derived per module.
+//! crate. The helpers here collect the pieces those tests compare, and
+//! `assert_same_shape` is one body of that comparison: the tests in `ipc` call
+//! it, while `lib` has its own `assert_object_parity` beside field-set tests
+//! that hold a serialized sample against a checked-in schema with no generated
+//! schema in hand.
 
 use std::collections::BTreeSet;
 
@@ -56,7 +59,16 @@ pub fn serialized_fields(value: impl serde::Serialize) -> BTreeSet<String> {
 /// Asserts that `generated` and `checked_in` declare the same object shape.
 ///
 /// Property names, the `required` list, and `additionalProperties` are compared;
-/// a definition that drifts in any of the three fails the calling test.
+/// a definition that drifts in any of the three fails the calling test. Neither
+/// property types nor bounds are compared, so a `type` that disagrees passes
+/// here just as a dropped bound does. A field whose checked-in schema constrains
+/// it beyond a bare `type` (a `minLength`, a `minItems`, a `pattern`, a numeric
+/// bound) or that carries a `deserialize_with` validator requires its own
+/// dedicated test instead, one that binds for that constraint each checked-in
+/// schema carrying it rather than merely one of them; for a `deserialize_with`
+/// validator, which no checked-in schema can state, that test binds each
+/// checked-in schema publishing that field and asserts that field's declared
+/// `type` there as the counterpart.
 pub fn assert_same_shape(generated: &schemars::Schema, checked_in: &Value) {
     let generated = serde_json::to_value(generated).expect("generated schema should serialize");
     assert_eq!(properties(&generated), properties(checked_in));

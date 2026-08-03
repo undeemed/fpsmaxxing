@@ -23,6 +23,20 @@ Thumbs.db
 .sentrux/cache.bin
 .sentrux/churn.bin
 
-# Crash dumps must never enter source control.
-core
-core.*
+# Crash artifacts, never repo state. A core dump is a memory image of a process
+# that ran holding live credentials, so an automated fix round staging one into a
+# public repo is a credential exposure, not bloat.
+# `**/` matches at any depth because a dump lands in the CRASHING PROCESS's working
+# directory, which is not always the repo root: `cargo test` runs each package's
+# test binary with cwd at that package root, so a Rust workspace dumps to
+# `crates/<pkg>/core`.
+# `!**/core/` is what makes the depth safe: without it, `**/core` would also match
+# every directory named `core` and silently untrack whole subsystems such as
+# `src/core/` or a `crates/core` package.
+# Two dump name shapes are covered because `kernel.core_pattern` is per-host:
+# `core` and `core.<pid>` (this container uses the bare `core` form), and
+# `core.<exe>.<pid>` from the common `core.%e.%p` pattern.
+**/core
+!**/core/
+**/core.[0-9]*
+**/core.*.[0-9]*
