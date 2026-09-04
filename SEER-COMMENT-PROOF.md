@@ -1,4 +1,4 @@
 # Seer comment proof
 
-Raised to observe the Seer App post its verdict as a pull-request comment on a
-repository that carries no Seer configuration. Safe to delete.
+Second commit, to prove the App edits its existing comment rather than
+stacking a new one on every scan. Safe to delete.
